@@ -646,17 +646,19 @@ impl RequestCards {
             .into_any_element()
     }
 
-    /// Card for one request. `page`: the Inbox page (collapsible, session line,
-    /// Open session); otherwise the compact card in the session view.
+    /// Card for one request, painted in `p`: the app's palette on the Inbox
+    /// page, the pane's own in the quick panel. `page`: the Inbox page
+    /// (collapsible, session line, Open session); otherwise the compact card in
+    /// the session view.
     pub(super) fn request_card(
         &mut self,
         key: &str,
         page: bool,
         collapsed_default: bool,
+        p: Palette,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let p = *palette(cx);
         let t = tones(&p);
         let store = self.store.read(cx);
         let req = store.requests.iter().find(|r| r.key == key)?.clone();
@@ -1039,7 +1041,7 @@ impl QmtApp {
                 .enumerate()
                 .filter_map(|(ix, k)| {
                     self.inbox_cards.update(cx, |cards, cx| {
-                        cards.request_card(k, true, ix >= 3, window, cx)
+                        cards.request_card(k, true, ix >= 3, p, window, cx)
                     })
                 })
                 .collect();

@@ -61,7 +61,7 @@ A compaction that carries a command record SHALL say on its row that it was star
 - **THEN** the conversation shows a command row `/compact` with that reply under it
 
 ### Requirement: A command being sent
-A prompt the agent has not answered yet SHALL be drawn as a command row in progress when it names an advertised command whose effect is an action, and as a prompt bubble otherwise. When the agent's entry for it arrives, that entry SHALL take its place. If sending fails, the row SHALL be marked as failed and show the error.
+A prompt the agent has not answered yet SHALL be drawn as a command row in progress when it names an advertised command whose descriptor states the effect `action`, and as a prompt bubble otherwise, including when the command has no descriptor. When the agent's entry for it arrives, that entry SHALL take its place. If sending fails, the row SHALL be marked as failed and show the error.
 
 #### Scenario: Pending action command
 - **WHEN** the user sends `/worktree list` and the agent has not answered yet
@@ -74,6 +74,11 @@ A prompt the agent has not answered yet SHALL be drawn as a command row in progr
 #### Scenario: Failed action command
 - **WHEN** the user sends `/worktree list` and the request fails
 - **THEN** the command row is marked as failed and shows the error
+
+#### Scenario: Pending command without a descriptor
+- **GIVEN** an agent that advertises `worktree` without a descriptor
+- **WHEN** the user sends `/worktree list` and the agent has not answered yet
+- **THEN** the conversation shows a prompt bubble reading `/worktree list`, not a command row
 
 ### Requirement: Conversations without command records
 A message that carries no command record SHALL be drawn as before: a user message as a prompt bubble with its content, an agent message as a reply. The app SHALL NOT decide from a message's text that it was a command.

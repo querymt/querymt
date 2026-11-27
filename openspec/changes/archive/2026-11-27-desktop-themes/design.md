@@ -108,6 +108,17 @@ naming the source URL and commit, the kit's Apache-2.0 licence, and each
 family's `author` and `url` as given in the file. Embed them with
 `include_str!`.
 
+The six themes converted from Zed (D11) live in a folder of their own,
+`assets/themes/extra/` (`ayu-mirage.json`, `gruvbox-variants.json`,
+`one.json`, each a kit `ThemeSet`), with `assets/themes/extra/NOTICE.md`
+naming the Zed files and commit they were converted from, each theme's
+upstream project and its MIT licence as recorded in Zed's
+`assets/themes/LICENSES`. They are not in `kit/`, whose NOTICE promises
+files copied unmodified. The catalogue embeds both folders in one list
+(24 files, 42 themes) and treats their themes alike. Zed's LICENSES also
+records Ayu as MIT (dempfi/ayu), so the kit NOTICE's `ayu.json` row changes
+from "not verified" to MIT per that file.
+
 `src/theme.rs` becomes a `src/theme/` module: `mod.rs` (`Palette`, `apply`),
 `catalogue.rs` (this decision, D4, D5) and `accent.rs` (D6).
 
@@ -126,7 +137,6 @@ struct Entry {
     palette: Palette,               // D4, with `theme` already set
     own_accent: Option<Preset>,     // Some(orange) for the built-ins, else None
     syntax: Arc<HighlightTheme>,    // D5
-    fence: Arc<FenceHighlighter>,   // D2
 }
 ```
 
@@ -172,26 +182,33 @@ Arc<HighlightTheme>` returns the entry's `syntax` (an `Arc` clone), so the
 per-frame lookup in `RenderCtx` copies a pointer. `hud_palette` sets `theme`
 to QueryMT Dark, whatever the user palette is.
 
-The entry also holds `fence: Arc<FenceHighlighter>`, with `type
-FenceHighlighter = dyn Fn(&CodeBlock) -> Vec<(Range<usize>, HighlightStyle)> +
-Send + Sync`, reached through `highlight::fence_highlighter(&Palette)`. It
-has to be one `Arc` per theme, not a closure built per call: the kit reuses
-a code block's highlights only while the highlighter is the same `Arc`
-(`gpui-base` `text/node.rs` compares with `Arc::ptr_eq`), and `md.rs`
-`styled` runs every frame, so a fresh closure per frame would re-parse every
-fence every frame. `TextView::code_block_highlighter(closure)` always makes a
-new `Arc`; the only setter taking an existing one is
-`TextView::shared_code_block_highlighter`, which the kit marks
-`#[doc(hidden)]` and uses itself for its own highlighter. We use it: the kit
-is pinned (0.11) and a test fails if fences are highlighted again on a second
-render. If a later kit removes it, the replacement is a task of that upgrade.
+Fences take the palette's syntax colours through the text view's style, not
+a highlighter of our own. `md.rs` `styled` sets
+`TextViewStyle.highlight_theme = theme::syntax(&p)` (`md::view_style`). The
+component `TextView` (the type the app uses; its inner `gpui_base::TextView`
+is private, and `shared_code_block_highlighter` exists only there) then hands
+the text view a highlighter that the kit caches per `highlight_theme` `Arc`
+(`gpui-component` `text/mod.rs` `shared_code_block_highlighter`, keyed by
+`Arc::ptr_eq`, so a stable `Arc` per theme means a code block's highlights are
+reused between frames). That highlighter is the kit's syntect backend, which
+`highlight.rs` copies line for line (the same scope names, grammars and
+fallbacks), so fences and tool output colour alike. When the style's theme is
+the kit's own default light theme the kit leaves the global
+`TextViewDefaults` highlighter (installed by `highlight::install` from the
+shown theme) in charge; that is the same `Arc` as QueryMT Light's, so nothing
+differs.
+
+An earlier version of this decision had the app hold one
+`Arc<FenceHighlighter>` per theme and hand it to
+`TextView::shared_code_block_highlighter`. That method is not reachable on the
+component `TextView`, and rebuilding the kit's private themed text style to
+use the base `TextView` risked changing QueryMT Dark, so it was dropped.
 
 Every reader switches from the kit global to the palette's theme:
 `RenderCtx::syntax` and `kit::editor_style` use `theme::syntax(&p)`, and
-`md.rs` `styled` sets `shared_code_block_highlighter(fence_highlighter(&p))`
-(the view already receives `p`). The kit global still gets the shown theme's
-`highlight_theme` (the same `Arc`, D7), for kit components the app does not
-style itself.
+`md.rs` `styled` uses `view_style(&p)` (the view already receives `p`). The kit
+global still gets the shown theme's `highlight_theme` (the same `Arc`, D7), for
+kit components the app does not style itself.
 
 Alternative: a separate syntax override next to `SessionPane::palette`.
 Rejected: every place that already threads a `Palette` would need a second
@@ -231,6 +248,7 @@ two opaque colours.
 | `popover` | `popover` |
 | `card` | `secondary` |
 | `card_hover` | `secondary_hover` |
+| `selected` | `accent` (`accent.background`; the kit falls back to `secondary`) |
 | `border` | `border` |
 | `border_strong` | `input` (`input.border`) |
 | `text` | `foreground` |
@@ -255,6 +273,19 @@ look and are accepted (see Risks).
 themes but not on a bundled theme, where the app's menus would take the
 theme's popover colour and the kit's popovers the sidebar colour.
 
+`selected` is the colour of the highlighted row. The kit paints a command
+palette's highlighted row with its `accent` colour, and `apply` used to set
+that to `card` (`t.accent = p.card`), which threw away every theme's own
+highlight colour. A theme whose sidebar, popover and card are one colour
+(all six converted from Zed, D11) then showed a highlight equal to the
+palette's own panel: the row vanished. `apply` now writes `t.accent =
+p.selected` and `t.sidebar_accent = p.selected`. For the built-ins `selected`
+is `card`, so nothing changes there; `Accent::apply_to` leaves it alone (a
+preset recolours the accent only); `hud_palette` sets it to its `card`. App
+menus that hover a row over a popover (`kit::menu_item`) use `selected`
+instead of `card` for the same reason; `title_chip` hovers over the page,
+where `card` differs from the background on every theme, and is unchanged.
+
 Alternative: read `ThemeConfigColors` strings directly. Rejected: the kit's
 fallbacks and gradient handling would have to be reimplemented.
 
@@ -266,7 +297,7 @@ builds it in `apply_config`. A highlight name a theme leaves out first falls
 back to its dotted prefix (`comment.doc` -> `comment`); a name with no match
 resolves to no style, so the text colour (`fg`) shows. A config without a
 `highlight` block uses the built-in syntax theme of its appearance (none of
-the 36 lacks one; tested). The built-ins use `HighlightTheme::default_dark()`
+the 42 lacks one; tested). The built-ins use `HighlightTheme::default_dark()`
 / `default_light()`.
 
 ### D6. Accent: theme by default, preset as override
@@ -314,13 +345,20 @@ What this does, measured on the files at `d2e6bba`:
   Slate 4.8 keep white; Teal (2.5), Green (2.3) and Amber (1.9) become black.
   This is the one deliberate change to the built-in looks; Orange is the
   theme's own accent and stays as it is.
-- Bundled themes: 152 of the 324 theme and preset pairs fall below 3:1 and
-  get black or white. The 12 dark themes with a light label (Adventure,
-  Adventure Time, Alduin, Asciinema, Fahrenheit, Flexoki Dark, Hybrid Dark,
-  macOS Classic Dark, Mellifluous Dark, Molokai Dark, Solarized Dark,
-  Spaceduck) fail on every preset; all 11 light themes fail on Teal, Green,
-  Amber and Orange; the other 13 dark themes keep their own label on every
-  preset.
+- Bundled themes: 152 of the 324 pairs of the 36 kit themes and a preset
+  fall below 3:1 and get black or white. The 12 dark themes with a light
+  label (Adventure, Adventure Time, Alduin, Asciinema, Fahrenheit, Flexoki
+  Dark, Hybrid Dark, macOS Classic Dark, Mellifluous Dark, Molokai Dark,
+  Solarized Dark, Spaceduck) fail on every preset; all 11 light themes fail
+  on Teal, Green, Amber and Orange; the other 13 dark themes keep their own
+  label on every preset.
+- The six themes of D11 (measured with the label D11 gives them): 15 of 54
+  pairs fall below 3:1. Ayu Mirage, Gruvbox Dark Soft and One Dark have a
+  dark label and keep it on every preset. One Light (label `#fafafa`) and
+  Gruvbox Light Hard (`#f9f5d7`) fail on Teal, Green, Amber and Orange, like
+  the kit's light themes. Gruvbox Light Soft's label (`#f2e5bc`, darker)
+  fails on Blue, Teal, Green, Amber, Orange, Red and Pink. All 42 bundled
+  themes together: 167 of 378 pairs.
 
 The old code treated `""` and `orange` alike everywhere; now Orange on a
 bundled theme means orange. A saved `orange` from before themes is read as
@@ -362,7 +400,8 @@ Steps, in this order:
    `t.apply_config(&config)`, with `config` the entry's `Rc` (a clone of
    the pointer) or, for a built-in, the registry's default config.
 4. In a second `Theme::update`: the fonts, radii, the palette over the kit
-   tokens as today (with `popover` from `Palette::popover`, D4), and
+   tokens as today (with `popover` from `Palette::popover` and `accent` from
+   `Palette::selected`, D4), and
    `t.highlight_theme = entry.syntax.clone()` so the kit holds the entry's
    `Arc`, not a copy.
 5. `highlight::install(cx)`.
@@ -455,21 +494,93 @@ render as before. `film/mod.rs` (lines 197 and 219) reads both.
 
 ```mermaid
 flowchart LR
-  F[assets/themes/kit/*.json] -->|ThemeSet, once| C[catalogue entries]
+  F[assets/themes/kit + extra/*.json] -->|ThemeSet, once| C[catalogue entries]
   C -->|Builtin| B[Palette::dark/light + kit default HighlightTheme]
   C -->|Kit config| R[scratch Theme.apply_config]
   R --> P[Palette via D4]
   C --> H[Arc HighlightTheme via D5]
-  P --> E[entry: palette, syntax, fence, Rc config]
+  P --> E[entry: palette, syntax, Rc config]
   H --> E
   B --> E
   A[prefs.accent -> Accent] --> AT[Accent.apply_to]
   E --> AT
   AT --> AP[theme::apply]
   AP --> G[Palette global + kit Theme: install config, then palette]
-  E -.->|syntax, fence by ThemeId| Q[readers: RenderCtx, editor_style, md.rs]
+  E -.->|syntax by ThemeId| Q[readers: RenderCtx, editor_style, md.rs]
   AT -.->|accent only| QP[hud_palette + QueryMT Dark syntax]
 ```
+
+### D11. Six themes converted from Zed
+
+Ayu Mirage, Gruvbox Dark Soft, Gruvbox Light Hard, Gruvbox Light Soft, One
+Dark and One Light are converted once from Zed's theme files
+(`zed-industries/zed`, `assets/themes/{ayu,gruvbox,one}`, at a pinned
+commit recorded in the NOTICE) into kit `ThemeConfig`s, by one rule for all
+six, so no theme is tuned by hand. Zed's Gruvbox Dark Hard is not converted:
+its page colour `#1d2021` is already the kit Gruvbox Dark's page colour.
+
+| Kit key | From Zed's `style` |
+|---|---|
+| `background` | `editor.background` (Zed's `background` is the window chrome, not the content) |
+| `sidebar.background` | `surface.background` |
+| `popover.background` | `elevated_surface.background` |
+| `secondary.background` / `secondary.hover` | `element.background` / `element.hover` |
+| `accent.background` / `accent.foreground` | `element.selected` / `text` (the highlighted row, D4 `selected`; Zed's `element.background` equals its surface and elevated surface, so without this the highlight equals the panel) |
+| `border` / `input.border` | `border` / `border.variant` |
+| `foreground` / `muted.foreground` | `text` / `text.muted` |
+| `primary.background` / `primary.hover` | `text.accent` / `text.accent` lightness step (D6) |
+| `primary.foreground` | `editor.background` or `text`, whichever contrasts more with `text.accent` |
+| `base.red` / `base.yellow` / `base.green` | `error` / `warning` / `success` |
+| `highlight.syntax` | `syntax`, every key the kit's `SyntaxColors` knows, with `color`, `font_style` and `font_weight` as given (the two use the same names and shape) |
+| `highlight.editor.*` | `editor.background`, `editor.foreground`, `editor.active_line.background`, `editor.line_number`, `editor.active_line_number`, `editor.invisible` |
+
+Alpha is dropped from the `ff` colours only; translucent values keep it and
+are composited by D4 like any kit theme's. Everything the table does not
+name is left out, so the kit's fallbacks fill it, as for the kit's own
+files. The conversion is done once, by a script kept out of the build, and
+the JSON is committed; the tests check the result against values copied
+from Zed's files (spec: Added themes follow their Zed originals).
+
+Alternative: copy the kit's family files (`ayu.json`, `gruvbox.json`) and
+change only the page colour. Rejected: the kit's Ayu Dark shares 1 of 35
+interface colours with Zed's, so the result would be neither the kit's nor
+Zed's theme, and One has no kit file to start from.
+
+### D12. Theme picker in the command palette
+
+The palette gets a second mode. `QmtApp` holds
+`palette_mode: PaletteMode`, with `PaletteMode::Commands` (today's
+palette) and `PaletteMode::Themes { restore: Appearance }`, where `restore`
+is the `Appearance` shown when the list opened (a `Copy` value, D7).
+
+- A "Select theme…" entry in the Actions group (`PaletteTarget::SelectTheme`,
+  keywords theme, colour, appearance, dark, light) switches to `Themes`,
+  clears the query and keeps the palette open.
+- In `Themes`, `palette_groups` returns two groups, "Dark themes" and
+  "Light themes", from `ThemeId::of_appearance(true / false)`, each row
+  `CommandItem::checked` when it is the theme shown. The existing
+  `filter_palette` filters them, so typing works as for commands. After the
+  first render of the list, `CommandState::set_selected_index` highlights
+  the shown theme (it matches against the rendered rows, so it runs after
+  them, through `window.defer`).
+- `on_select` (the highlight moved) calls `theme::apply(Appearance { theme,
+  accent: restore.accent })`: the window shows the theme, nothing is saved.
+- `on_confirm` saves the key as `theme_dark` or `theme_light` by
+  `ThemeId::dark()`; if that differs from `restore.dark()` it also
+  `set_dark(Some(theme.dark()))`, otherwise `prefs.dark` is untouched (System
+  stays System). Then `apply_theme` applies what the preferences now say.
+- Every way of closing the palette goes through one `close_palette(window,
+  cx)`: Esc (`on_cancel`), the scrim click, Ctrl/Cmd+P (`toggle_palette`),
+  `run_palette` and page changes. In `Themes` mode without a confirm it
+  calls `theme::apply(restore)` and resets the mode to `Commands`. Today
+  these paths each set `palette_open = false` themselves, which is how a
+  path would forget the restore; they are folded into the one function.
+
+The preview applies the whole theme, so it costs what a mode switch costs
+(pointer clones, D1/D7), not a reparse.
+
+Alternative: a separate theme dialog. Rejected: the palette already has the
+search, keyboard handling, groups and scrim, and Zed's picker is a palette.
 
 ## Risks / Trade-offs
 
@@ -506,20 +617,35 @@ flowchart LR
   (`hud_palette`), and some theme accents are extreme: Solarized Light's is
   grey, Aurora Light's near black] -> the review checks the panel with those
   themes; the lightening floor already exists for dark accents.
-- [`shared_code_block_highlighter` is a `#[doc(hidden)]` kit method] ->
-  the kit is pinned and uses it itself; the cache test fails if it stops
-  sharing (D2).
-- [Building the catalogue on first use parses 21 files and resolves 36
+- [Fences rely on the kit sharing one highlighter per `highlight_theme`
+  `Arc`, and on its syntect highlighter matching `highlight.rs`] -> the kit is
+  pinned; a test checks that `view_style` hands out the same `Arc` every frame
+  and that the quick panel's is QueryMT Dark's. The equality of the two
+  highlighters was checked by comparing the sources (they differ only in
+  comments); a later kit that changes its scope mapping would make fences and
+  tool output differ, and the fix is to update `highlight.rs` with it.
+- [The palette's `on_cancel` runs only for Esc with an empty query; the
+  first Esc clears the query] -> the list stays open and still previews;
+  the second Esc restores, as for the command list today.
+- [While previewing, the quick panel's accent follows the previewed theme,
+  because `hud_palette` takes the global accent] -> accepted: the preview
+  ends when the palette closes, and the panel follows what is kept.
+- [Zed's theme files change later, or a converted value was mistyped] ->
+  the conversion is pinned to a Zed commit in the NOTICE, and the tests
+  compare the committed files with values copied from that commit.
+- [Building the catalogue on first use parses 24 files and resolves 42
   themes on the main thread] -> once per process, at the first `apply`
   during start-up; task 5.3 records the start-up time before and after, and
   an entry's palette can become lazy if it shows.
 - [`ThemeId` is an index into a per-process list] -> it is never saved or
   sent: the file holds the key, and `ThemeId::resolve` turns it back.
-- [Web build grows] -> 172,276 bytes of JSON in the wasm, about 18 KB
-  gzipped on the wire; measured in task 5.3.
+- [Web build grows] -> 172,276 bytes of kit JSON in the wasm, about 18 KB
+  gzipped on the wire, plus the three files of D11; measured in tasks 5.3
+  and 6.7.
 - [The global `TextViewDefaults` highlighter and the per-view one disagree]
   -> every app `TextView` goes through `md.rs` `styled`, which sets the
-  per-view highlighter; the global keeps the main window's theme.
+  per-view `highlight_theme`; the global keeps the main window's theme and is
+  only used for QueryMT Light's own `Arc` (the same).
 
 ## Migration Plan
 

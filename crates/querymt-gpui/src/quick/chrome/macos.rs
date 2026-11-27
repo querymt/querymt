@@ -11,7 +11,7 @@ use objc2::msg_send;
 use objc2::rc::{Retained, Weak};
 use objc2::runtime::{AnyClass, AnyObject};
 use objc2_app_kit::{
-    NSAppearance, NSAppearanceCustomization as _, NSAppearanceNameDarkAqua,
+    NSAppearance, NSAppearanceCustomization as _, NSAppearanceNameAqua, NSAppearanceNameDarkAqua,
     NSAutoresizingMaskOptions, NSGlassEffectView, NSView, NSVisualEffectBlendingMode,
     NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindow,
     NSWindowOrderingMode,
@@ -93,9 +93,10 @@ pub(super) fn drop_window_shadow(window: &Window) {
     }
 }
 
-/// Add the material below GPUI's view and fix it to dark aqua. `animate`: the
-/// window starts invisible, for [`open_step`] to bring in.
-pub(super) fn install(window: &mut Window, animate: bool) -> Chrome {
+/// Add the material below GPUI's view and set it to the app's appearance
+/// (`dark`: dark aqua, else aqua). `animate`: the window starts invisible, for
+/// [`open_step`] to bring in.
+pub(super) fn install(window: &mut Window, animate: bool, dark: bool) -> Chrome {
     let Some(mtm) = MainThreadMarker::new() else {
         return Chrome::solid();
     };
@@ -135,14 +136,14 @@ pub(super) fn install(window: &mut Window, animate: bool) -> Chrome {
     );
     parent.addSubview_positioned_relativeTo(&material, NSWindowOrderingMode::Below, None);
     MATERIAL.with(|slot| *slot.borrow_mut() = Some(Weak::from_retained(&material)));
-    set_dark(window);
+    set_appearance(window, dark);
     if animate && let Some(ns_window) = ns_window(window) {
         // Before the first frame: the material would otherwise show at once,
         // ahead of the animation.
         ns_window.setAlphaValue(0.);
     }
     // Liquid Glass draws its own edge; a visual-effect view has none.
-    Chrome::dark_material(glass)
+    Chrome::material(glass)
 }
 
 /// `bounds` scaled by `scale` around its centre.
@@ -182,15 +183,21 @@ pub(super) fn open_step(window: &Window, opacity: f32, scale: f32) {
     super::rim::open_step(scale.min(1.) as f64);
 }
 
-/// Make the material (and so everything in the window that AppKit themes)
-/// dark, once: the panel is a HUD and follows neither the app's theme nor the
-/// desktop's.
-fn set_dark(window: &Window) {
+/// Set the window's appearance, and so the material's and everything in the
+/// window that AppKit themes: dark aqua for a dark app theme, aqua for a light
+/// one. The panel follows the app's theme, not the desktop's.
+pub(super) fn set_appearance(window: &Window, dark: bool) {
     let Some(ns_window) = ns_window(window) else {
         return;
     };
-    // SAFETY: AppKit's constant appearance name.
-    let name = unsafe { NSAppearanceNameDarkAqua };
+    // SAFETY: AppKit's constant appearance names.
+    let name = unsafe {
+        if dark {
+            NSAppearanceNameDarkAqua
+        } else {
+            NSAppearanceNameAqua
+        }
+    };
     ns_window.setAppearance(NSAppearance::appearanceNamed(name).as_deref());
 }
 

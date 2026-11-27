@@ -634,7 +634,7 @@ mod tests {
     fn harness(cx: &mut gpui_kit::TestAppContext) -> Harness {
         cx.update(|cx| {
             gpui_kit::init(cx);
-            crate::theme::apply(true, "orange", cx);
+            crate::theme::apply(crate::theme::Appearance::builtin(true), cx);
         });
         let mut view = SessionView::new("test-agent", "s", "/w", "Source");
         let text = |kind: &str, id: &str, text: &str| {

@@ -2,7 +2,7 @@
 
 ## Context
 
-See proposal.md for the motivation. The current state:
+See proposal.md for the motivation. Paths are relative to `crates/querymt-gpui`, a member of this workspace that depends on `querymt-agent-session-core` by path. The current state:
 
 - **Rows.** `src/session/projection.rs` turns each core entry into an `Item` (`src/session.rs` `ItemKind`):
   - `EntryKind::UserMessage` becomes `ItemKind::User { text, attachments, local }`, where `local` means the agent has not confirmed it;
@@ -16,11 +16,11 @@ See proposal.md for the motivation. The current state:
   - `src/ui/find.rs` `views_of` indexes the user text;
   - `src/session/golden.rs` records it;
   - `src/ui/session_view.rs` `activity` shows "Sending prompt…" for a local one, or "Compacting context…" when `is_compact_command` matches its text.
-- **What querymt `add-slash-command-records` provides** (`querymt-agent-session-core`):
+- **What `add-slash-command-records` provides** (`querymt-agent-session-core`):
   - `UserMessage.slash_command` and `CompactionEntry.slash_command`: `{ name, arguments, source, effect, client_prompt_id }`;
   - `EntryKind::CommandReply { message_id, slash_command, text, code }`;
   - the entry that carries a record replaces the optimistic prompt it answers, so a command and its result are never both in the view.
-- **From `slash-command-actions`:** `src/session/commands.rs` `recognise` and `CommandTraits::of` (is this text an advertised command, and is it an action).
+- **From `slash-command-actions`:** `src/session/commands.rs` `recognise` and `CommandTraits::of` (is this text an advertised command). `CommandTraits::is_action()` is true only when the agent stated `effect` `action`; a command without a descriptor is neither a prompt nor an action.
 
 ## Goals / Non-Goals
 
@@ -50,10 +50,11 @@ See proposal.md for the motivation. The current state:
 
 ### D3. A local prompt that names an action command is a command row in progress
 
-- For a `UserMessage` whose status is pending or failed, the projection asks `commands::recognise(text, &commands)` and `CommandTraits::of`. An advertised action command becomes `ItemKind::Command` with `Running`, or `Failed` with the prompt's error as output.
+- For a `UserMessage` whose status is pending or failed, the projection asks `commands::recognise(text, &commands)` and `CommandTraits::of`. A command for which `is_action()` holds becomes `ItemKind::Command` with `Running`, or `Failed` with the prompt's error as output.
+- The test is `is_action()`, never `!is_prompt()`. A command without a descriptor (an agent from before `add-slash-command-records`) stays a prompt bubble while pending, so it does not show as a command row and then turn into a bubble when the response arrives.
 - This uses the catalog at the moment of sending, for a prompt this client just created. It is not history classification: a confirmed message is never recognised from its text (spec: Conversations without command records).
 - The row builder needs the command list. The projection already reads it from the core header (`header.available_commands`, the source of its `slash_commands`); the same list is passed to the function that builds a turn's rows.
-- With an agent that sends no records, the core marks the prompt sent when the response arrives. The row then becomes an ordinary prompt bubble followed by the assistant reply, as today.
+- With an agent that sends no records, it sends no descriptors either (both come from the same change), so the pending prompt is a bubble throughout. The core marks it sent when the response arrives, and the conversation shows the bubble followed by the assistant reply, as today.
 - Alternative considered: leaving the prompt bubble until the reply arrives. Rejected: `/compact` can take many seconds, and the bubble says "this was sent to the model".
 
 ### D4. The compaction row shows the request
@@ -93,6 +94,6 @@ See proposal.md for the motivation. The current state:
 
 ## Migration Plan
 
-1. Land `slash-command-actions` tasks 1.1 and 1.2 (pinned revision, `commands.rs`).
+1. Land `add-slash-command-records`, then `slash-command-actions` tasks 1.1 and 1.2 (`commands.rs`).
 2. Ship this change. No stored data changes; golden files are regenerated in task 1.3.
-3. Rollback: revert this change. The core's command reply entries then have no row, so revert together with the pin if replies must stay visible.
+3. Rollback: revert this change. The core still produces command reply entries (path dependency, no pin to move back), and they then have no row: `/worktree` output is not shown. If replies must stay visible, revert the session-view part of `add-slash-command-records` (its group 4) in the same release.

@@ -3,7 +3,7 @@ id: gpui-ui
 title: UI shell, pages and the session pane
 description: How the main window is put together (QmtApp, pages, sidebar, modals), how one SessionPane renders a session in both the main window and the quick panel (density, RenderCtx, row cache), and the shared pieces (model picker, keys, palette, fuzzy search).
 tags: ui, gpui, find, search in session, cmd-f, mermaid, diagrams, markdown, shell, pages, sidebar, session pane, transcript, rows, density, compact, render, model picker, keybindings, actions, theme, palette, search
-knowledge_paths: ["crates/querymt-gpui/src/ui/**", "crates/querymt-gpui/src/theme.rs", "crates/querymt-gpui/src/search.rs"]
+knowledge_paths: ["crates/querymt-gpui/src/ui/**", "crates/querymt-gpui/src/search.rs"]
 knowledge_sources: ["crates/querymt-gpui/src/ui/mod.rs", "crates/querymt-gpui/src/ui/session_pane.rs", "crates/querymt-gpui/src/ui/model_picker.rs", "crates/querymt-gpui/src/ui/keys.rs#bind_keys"]
 ---
 
@@ -201,10 +201,6 @@ The bar and its state live on `SessionPane` (`find: Option<FindBar>`, in `find.r
   `UndoWorkspace`, `OpenModelPicker`, `OpenSidebarSession { index }`, …) bound with no key
   context so they reach `QmtApp`'s root even with nothing focused; Cmd on macOS, Ctrl
   elsewhere. Text inputs keep their own deeper bindings.
-- **Theme** (`src/theme.rs`): QueryMT design tokens applied to the gpui-component theme,
-  plus a `Palette` global for app colours the component theme has no slot for. The
-  transcript reads the palette once per frame and passes it down, so the quick panel can
-  substitute its HUD palette.
 - **Search** (`src/search.rs`): one frizbee-based fuzzy matcher for every search box. Every
   query word must match within one field (its characters in order, gaps allowed);
   different words may match different fields, and a match in a secondary field

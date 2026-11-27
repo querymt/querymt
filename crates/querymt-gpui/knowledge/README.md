@@ -52,7 +52,6 @@ Build, test and CI conventions are in [development.md](development.md).
 | `../src/store.rs` | `AgentsStore`: configs, prefs, connections, catalog, requests, open-session hub. |
 | `../src/session.rs` | The `SessionView` struct, transcript display types (`Item`, `ToolCall`, …) and the session module root. |
 | `../src/search.rs` | One fuzzy matcher (frizbee) behind every search box. |
-| `../src/theme.rs` | QueryMT design tokens applied to gpui-component, plus the `Palette` global. |
 | `../src/highlight.rs` | Standalone syntect highlighting for tool output and Markdown fences. |
 | `../src/usage.rs` | Token, cost and active-time model for the session usage popover. |
 | `../src/telemetry.rs` | Opt-in OpenTelemetry export (only when `OTEL_EXPORTER_OTLP_ENDPOINT` is set). |

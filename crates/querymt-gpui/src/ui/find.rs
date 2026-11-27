@@ -1031,7 +1031,7 @@ mod app_tests {
     fn rig(cx: &mut TestAppContext, view: SessionView, page: Page, control: bool) -> Rig {
         cx.update(|cx| {
             gpui_kit::init(cx);
-            crate::theme::apply(true, "orange", cx);
+            crate::theme::apply(crate::theme::Appearance::builtin(true), cx);
             crate::ui::keys::bind_keys(cx);
         });
         let mut store = crate::store::launch::peer_fixture();

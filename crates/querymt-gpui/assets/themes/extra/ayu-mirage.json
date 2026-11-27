@@ -1,0 +1,179 @@
+{
+  "$schema": "https://github.com/longbridge/gpui-kit/raw/refs/heads/main/.theme-schema.json",
+  "name": "Ayu Mirage",
+  "author": "Zed Industries (dempfi/ayu)",
+  "url": "https://github.com/zed-industries/zed/blob/150c2aaeca8778c2759bba92b19247b0901d536f/assets/themes/ayu",
+  "themes": [
+    {
+      "name": "Ayu Mirage",
+      "mode": "dark",
+      "colors": {
+        "background": "#242835",
+        "foreground": "#cccac2",
+        "border": "#53565d",
+        "input.border": "#43464f",
+        "muted.foreground": "#9a9a98",
+        "sidebar.background": "#353944",
+        "popover.background": "#353944",
+        "popover.foreground": "#cccac2",
+        "secondary.background": "#353944",
+        "secondary.hover.background": "#43464f",
+        "secondary.foreground": "#cccac2",
+        "accent.background": "#53565d",
+        "accent.foreground": "#cccac2",
+        "primary.background": "#72cffe",
+        "primary.hover.background": "#9bddfe",
+        "primary.foreground": "#242835",
+        "base.red": "#f18779",
+        "base.yellow": "#fecf72",
+        "base.green": "#d5fe80"
+      },
+      "highlight": {
+        "editor.background": "#242835",
+        "editor.foreground": "#cccac2",
+        "editor.active_line.background": "#353944bf",
+        "editor.line_number": "#575c6b",
+        "editor.active_line_number": "#e1e3ea",
+        "editor.invisible": "#787a7c",
+        "error": "#f18779",
+        "error.background": "#481a1b",
+        "error.border": "#662e2d",
+        "warning": "#fecf72",
+        "warning.background": "#574018",
+        "warning.border": "#765a29",
+        "info": "#72cffe",
+        "info.background": "#123950",
+        "info.border": "#24556f",
+        "success": "#d5fe80",
+        "success.background": "#426117",
+        "success.border": "#5d7e2c",
+        "hint": "#7399a3",
+        "hint.background": "#123950",
+        "hint.border": "#24556f",
+        "created": "#d5fe80",
+        "modified": "#fecf72",
+        "deleted": "#f18779",
+        "syntax": {
+          "attribute": {
+            "color": "#72cffe"
+          },
+          "boolean": {
+            "color": "#dfbfff"
+          },
+          "comment": {
+            "color": "#5c6773"
+          },
+          "comment.doc": {
+            "color": "#9b9b99"
+          },
+          "constant": {
+            "color": "#dfbfff"
+          },
+          "constructor": {
+            "color": "#72cffe"
+          },
+          "embedded": {
+            "color": "#cccac2"
+          },
+          "emphasis": {
+            "color": "#72cffe"
+          },
+          "emphasis.strong": {
+            "color": "#72cffe",
+            "font_weight": 700
+          },
+          "enum": {
+            "color": "#fead66"
+          },
+          "function": {
+            "color": "#ffd173"
+          },
+          "hint": {
+            "color": "#7399a3"
+          },
+          "keyword": {
+            "color": "#ffad65"
+          },
+          "label": {
+            "color": "#72cffe"
+          },
+          "link_text": {
+            "color": "#fead66",
+            "font_style": "italic"
+          },
+          "link_uri": {
+            "color": "#d5fe80"
+          },
+          "number": {
+            "color": "#dfbfff"
+          },
+          "operator": {
+            "color": "#f29e74"
+          },
+          "predictive": {
+            "color": "#6d839b",
+            "font_style": "italic"
+          },
+          "preproc": {
+            "color": "#ffad65"
+          },
+          "primary": {
+            "color": "#cccac2"
+          },
+          "property": {
+            "color": "#72cffe"
+          },
+          "punctuation": {
+            "color": "#b4b3ae"
+          },
+          "punctuation.bracket": {
+            "color": "#b4b3ae"
+          },
+          "punctuation.delimiter": {
+            "color": "#b4b3ae"
+          },
+          "punctuation.list_marker": {
+            "color": "#b4b3ae"
+          },
+          "punctuation.special": {
+            "color": "#dfbfff"
+          },
+          "string": {
+            "color": "#d4fe7f"
+          },
+          "string.escape": {
+            "color": "#9b9b99"
+          },
+          "string.regex": {
+            "color": "#95e6cb"
+          },
+          "string.special": {
+            "color": "#ffdfb3"
+          },
+          "string.special.symbol": {
+            "color": "#fead66"
+          },
+          "tag": {
+            "color": "#72cffe"
+          },
+          "text.literal": {
+            "color": "#fead66"
+          },
+          "title": {
+            "color": "#cccac2",
+            "font_weight": 700
+          },
+          "type": {
+            "color": "#73cfff"
+          },
+          "variable": {
+            "color": "#cccac2"
+          },
+          "variant": {
+            "color": "#72cffe"
+          }
+        }
+      }
+    }
+  ]
+}

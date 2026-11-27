@@ -1275,7 +1275,7 @@ mod tests {
     fn agent_logs_open_full_size_and_filter(cx: &mut gpui_kit::TestAppContext) {
         cx.update(|cx| {
             gpui_kit::init(cx);
-            crate::theme::apply(true, "orange", cx);
+            crate::theme::apply(crate::theme::Appearance::builtin(true), cx);
         });
         let mut store = crate::store::automations::schedule_ui_fixture();
         let log = &mut store.runtime_mut_for_test("test-agent").log;
@@ -1377,7 +1377,7 @@ mod tests {
         use serde_json::json;
         cx.update(|cx| {
             gpui_kit::init(cx);
-            crate::theme::apply(true, "orange", cx);
+            crate::theme::apply(crate::theme::Appearance::builtin(true), cx);
         });
         let mut store = crate::store::automations::schedule_ui_fixture();
         store.prefs.developer_mode = true;
@@ -1491,7 +1491,7 @@ mod tests {
     fn debug_events_need_developer_mode(cx: &mut gpui_kit::TestAppContext) {
         cx.update(|cx| {
             gpui_kit::init(cx);
-            crate::theme::apply(true, "orange", cx);
+            crate::theme::apply(crate::theme::Appearance::builtin(true), cx);
         });
         let store = crate::store::automations::schedule_ui_fixture();
         let main_view = crate::session::SessionView::new("test-agent", "s1", "/w", "S");
@@ -1527,7 +1527,7 @@ mod tests {
         use serde_json::json;
         cx.update(|cx| {
             gpui_kit::init(cx);
-            crate::theme::apply(true, "orange", cx);
+            crate::theme::apply(crate::theme::Appearance::builtin(true), cx);
         });
         let mut store = crate::store::automations::schedule_ui_fixture();
         store.prefs.developer_mode = true;

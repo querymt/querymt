@@ -22,12 +22,22 @@ On desktop builds the app SHALL toggle the quick panel when its global shortcut 
 - **THEN** the panel closes and the draft is kept for the next time the panel opens
 
 ### Requirement: Looks like a HUD
-The panel SHALL be dark whatever the app's theme or the desktop's, with a look of its own that is visibly different from the main window: rounded corners, no rule under its header, a floating composer, assistant text without a card, user messages as a tinted pill, and tool calls as one-line chips. All of it, markdown and diffs included, SHALL use the panel's own colours.
+The panel SHALL follow the app's light or dark theme (not the desktop's), with a look of its own that is visibly different from the main window: rounded corners, no rule under its header, a floating composer, assistant text without a card, user messages as a tinted pill, and tool calls as one-line chips. All of it, markdown and diffs included, SHALL use the panel's own colours.
 
 #### Scenario: Light app theme
-- **GIVEN** the app theme is light and the desktop is set to light
+- **GIVEN** the app theme is light, whatever the desktop is set to
 - **WHEN** the panel is summoned
-- **THEN** its material, surfaces and text are dark, and the main window is unchanged
+- **THEN** its material and surfaces are light and all its text, assistant replies and markdown included, is dark and readable, and the main window is unchanged
+
+#### Scenario: Dark app theme
+- **GIVEN** the app theme is dark
+- **WHEN** the panel is summoned
+- **THEN** its material and surfaces are dark and its text is light
+
+#### Scenario: Theme changed while the panel is open
+- **GIVEN** the panel is open
+- **WHEN** the app theme changes between light and dark
+- **THEN** the panel's material, surfaces and text follow it
 
 #### Scenario: Transcript uses the panel's colours
 - **GIVEN** the panel shows a session with markdown, a code block and a diff
@@ -40,7 +50,7 @@ The panel SHALL be dark whatever the app's theme or the desktop's, with a look o
 #### Scenario: Typed text in a light app theme
 - **GIVEN** the app theme is light
 - **WHEN** the user types in the panel's composer or in a search field of the panel
-- **THEN** the text, its placeholder, its selection and its caret use the panel's colours and are light on the dark panel
+- **THEN** the text, its placeholder, its selection and its caret use the panel's colours and are dark on the light panel
 
 ### Requirement: A new quick chat is one bar
 Before a conversation is shown, the panel SHALL be a single bar holding the input, what the chat will run on and a way to pick a session, with no header. The header, with its new-chat, session-picker and open-in-main-window actions, SHALL appear with a conversation.

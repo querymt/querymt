@@ -2,11 +2,19 @@
 //! gpui-component theme, plus a `Palette` global for app-specific colors
 //! (status tones, accent tints) that the component theme has no slot for.
 
-use gpui_kit::component::{Theme, ThemeMode};
+mod accent;
+mod catalogue;
+
+use gpui_kit::component::{Theme, ThemeMode, ThemeRegistry};
 use gpui_kit::{App, Global, Hsla, px, rgb, rgba};
+
+pub use accent::{Accent, Appearance, Preset};
+pub use catalogue::{ThemeId, syntax};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Palette {
+    /// The theme this palette belongs to: its syntax colours come with it.
+    pub theme: ThemeId,
     pub dark: bool,
     pub bg: Hsla,
     pub surface: Hsla,
@@ -16,6 +24,9 @@ pub struct Palette {
     pub popover: Hsla,
     pub card: Hsla,
     pub card_hover: Hsla,
+    /// The highlighted row of a list or menu (the kit's `accent`). The theme's
+    /// own selection colour; the built-ins' `card` (design D4).
+    pub selected: Hsla,
     pub border: Hsla,
     pub border_strong: Hsla,
     pub text: Hsla,
@@ -52,12 +63,14 @@ impl Palette {
 
     pub fn light() -> Self {
         Self {
+            theme: ThemeId::QMT_LIGHT,
             dark: false,
             bg: hex(0xf6f5f4),
             surface: hex(0xffffff),
             popover: hex(0xffffff),
             card: hex(0xf1efed),
             card_hover: hex(0xebe9e6),
+            selected: hex(0xf1efed),
             border: hex(0xdeddda),
             border_strong: hex(0xc0bfbc),
             text: hex(0x241f31),
@@ -78,12 +91,14 @@ impl Palette {
 
     pub fn dark() -> Self {
         Self {
+            theme: ThemeId::QMT_DARK,
             dark: true,
             bg: hex(0x1b1b1b),
             surface: hex(0x202020),
             popover: hex(0x202020),
             card: hex(0x292929),
             card_hover: hex(0x303030),
+            selected: hex(0x292929),
             border: hex(0x383838),
             border_strong: hex(0x505050),
             text: hex(0xf5f5f5),
@@ -107,50 +122,14 @@ pub fn palette(cx: &App) -> &Palette {
     cx.global::<Palette>()
 }
 
-/// Accent presets (same set as the Svelte app): id, label, dark, light.
-pub const ACCENTS: [(&str, &str, u32, u32); 9] = [
-    ("blue", "Blue", 0x60a5fa, 0x3b82f6),
-    ("teal", "Teal", 0x2dd4bf, 0x14b8a6),
-    ("green", "Green", 0x4ade80, 0x22c55e),
-    ("amber", "Amber", 0xfacc15, 0xeab308),
-    ("orange", "Orange", 0xfb923c, 0xf97316),
-    ("red", "Red", 0xf87171, 0xef4444),
-    ("pink", "Pink", 0xf472b6, 0xec4899),
-    ("purple", "Purple", 0xc084fc, 0xa855f7),
-    ("slate", "Slate", 0x94a3b8, 0x64748b),
-];
-
-pub fn accent_color(id: &str, dark: bool) -> Hsla {
-    let (_, _, d, l) = ACCENTS
-        .iter()
-        .find(|a| a.0 == id)
-        .copied()
-        .unwrap_or(ACCENTS[4]);
-    hex(if dark { d } else { l })
-}
-
-/// Accent tint behind user message bubbles (`Palette::accent_dim`).
-pub fn accent_dim(id: &str, dark: bool) -> Hsla {
-    accent_color(id, dark).opacity(if dark { 0.16 } else { 0.12 })
-}
-
-/// Switch light/dark/accent and re-apply QueryMT colors over the component theme.
-pub fn apply(dark: bool, accent: &str, cx: &mut App) {
-    let mut p = if dark {
-        Palette::dark()
-    } else {
-        Palette::light()
-    };
-    if !accent.is_empty() && accent != "orange" {
-        let a = accent_color(accent, dark);
-        p.accent = a;
-        p.accent_hover = Hsla {
-            l: (a.l + if dark { 0.08 } else { -0.08 }).clamp(0., 1.),
-            ..a
-        };
-        p.accent_dim = accent_dim(accent, dark);
-    }
+/// Show `appearance`: set the palette, install the theme's kit config, then
+/// write the app's own tokens over it (design D7).
+pub fn apply(appearance: Appearance, cx: &mut App) {
+    let id = appearance.theme;
+    let dark = appearance.dark();
+    let p = appearance.palette();
     cx.set_global(p);
+    // The first call creates the kit theme; later ones only switch its mode.
     Theme::change(
         if dark {
             ThemeMode::Dark
@@ -160,6 +139,18 @@ pub fn apply(dark: bool, accent: &str, cx: &mut App) {
         None,
         cx,
     );
+    let config = id.config().unwrap_or_else(|| {
+        let registry = ThemeRegistry::global(cx);
+        if dark {
+            registry.default_dark_theme().clone()
+        } else {
+            registry.default_light_theme().clone()
+        }
+    });
+    // Its own update: a mode change with the same config pointer makes the
+    // kit reload the config over whatever the same closure wrote after it.
+    Theme::update(cx, |t| t.apply_config(&config));
+    let syntax = id.syntax();
     Theme::update(cx, |t| {
         t.font_family = "IBM Plex Sans".into();
         t.mono_font_family = "IBM Plex Mono".into();
@@ -201,9 +192,9 @@ pub fn apply(dark: bool, accent: &str, cx: &mut App) {
         t.button_active = p.card_hover;
         t.button_foreground = p.text;
 
-        t.accent = p.card;
+        t.accent = p.selected;
         t.accent_foreground = p.text;
-        t.popover = p.surface;
+        t.popover = p.popover;
         t.popover_foreground = p.text;
         t.list_hover = p.card;
         t.list_active = p.accent_dim;
@@ -212,7 +203,7 @@ pub fn apply(dark: bool, accent: &str, cx: &mut App) {
         t.sidebar = p.surface;
         t.sidebar_foreground = p.text;
         t.sidebar_border = p.border;
-        t.sidebar_accent = p.card;
+        t.sidebar_accent = p.selected;
         t.sidebar_accent_foreground = p.text;
         t.sidebar_primary = p.accent;
         t.sidebar_primary_foreground = p.on_accent;
@@ -224,6 +215,10 @@ pub fn apply(dark: bool, accent: &str, cx: &mut App) {
         t.danger = p.danger;
         t.success = p.success;
         t.warning = p.warn;
+        t.highlight_theme = syntax;
     });
     crate::highlight::install(cx);
 }
+
+#[cfg(test)]
+mod tests;

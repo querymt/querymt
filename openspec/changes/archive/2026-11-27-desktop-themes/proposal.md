@@ -25,6 +25,19 @@ colours chosen by their authors.
   11 light: Catppuccin, Tokyo Night, Ayu, Everforest, Flexoki, Gruvbox,
   Solarized, macOS Classic, Molokai, Mellifluous, Hybrid and others) are
   bundled with the app and offered in the list of their appearance.
+- Six more themes complete the set Zed ships built in: **Ayu Mirage**,
+  **Gruvbox Dark Soft**, **One Dark** (dark), **Gruvbox Light Hard**,
+  **Gruvbox Light Soft** and **One Light** (light). gpui-kit has none of
+  them, so they are converted once, by hand, from Zed's theme files into the
+  kit's format and bundled next to the kit's files. That makes 42 bundled
+  themes, 28 dark and 14 light. Zed's Gruvbox Dark Hard is left out: the
+  kit's Gruvbox Dark already uses gruvbox's hard background (`#1d2021`).
+- The command palette (Ctrl/Cmd+P) gets **Select theme…**, which lists
+  every theme, dark and light, with the one shown marked. Moving through the
+  list previews the highlighted theme in the window; Enter keeps it, Esc or a
+  click outside puts the previous look back. Picking a theme of the
+  appearance shown keeps the mode (System stays System); picking one of the
+  other appearance also switches the mode to Dark or Light.
 - Choosing a bundled theme recolours the whole window from the theme's own
   colours: page, sidebar, popovers, cards, borders, text, secondary text,
   status colours, and code in fences, tool output, diffs and inputs. Themes
@@ -61,7 +74,10 @@ colours chosen by their authors.
 - Fonts, font sizes and corner radii from theme files; the app keeps its
   own.
 - Loading user theme files from disk, Zed or VS Code theme import, or the
-  editor (tmTheme) themes bundled in `two-face`.
+  editor (tmTheme) themes bundled in `two-face`. The six Zed themes above are
+  converted once and committed; the app has no importer.
+- A keyboard shortcut for the theme picker (Zed's Cmd+K Cmd+T: Cmd+K belongs
+  to the quick panel); it is reached through the command palette.
 - A separate link colour per accent, or new accent presets.
 - Per-window or per-session themes.
 - Theming the quick panel beyond its accent, the app icon or the tray.
@@ -92,15 +108,21 @@ without a requirement change.
   (`Prefs` and its migration in `startup_state`),
   `src/ui/settings.rs` (Appearance selects, Theme accent swatch, previews),
   `src/ui/mod.rs` and `src/main.rs` (apply on start and on change),
+  `src/ui/keys.rs` (the palette's theme picker),
   `src/ui/md.rs`, `src/ui/session_view.rs`, `src/ui/kit.rs` (syntax colours
   taken from the palette in use, so the quick panel can keep its own),
-  `src/highlight.rs` (one cached fence highlighter per theme),
+  `src/highlight.rs` (a test that fences and tool output agree; fences
+  take the palette's syntax colours through the text view's style),
   `src/quick/hud.rs`, `src/film/scene.rs` and `src/film/mod.rs` (scenes may
   name a theme), and test call sites of `theme::apply`.
 - Assets: 21 theme files (172,276 bytes of JSON, about 18 KB gzipped)
   copied from the gpui-kit repository at a pinned commit into
   `assets/themes/kit/`, with a notice naming the source, the licence and each
-  theme's author. The web build's size before and after is measured.
+  theme's author. Three more files (Ayu Mirage; Gruvbox Dark Soft, Light
+  Hard and Light Soft; One Dark and Light) converted from Zed's theme files
+  into `assets/themes/extra/`, with a notice naming Zed's files, the
+  upstream projects and their MIT licences. The web build's size before and
+  after is measured.
 - Dependencies: none added; the kit's own theme types parse the files.
 - Persisted state: the desktop preferences file gains three optional keys
   (`theme_dark`, `theme_light`, `appearance_version`), and the existing

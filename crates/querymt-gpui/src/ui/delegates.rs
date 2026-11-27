@@ -888,7 +888,7 @@ mod tests {
 
         cx.update(|cx| {
             gpui_kit::init(cx);
-            crate::theme::apply(true, "orange", cx);
+            crate::theme::apply(crate::theme::Appearance::builtin(true), cx);
         });
         let (handle, app) = cx.update(|cx| {
             let store = cx.new(|cx| {
@@ -955,7 +955,7 @@ mod tests {
 
         cx.update(|cx| {
             gpui_kit::init(cx);
-            crate::theme::apply(true, "orange", cx);
+            crate::theme::apply(crate::theme::Appearance::builtin(true), cx);
         });
         let mut store = crate::store::launch::models_fixture(0);
         let (_rpc, requests) = store.rpc_for_test("test-agent");

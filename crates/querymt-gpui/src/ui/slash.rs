@@ -455,7 +455,7 @@ mod ui_tests {
     fn rig(cx: &mut TestAppContext, view: SessionView, control: bool) -> Rig {
         cx.update(|cx| {
             gpui_kit::init(cx);
-            crate::theme::apply(true, "orange", cx);
+            crate::theme::apply(crate::theme::Appearance::builtin(true), cx);
         });
         let mut store = crate::store::launch::peer_fixture();
         let (_rpc, requests) = store.rpc_for_test("test-agent");

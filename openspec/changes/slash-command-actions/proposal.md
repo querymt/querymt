@@ -9,7 +9,7 @@ The command palette cannot tell what picking a slash command will do. The app kn
 - a command the session cannot take now closes the palette and does nothing;
 - while a turn runs, any text that starts with `/` is queued, including a message that starts with a path, and a command the agent only takes as a prompt (`/worktree`) is queued and then rejected.
 
-querymt now states these facts per command (`add-slash-command-records` in the querymt repository): source, effect, input need and accepted submissions. This change makes the app use them. It covers built-in and user-defined commands (`~/.qmt/commands`, `<root>/.qmt/commands`, configured paths) with the same rules.
+querymt now states these facts per command (`add-slash-command-records`, in this repository): source, effect, input need and accepted submissions. This change makes the app use them. It covers built-in and user-defined commands (`~/.qmt/commands`, `<root>/.qmt/commands`, configured paths) with the same rules.
 
 This change replaces the earlier draft of `slash-command-actions`. The conversation part of that draft moved to `slash-command-transcript`.
 
@@ -49,13 +49,13 @@ None.
 
 ## Impact
 
-- **Depends on querymt `add-slash-command-records`** (catalog descriptor and `SlashCommandView` fields). That change must be merged and its revision pinned here first.
-- **This repository:**
-  - `Cargo.toml`: the `querymt-agent-session-core` revision (both entries).
+- **Depends on `add-slash-command-records`** (catalog descriptor and `SlashCommandView` fields). That change must land first. `querymt-gpui` uses `querymt-agent-session-core` by path, so there is no revision to pin.
+- **`crates/querymt-gpui`** (paths below are relative to it):
+  - `src/session/commands.rs` (new): the descriptor fallback and command recognition.
   - `src/ui/slash.rs`: command recognition, readiness, `run_slash_command`.
   - `src/ui/keys.rs`: palette targets, row content, Tab, the key hint footer.
   - `src/ui/session_view.rs`: `session_ready` and `send_session_prompt` use the shared readiness; the composer shows the reason.
   - `src/session/open.rs`: `OpenSession::send` takes the delivery decision instead of testing for a leading `/`.
   - Tests in `src/ui/keys.rs`, `src/ui/slash.rs`, `src/session/open.rs`.
 - **Compatibility:** with an agent that sends no descriptor, commands behave as before this change, except that text starting with `/` that names no command is no longer forced to queue.
-- **Related:** `slash-subcommands` depends on this change's input need, accepted submissions and unavailable rows. `slash-command-transcript` builds on tasks 1.1 and 1.2 of this change (the pinned revision and `src/session/commands.rs`).
+- **Related:** `slash-subcommands` depends on this change's input need, accepted submissions and unavailable rows. `slash-command-transcript` builds on tasks 1.1 and 1.2 of this change (the descriptor check and `src/session/commands.rs`).

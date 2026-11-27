@@ -195,6 +195,8 @@ fn build_store(
         // clip must not depend on it.
         store.prefs.dark = Some(scene.theme == Theme::Dark);
         store.prefs.accent = scene.accent.clone();
+        store.prefs.theme_dark = scene.color_theme.clone();
+        store.prefs.theme_light = scene.color_theme.clone();
         store
     });
     (store, link)
@@ -216,7 +218,7 @@ fn open(resolved: &Resolved) -> Film {
     cx.update(|cx| {
         gpui_kit::init(cx);
         crate::install_fonts(cx);
-        crate::theme::apply(scene.theme == Theme::Dark, &scene.accent, cx);
+        crate::theme::apply(scene.appearance(), cx);
         crate::ui::bind_keys(cx);
     });
     let (store, link) = cx.update(|cx| build_store(scene, resolved.address.as_deref(), cx));

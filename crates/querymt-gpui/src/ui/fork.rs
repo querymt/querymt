@@ -223,7 +223,7 @@ mod tests {
         use gpui_kit::AppContext as _;
         cx.update(|cx| {
             gpui_kit::init(cx);
-            crate::theme::apply(true, "orange", cx);
+            crate::theme::apply(crate::theme::Appearance::builtin(true), cx);
         });
         let mut view = SessionView::new("test-agent", "s", "/w", "Source");
         for id in ["u1", "u2"] {

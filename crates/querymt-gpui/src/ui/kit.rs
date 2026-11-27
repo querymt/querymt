@@ -643,7 +643,8 @@ pub fn title_icon_button(
         .tooltip(move |window, cx| wrap_tip(tip).build(window, cx))
 }
 
-/// Left-aligned popover menu row: icon + label, `card` background on hover.
+/// Left-aligned popover menu row: icon + label, the theme's selection colour
+/// on hover (a menu is a popover: `card` can equal its own background).
 /// (`Button` centres its content in an inner row, so `justify_start` can't.)
 pub fn menu_item(
     id: impl Into<ElementId>,
@@ -651,7 +652,7 @@ pub fn menu_item(
     label: impl Into<SharedString>,
     p: &Palette,
 ) -> Stateful<Div> {
-    let hover = p.card;
+    let hover = p.selected;
     h_flex()
         .id(id)
         .w_full()
@@ -1729,7 +1730,7 @@ mod tests {
     ) {
         let p = cx.update(|cx| {
             gpui_kit::init(cx);
-            crate::theme::apply(true, "orange", cx);
+            crate::theme::apply(crate::theme::Appearance::builtin(true), cx);
             *crate::theme::palette(cx)
         });
         assert_eq!(context_colour(0.69, &p), p.accent);
@@ -1803,8 +1804,7 @@ mod tests {
 /// placeholder in `muted`, the selection and the caret in the accent. The
 /// kit's own come from the app theme, which is wrong on a palette of its own
 /// (the quick panel's is dark whatever the app theme).
-pub(crate) fn editor_style(p: &Palette, cx: &App) -> base::input::InputEditorStyle {
-    let theme = gpui_kit::component::ActiveTheme::theme(cx);
+pub(crate) fn editor_style(p: &Palette, _cx: &App) -> base::input::InputEditorStyle {
     base::input::InputEditorStyle {
         foreground: p.text,
         muted_foreground: p.muted,
@@ -1812,7 +1812,7 @@ pub(crate) fn editor_style(p: &Palette, cx: &App) -> base::input::InputEditorSty
         border: p.border,
         selection: p.accent.opacity(0.32),
         caret: p.accent,
-        highlight_styles: theme.highlight_theme.clone(),
+        highlight_styles: crate::theme::syntax(p),
         ..Default::default()
     }
 }

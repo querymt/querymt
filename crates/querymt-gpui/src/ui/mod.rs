@@ -13,6 +13,8 @@ pub(crate) mod keys;
 pub(crate) mod kit;
 mod log_view;
 mod md;
+#[cfg(test)]
+pub(crate) use md::view_style;
 mod mermaid;
 mod mesh;
 pub(crate) mod model_picker;
@@ -277,6 +279,8 @@ pub struct QmtApp {
     /// and the Advanced maintenance / failed-plugin disclosures.
     provider_open: HashSet<String>,
     method_menu: Option<String>,
+    /// Appearance whose theme select is open (`true`: dark).
+    theme_menu: Option<bool>,
     maintenance_open: bool,
     failed_plugins_open: bool,
     /// General settings: Advanced / Danger zone disclosures and the reset confirmation.
@@ -325,6 +329,11 @@ pub struct QmtApp {
     /// Command palette (Ctrl/Cmd+P).
     palette: Entity<CommandState>,
     palette_open: bool,
+    /// What the palette lists: commands, or the theme picker (design D12).
+    palette_mode: keys::PaletteMode,
+    /// Row of the theme list to highlight once it has been drawn
+    /// (section, row).
+    theme_highlight: Option<(usize, usize)>,
     /// Selects of the Start Options (Profile, Target): the open one, its
     /// search and highlighted row (one menu is open at a time).
     option_menu: Option<profile_select::OptionMenu>,
@@ -527,6 +536,7 @@ impl QmtApp {
             key_editing: None,
             provider_open: HashSet::new(),
             method_menu: None,
+            theme_menu: None,
             maintenance_open: false,
             failed_plugins_open: false,
             general_advanced_open: false,
@@ -555,6 +565,8 @@ impl QmtApp {
             app_focus,
             palette,
             palette_open: false,
+            palette_mode: keys::PaletteMode::Commands,
+            theme_highlight: None,
             option_menu: None,
             profile_query,
             profile_cursor: 0,
@@ -645,14 +657,21 @@ impl QmtApp {
 
     /// Re-apply theme mode + accent from preferences.
     pub(crate) fn apply_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let prefs = self.store.read(cx).prefs.clone();
-        let dark = prefs.dark.unwrap_or_else(|| {
-            matches!(
-                window.appearance(),
-                WindowAppearance::Dark | WindowAppearance::VibrantDark
-            )
-        });
-        theme::apply(dark, &prefs.accent, cx);
+        let system_dark = matches!(
+            window.appearance(),
+            WindowAppearance::Dark | WindowAppearance::VibrantDark
+        );
+        self.apply_theme_for(system_dark, cx);
+    }
+
+    /// [`Self::apply_theme`] with the desktop's appearance given: System mode
+    /// shows the chosen dark or light theme of it.
+    fn apply_theme_for(&mut self, system_dark: bool, cx: &mut Context<Self>) {
+        // Copy out what is needed: this runs on every picker click.
+        let prefs = &self.store.read(cx).prefs;
+        let dark = prefs.dark.unwrap_or(system_dark);
+        let appearance = prefs.appearance(dark);
+        theme::apply(appearance, cx);
         cx.notify();
     }
 
@@ -664,10 +683,10 @@ impl QmtApp {
 
     /// Close the top-most overlay. Returns whether one was open.
     fn close_topmost(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.preview.take().is_some() || std::mem::take(&mut self.palette_open) {
+        if self.preview.take().is_some() || self.close_palette(cx) {
             return true;
         }
-        if self.side.menu.take().is_some() {
+        if self.side.menu.take().is_some() || self.theme_menu.take().is_some() {
             return true;
         }
         if self.close_log_view() {
@@ -1295,7 +1314,7 @@ impl Render for QmtApp {
         // rectangular, so the frame's `overflow_hidden` can't clip their corners.
         let overlay = self
             .render_preview(radii, window, cx)
-            .or_else(|| self.render_palette(radii, cx))
+            .or_else(|| self.render_palette(radii, window, cx))
             .or_else(|| self.render_log_view(radii, window, cx))
             .or_else(|| {
                 (self.page == Page::Session)

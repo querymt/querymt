@@ -1393,6 +1393,47 @@ impl AgentRuntime {
 // ---------------------------------------------------------------------------
 // Persistence
 
+/// A string preference that reads a value of any other type as unset, so one
+/// bad key never loses the whole saved state.
+fn lenient_string<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::String(s) => s,
+        _ => String::new(),
+    })
+}
+
+/// The version of the appearance preferences (theme keys, accent meaning).
+///
+/// Version 0 is a file saved before themes existed, which stored `orange`
+/// as the accent when it was merely the default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct AppearanceVersion(u32);
+
+impl AppearanceVersion {
+    pub const CURRENT: Self = Self(1);
+
+    /// What a file without the key was saved by.
+    pub fn legacy() -> Self {
+        Self(0)
+    }
+
+    /// A present value that is not a version is read as current, so garbage
+    /// never triggers the migration.
+    fn lenient<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(serde_json::Value::deserialize(d)?
+            .as_u64()
+            .and_then(|v| u32::try_from(v).ok())
+            .map_or(Self::CURRENT, Self))
+    }
+}
+
+impl Default for AppearanceVersion {
+    fn default() -> Self {
+        Self::CURRENT
+    }
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Prefs {
     pub dark: Option<bool>,
@@ -1415,9 +1456,22 @@ pub struct Prefs {
     /// default (44% of the page, at most the chat width).
     #[serde(default)]
     pub turn_diff_width: Option<f32>,
-    /// Accent preset id (`orange`, `blue`, …).
+    /// Accent preset id (`blue`, `orange`, …); empty: the theme's own accent.
     #[serde(default)]
     pub accent: String,
+    /// Theme key of the dark appearance; empty, unknown or a light theme's
+    /// key: QueryMT Dark. Kept as saved until the user picks another.
+    #[serde(default, deserialize_with = "lenient_string")]
+    pub theme_dark: String,
+    /// Theme key of the light appearance (as `theme_dark`).
+    #[serde(default, deserialize_with = "lenient_string")]
+    pub theme_light: String,
+    /// Which version of the appearance preferences saved this file.
+    #[serde(
+        default = "AppearanceVersion::legacy",
+        deserialize_with = "AppearanceVersion::lenient"
+    )]
+    pub appearance_version: AppearanceVersion,
     #[serde(default)]
     pub show_pinned_sidebar: bool,
     /// Tab order of the sidebar's open sessions (`agent/session`, top first).
@@ -1537,6 +1591,29 @@ impl PickerLayout {
 }
 
 impl Prefs {
+    /// The theme shown in the dark or light appearance: the saved key, or the
+    /// QueryMT theme when it is empty, unknown or of the other appearance.
+    pub fn theme_id(&self, dark: bool) -> crate::theme::ThemeId {
+        let saved = if dark {
+            &self.theme_dark
+        } else {
+            &self.theme_light
+        };
+        crate::theme::ThemeId::resolve(saved, dark)
+    }
+
+    /// The saved accent: a preset, or the shown theme's own.
+    pub fn accent_choice(&self) -> crate::theme::Accent {
+        crate::theme::Accent::parse(&self.accent)
+    }
+
+    /// What to show in the `dark` or light appearance.
+    pub fn appearance(&self, dark: bool) -> crate::theme::Appearance {
+        crate::theme::Appearance {
+            theme: self.theme_id(dark),
+            accent: self.accent_choice(),
+        }
+    }
     /// Peers whose sessions the catalog asks for (desktop `remoteNodeIds`).
     pub fn remote_node_ids(&self) -> Vec<String> {
         if self.show_remote_sessions {
@@ -1780,6 +1857,14 @@ fn startup_state(
             completed_at: Some(crate::util::rfc3339_now()),
             skipped_at: None,
         };
+    }
+    // Before themes existed `orange` was what the Accent row saved while it
+    // showed the default selected, not a choice: it is the theme's accent now.
+    if persisted.prefs.appearance_version < AppearanceVersion::CURRENT {
+        if persisted.prefs.accent == "orange" {
+            persisted.prefs.accent.clear();
+        }
+        persisted.prefs.appearance_version = AppearanceVersion::CURRENT;
     }
     let mut configs = persisted.configs;
     for seed in seeds {
@@ -5455,6 +5540,117 @@ mod seed_tests {
         assert!(saved.prefs.dismissed_seeds.is_empty());
         let (configs, ..) = startup_state(Some(saved), vec![local_seed()]);
         assert_eq!(ids(&configs), ["local-qmtcode"], "nothing is dismissed");
+    }
+
+    fn load(text: &str) -> Persisted {
+        serde_json::from_str(text).expect("state loads")
+    }
+
+    /// The preferences the next start would read after `prefs` was saved.
+    fn reload(prefs: &Prefs) -> Prefs {
+        let text = serde_json::to_string(&Persisted {
+            configs: Vec::new(),
+            prefs: prefs.clone(),
+        })
+        .expect("state saves");
+        startup_state(Some(load(&text)), Vec::new()).1
+    }
+
+    #[test]
+    fn older_preferences_load_without_theme_keys() {
+        let saved = load(r#"{"configs":[],"prefs":{"dark":false,"cwd":"/w","accent":"blue"}}"#);
+        assert_eq!(saved.prefs.dark, Some(false));
+        assert_eq!(saved.prefs.cwd, "/w");
+        assert_eq!(saved.prefs.theme_id(true), crate::theme::ThemeId::QMT_DARK);
+        assert_eq!(
+            saved.prefs.theme_id(false),
+            crate::theme::ThemeId::QMT_LIGHT
+        );
+        let (_, prefs, _) = startup_state(Some(saved), Vec::new());
+        assert_eq!(prefs.accent, "blue", "a non-orange accent is kept");
+        assert_eq!(prefs.accent_choice().id(), "blue");
+    }
+
+    #[test]
+    fn legacy_orange_accent_becomes_the_theme_accent() {
+        let saved = load(r#"{"configs":[],"prefs":{"accent":"orange"}}"#);
+        assert_eq!(saved.prefs.appearance_version, AppearanceVersion::legacy());
+        let (_, prefs, _) = startup_state(Some(saved), Vec::new());
+        assert_eq!(prefs.accent, "");
+        assert_eq!(prefs.appearance_version, AppearanceVersion::CURRENT);
+        assert_eq!(prefs.accent_choice(), crate::theme::Accent::Theme);
+    }
+
+    #[test]
+    fn orange_picked_after_the_upgrade_is_kept() {
+        let (_, mut prefs, _) = startup_state(None, Vec::new());
+        prefs.accent = "orange".into();
+        assert_eq!(reload(&prefs).accent, "orange");
+        assert_eq!(reload(&reload(&prefs)).accent, "orange");
+    }
+
+    #[gpui_kit::test]
+    fn orange_survives_reset_app_data(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        let store = cx.new(|_| {
+            let mut store = automations::schedule_ui_fixture();
+            store.prefs.accent = "teal".into();
+            store
+        });
+        cx.update(|cx| store.update(cx, |s, cx| s.reset_with_seeds(vec![local_seed()], cx)));
+        let prefs = cx.update(|cx| {
+            store.update(cx, |s, cx| {
+                s.update_prefs(|p| p.accent = "orange".into(), cx);
+                s.prefs.clone()
+            })
+        });
+        assert_eq!(prefs.appearance_version, AppearanceVersion::CURRENT);
+        assert_eq!(reload(&prefs).accent, "orange");
+    }
+
+    #[test]
+    fn invalid_version_does_not_rewrite_the_accent() {
+        let saved =
+            load(r#"{"configs":[],"prefs":{"accent":"orange","appearance_version":"two"}}"#);
+        let (_, prefs, _) = startup_state(Some(saved), Vec::new());
+        assert_eq!(prefs.accent, "orange");
+        assert_eq!(prefs.appearance_version, AppearanceVersion::CURRENT);
+    }
+
+    #[test]
+    fn fresh_install_is_current() {
+        let (_, prefs, first_run) = startup_state(None, Vec::new());
+        assert!(first_run);
+        assert_eq!(prefs.appearance_version, AppearanceVersion::CURRENT);
+        assert_eq!(prefs.accent, "");
+    }
+
+    #[test]
+    fn non_string_theme_value_is_unset() {
+        let text = serde_json::json!({
+            "configs": [local_seed()],
+            "prefs": { "theme_light": 7, "theme_dark": "tokyo-night", "cwd": "/w" },
+        })
+        .to_string();
+        let saved = load(&text);
+        assert_eq!(saved.prefs.theme_light, "");
+        assert_eq!(saved.prefs.theme_dark, "tokyo-night");
+        assert_eq!(saved.prefs.cwd, "/w");
+        assert_eq!(saved.configs.len(), 1, "agents still load");
+    }
+
+    #[test]
+    fn unknown_theme_id_is_kept() {
+        let saved = load(
+            r#"{"configs":[],"prefs":{"theme_dark":"removed-theme","theme_light":"tokyo-night"}}"#,
+        );
+        let (_, prefs, _) = startup_state(Some(saved), Vec::new());
+        // Resolved to the built-in themes, saved as it was.
+        assert_eq!(prefs.theme_id(true), crate::theme::ThemeId::QMT_DARK);
+        assert_eq!(prefs.theme_id(false), crate::theme::ThemeId::QMT_LIGHT);
+        let again = reload(&prefs);
+        assert_eq!(again.theme_dark, "removed-theme");
+        assert_eq!(again.theme_light, "tokyo-night");
     }
 
     #[gpui_kit::test]

@@ -308,6 +308,12 @@ impl SessionPane {
         self.palette.unwrap_or_else(|| *crate::theme::palette(cx))
     }
 
+    /// The colours the pane paints with.
+    #[cfg(test)]
+    pub(crate) fn palette_for_test(&self, cx: &App) -> Palette {
+        self.palette(cx)
+    }
+
     /// Put the keyboard focus in the composer.
     pub(crate) fn focus_composer(&self, window: &mut Window, cx: &mut Context<Self>) {
         self.prompt.update(cx, |input, cx| input.focus(window, cx));
@@ -825,7 +831,7 @@ mod tests {
     fn rig(cx: &mut TestAppContext) -> Rig {
         cx.update(|cx| {
             gpui_kit::init(cx);
-            crate::theme::apply(true, "orange", cx);
+            crate::theme::apply(crate::theme::Appearance::builtin(true), cx);
         });
         let mut store = crate::store::automations::schedule_ui_fixture();
         let (_, requests) = store.rpc_for_test("test-agent");

@@ -2,9 +2,12 @@
 
 ## Context
 
-- **Runtime:** `/worktree`'s operations exist only as a parser in querymt `ext_worktree_ops.rs` (the match on `"create"`, `"list"`, … `"recover"`) and as one hint string in `Builtin::entry`. Delivery rules for the whole command are in `Builtin::accepts` (prompt only).
+Agent paths are under `crates/`; app paths are relative to `crates/querymt-gpui`, a member of this workspace that depends on `querymt-agent-session-core` by path.
+
+- **Runtime:** `/worktree`'s operations exist only as a parser in `crates/agent-runtime/src/agent/handle/ext_worktree_ops.rs` (the match on `"create"`, `"list"`, … `"recover"`) and as one hint string in `Builtin::entry`. Submission rules for the whole command are in `Builtin::accepts` (prompt only), advertised as `accepts` by `add-slash-command-records`.
 - **Client, after `slash-command-actions`:**
-  - `SlashCommandView` carries `source`, `effect`, `input` and `accepts` (querymt `add-slash-command-records`).
+  - `SlashCommandView` carries `source`, `effect`, `input` and `accepts: Option<Vec<..>>` (`add-slash-command-records`).
+  - `src/session/commands.rs` `CommandTraits::of` holds the no-descriptor fallback.
   - Palette entries are `PaletteTarget::SlashCommand { name, input, blocked }`; a command the session cannot take is an unavailable row with a reason.
   - Tab puts a command that takes input in the composer.
 - **Composer list:** `src/ui/slash.rs` shows the command list while the cursor is in the first word (`slash_list`), moves with `slash_move` (`:117`), completes with `slash_complete_highlighted` (`:134`) and closes with `close_slash_list` (`:204`). Completion replaces the first word and keeps the rest.
@@ -24,8 +27,8 @@
 
 ### D1. Subcommands in `_meta.querymt.subcommands`
 
-- **Shape:** each element is `{ name, description, input: none|optional|required, hint?, accepts?, destructive: bool }`. `accepts` defaults to the parent's.
-- **Runtime source:** a `const` table of `WorktreeOp` descriptors (name, description, arity, hint, destructive) next to the parser in `ext_worktree_ops.rs`. `Builtin::entry` builds the metadata from that table, and the parser's `match` is tested against the same table, so an operation added to one and not the other fails a test.
+- **Shape:** each element is `{ name, description, input: none|optional|required, hint?, accepts?, destructive: bool }`, with the value names of the catalog descriptor (`add-slash-command-records` D1). `accepts` defaults to the parent's.
+- **Runtime source:** a `const` table of `WorktreeOp` descriptors (name, description, input need, hint, destructive) next to the parser in `ext_worktree_ops.rs`. `Builtin::entry` builds the metadata from that table, and the parser's `match` is tested against the same table, so an operation added to one and not the other fails a test.
 - **`/worktree` classification:**
 
   | Subcommand | Input | Destructive |
@@ -40,17 +43,19 @@
   | `archive` | optional | yes |
   | `remove` | optional | yes |
 
-- **Client view:** `agent-session-core` adds `SlashCommandView.subcommands: Vec<SubcommandView>`. A malformed element is skipped; a malformed list leaves the command without subcommands, so it behaves as today.
+- **Client view:** `agent-session-core` adds `SlashCommandView.subcommands: Vec<SubcommandView>`. `SubcommandView.accepts` is the parent's `accepts` when the element has none, so it stays `None` only when the parent has no descriptor either. A malformed element is skipped; a malformed list leaves the command without subcommands, so it behaves as today.
+- **App:** `CommandTraits::of_subcommand(&SlashCommandView, &SubcommandView)` applies the same per-field fallback as `CommandTraits::of`; it lives next to it in `src/session/commands.rs`.
 - **Alternative considered:** parsing the `|`-separated hint in the client. It is fragile, and it cannot express `destructive`.
 
 ### D2. Palette: a target per subcommand; destructive forces the composer
 
-- **Target:** `PaletteTarget::SlashCommand { name, sub: Option<String>, input, destructive }`.
+- **Target:** `PaletteTarget::SlashCommand { name, sub: Option<String>, input, blocked: Option<Blocked>, destructive }`. `blocked` is the field of `slash-command-actions` D4, kept so a subcommand row can be unavailable.
 - **Entries:** `palette_groups` emits one entry per subcommand, labelled `"{name} {sub}"` with the subcommand's description and keywords (parent name, subcommand name, description). The parent entry is omitted when it has subcommands.
 - **Picking:** goes through `run_slash_command(name, sub, input, destructive)`.
+  - A blocked row does nothing and keeps the palette open, as in `slash-command-actions` D4; this check comes first, also for a destructive subcommand.
   - A destructive subcommand prefills `/{name} {sub} `.
   - Any other subcommand follows `input` as in `slash-command-actions` D6, so Tab still prefills an optional one.
-- **Readiness:** uses the subcommand's `accepts`.
+- **Readiness:** `SessionPane::readiness` (`slash-command-actions` D3) gains an optional subcommand argument; with one, it reads `accepts_queue` from `CommandTraits::of_subcommand`, so `blocked` uses the subcommand's `accepts`. Typed text `/name sub …` resolves the subcommand the same way before `send_session_prompt` checks readiness.
 - **Destructive marker:** `IconName::TriangleAlert` in `p.danger` replaces the row's `SquareSlash` icon, and the tooltip begins "Destructive:". The label stays in `p.text`, so it stays readable and does not rely on colour alone.
 - **Ordering:** fan-out keeps the agent's order. The palette's group ranking (best match first) is unchanged.
 

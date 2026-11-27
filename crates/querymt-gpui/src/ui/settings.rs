@@ -11,7 +11,7 @@ use super::kit::{danger_btn, flat_btn, subtle};
 use super::mesh::panel;
 use super::{QmtApp, kit};
 use crate::store::{ImageSendMode, ProviderAuth, SendShortcut};
-use crate::theme::{ACCENTS, Palette, accent_color, accent_dim, palette};
+use crate::theme::{Accent, Appearance, Palette, Preset, ThemeId, palette};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SettingsTab {
@@ -242,9 +242,20 @@ fn section_heading(title: &'static str, desc: &'static str, p: &Palette) -> Div 
 
 const THEME_PREVIEW_H: f32 = 112.;
 
+/// What the Theme swatch is painted with: the shown theme's own accent, never
+/// the palette's, which holds a picked preset.
+fn theme_swatch_colour(p: &Palette) -> Hsla {
+    p.theme.accent()
+}
+
+/// The palette a preview of `theme` paints with, under `accent`.
+fn preview_palette(theme: ThemeId, accent: Accent) -> Palette {
+    Appearance { theme, accent }.palette()
+}
+
 /// Miniature app window drawn in `pal`: sidebar, header, text lines and a
 /// composer with the accent dot.
-fn theme_mock(pal: &Palette, accent: &str) -> Div {
+fn theme_mock(pal: &Palette) -> Div {
     let bar = |w: f32| div().h(px(6.)).w(px(w)).rounded_full().bg(pal.border);
     // One turn, like the transcript: the user bubble sits right on the accent
     // tint (`Palette::accent_dim`), the assistant reply is plain text lines.
@@ -253,7 +264,7 @@ fn theme_mock(pal: &Palette, accent: &str) -> Div {
             .h(px(12.))
             .w(px(48.))
             .rounded(px(4.))
-            .bg(accent_dim(accent, pal.dark)),
+            .bg(pal.accent_dim),
     );
     h_flex()
         .size_full()
@@ -298,25 +309,29 @@ fn theme_mock(pal: &Palette, accent: &str) -> Div {
                         .border_1()
                         .border_color(pal.border)
                         .bg(pal.surface)
-                        .child(
-                            div()
-                                .size(px(7.))
-                                .rounded_full()
-                                .bg(accent_color(accent, pal.dark)),
-                        ),
+                        .child(div().size(px(7.)).rounded_full().bg(pal.accent)),
                 ),
         )
 }
 
 /// Preview for a theme mode: light, dark, or (System) light with its right
-/// half shown in dark.
-fn theme_preview(mode: Option<bool>, accent: &str, p: &Palette) -> Div {
-    let (light, dark) = (Palette::light(), Palette::dark());
+/// half shown in dark. Each is drawn in the theme chosen for its appearance.
+fn theme_preview(
+    mode: Option<bool>,
+    dark: ThemeId,
+    light: ThemeId,
+    accent: Accent,
+    p: &Palette,
+) -> Div {
+    let (light, dark) = (
+        preview_palette(light, accent),
+        preview_palette(dark, accent),
+    );
     let base = div().relative().w_full().h(px(THEME_PREVIEW_H));
     match mode {
-        Some(true) => base.child(theme_mock(&dark, accent)),
-        Some(false) => base.child(theme_mock(&light, accent)),
-        None => base.child(theme_mock(&light, accent)).child(
+        Some(true) => base.child(theme_mock(&dark)),
+        Some(false) => base.child(theme_mock(&light)),
+        None => base.child(theme_mock(&light)).child(
             // The dark mock is twice the half's width and anchored right,
             // so only its right half shows.
             div()
@@ -336,7 +351,7 @@ fn theme_preview(mode: Option<bool>, accent: &str, p: &Palette) -> Div {
                         .bottom_0()
                         .right_0()
                         .w(relative(2.))
-                        .child(theme_mock(&dark, accent)),
+                        .child(theme_mock(&dark)),
                 ),
         ),
     }
@@ -750,11 +765,15 @@ impl QmtApp {
     /// Theme mode cards and accent swatches (desktop `AppearanceControls`),
     /// shared by Settings and setup.
     pub(super) fn appearance_controls(&self, p: &Palette, cx: &mut Context<Self>) -> Div {
-        let prefs = self.store.read(cx).prefs.clone();
-        let accent = if prefs.accent.is_empty() {
-            "orange".to_string()
-        } else {
-            prefs.accent.clone()
+        // Copy out `Copy` values: this runs on every render.
+        let (mode, dark_theme, light_theme, accent) = {
+            let prefs = &self.store.read(cx).prefs;
+            (
+                prefs.dark,
+                prefs.theme_id(true),
+                prefs.theme_id(false),
+                prefs.accent_choice(),
+            )
         };
 
         // ---- Application theme: one preview card per mode.
@@ -767,8 +786,8 @@ impl QmtApp {
         let theme_cards =
             h_flex()
                 .gap(px(12.))
-                .children(modes.into_iter().map(|(mode, id, label)| {
-                    let selected = prefs.dark == mode;
+                .children(modes.into_iter().map(|(card, id, label)| {
+                    let selected = mode == card;
                     v_flex()
                         .id(id)
                         .flex_1()
@@ -787,7 +806,7 @@ impl QmtApp {
                                     .hover(move |s| s.bg(hover))
                             }
                         })
-                        .child(theme_preview(mode, &accent, p))
+                        .child(theme_preview(card, dark_theme, light_theme, accent, p))
                         .child(
                             div()
                                 .text_center()
@@ -797,33 +816,65 @@ impl QmtApp {
                                 .child(label),
                         )
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.store.update(cx, |s, cx| s.set_theme_mode(mode, cx));
+                            this.store.update(cx, |s, cx| s.set_theme_mode(card, cx));
                             this.apply_theme(window, cx);
                         }))
                 }));
 
-        // ---- Accent color
+        // ---- Dark and light theme.
+        let theme_rows = settings_card(p)
+            .child(self.theme_select_row(true, dark_theme, p, cx))
+            .child(self.theme_select_row(false, light_theme, p, cx));
+
+        // ---- Accent color: the theme's own, then the presets.
+        let theme_swatch = {
+            // The shown theme's own accent, never the palette's (which holds
+            // a picked preset).
+            let color = theme_swatch_colour(p);
+            let selected = accent == Accent::Theme;
+            div()
+                .id("accent-theme")
+                .debug_selector(|| "accent-theme".into())
+                .size(px(26.))
+                .rounded_full()
+                .p(px(3.))
+                .border_2()
+                .border_color(if selected { color } else { transparent_black() })
+                .cursor_pointer()
+                .tooltip(move |window, cx| kit::wrap_tip("Theme").build(window, cx))
+                .child(div().size_full().rounded_full().bg(color))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.store.update(cx, |s, cx| {
+                        s.update_prefs(|p| p.accent = Accent::Theme.id().to_string(), cx)
+                    });
+                    this.apply_theme(window, cx);
+                }))
+        };
         let swatches =
             h_flex()
                 .flex_none()
                 .gap_2()
-                .children(ACCENTS.iter().map(|(id, label, _, _)| {
-                    let id: &'static str = id;
-                    let color = accent_color(id, p.dark);
-                    let selected = accent == id;
+                .child(theme_swatch)
+                .children(Preset::all().map(|preset| {
+                    let color = preset.color(p.dark);
+                    let selected = accent == Accent::Preset(preset);
                     div()
-                        .id(id)
+                        .id(preset.id())
+                        .debug_selector(move || format!("accent-{}", preset.id()))
                         .size(px(26.))
                         .rounded_full()
                         .p(px(3.))
                         .border_2()
                         .border_color(if selected { color } else { transparent_black() })
                         .cursor_pointer()
-                        .tooltip(move |window, cx| kit::wrap_tip(*label).build(window, cx))
+                        .tooltip(move |window, cx| kit::wrap_tip(preset.label()).build(window, cx))
                         .child(div().size_full().rounded_full().bg(color))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.store.update(cx, |s, cx| {
-                                s.update_prefs(|p| p.accent = id.to_string(), cx)
+                                s.update_prefs(
+                                    |p| p.accent = Accent::Preset(preset).id().to_string(),
+                                    cx,
+                                )
                             });
                             this.apply_theme(window, cx);
                         }))
@@ -841,13 +892,154 @@ impl QmtApp {
                     ))
                     .child(theme_cards),
             )
+            .child(theme_rows)
             .child(settings_card(p).child(simple_row(
                 "Accent color",
-                "Highlights buttons, prompts and selections. Applies instantly.",
+                "Theme uses the theme's own accent; a color overrides it. Applies instantly.",
                 swatches,
                 true,
                 p,
             )))
+    }
+
+    /// One "Dark theme" / "Light theme" row: a pill select over the themes of
+    /// that appearance, the theme in use marked.
+    fn theme_select_row(
+        &self,
+        dark: bool,
+        current: ThemeId,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let (title, help, key) = if dark {
+            (
+                "Dark theme",
+                "Shown in Dark mode, and in System mode when the desktop is dark.",
+                "dark",
+            )
+        } else {
+            (
+                "Light theme",
+                "Shown in Light mode, and in System mode when the desktop is light.",
+                "light",
+            )
+        };
+        let open = self.theme_menu == Some(dark);
+        let trigger = flat_btn(kit::keyed("theme-select", key), true, true, p)
+            .debug_selector(move || format!("theme-select-{key}"))
+            .min_w(px(176.))
+            .justify_between()
+            .child(current.label())
+            .child(kit::icon(
+                if open {
+                    IconName::ChevronUp
+                } else {
+                    IconName::ChevronDown
+                },
+                13.,
+                p.muted,
+            ))
+            .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
+                if this.dismissed.closed_by(&format!("theme:{dark}"), ev) {
+                    return;
+                }
+                this.theme_menu = if this.theme_menu == Some(dark) {
+                    None
+                } else {
+                    Some(dark)
+                };
+                cx.notify();
+            }));
+        let menu = open.then(|| {
+            let hover = p.card_hover;
+            let items: Vec<AnyElement> = ThemeId::of_appearance(dark)
+                .into_iter()
+                .map(|theme| {
+                    let selected = theme == current;
+                    let swatch = theme.palette_swatches();
+                    h_flex()
+                        .id(kit::keyed("theme-option", theme.key()))
+                        .debug_selector(move || format!("theme-option-{}", theme.key()))
+                        .h(px(30.))
+                        .px_2()
+                        .gap_2()
+                        .flex_none()
+                        .rounded(px(6.))
+                        .cursor_pointer()
+                        .text_size(px(12.))
+                        .hover(move |s| s.bg(hover))
+                        .child(h_flex().flex_none().gap(px(2.)).children(swatch.map(|c| {
+                            div()
+                                .size(px(10.))
+                                .rounded_full()
+                                .border_1()
+                                .border_color(p.border_strong)
+                                .bg(c)
+                        })))
+                        .child(div().flex_1().truncate().child(theme.label()))
+                        .when(selected, |el| {
+                            el.child(
+                                div()
+                                    .debug_selector(move || {
+                                        format!("theme-selected-{}", theme.key())
+                                    })
+                                    .child(kit::icon(IconName::Check, 13., p.accent)),
+                            )
+                        })
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.theme_menu = None;
+                            this.store.update(cx, |s, cx| {
+                                s.update_prefs(
+                                    |prefs| {
+                                        let key = theme.key().to_string();
+                                        if dark {
+                                            prefs.theme_dark = key;
+                                        } else {
+                                            prefs.theme_light = key;
+                                        }
+                                    },
+                                    cx,
+                                )
+                            });
+                            this.apply_theme(window, cx);
+                        }))
+                        .into_any_element()
+                })
+                .collect();
+            deferred(
+                v_flex()
+                    .id(kit::keyed("theme-menu", key))
+                    .debug_selector(move || format!("theme-menu-{key}"))
+                    .absolute()
+                    .top(px(36.))
+                    .right_0()
+                    .w(px(232.))
+                    .max_h(px(320.))
+                    .overflow_y_scroll()
+                    .p_1()
+                    .rounded(px(10.))
+                    .bg(p.popover)
+                    .border_1()
+                    .border_color(p.border)
+                    .when(p.overlay_shadow(), |el| el.shadow_lg())
+                    .occlude()
+                    .on_mouse_down_out(cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                        if this.theme_menu.take().is_some() {
+                            this.dismissed.record(format!("theme:{dark}"), ev);
+                        }
+                        cx.notify();
+                    }))
+                    .children(items),
+            )
+            .with_priority(1)
+        });
+        simple_row(
+            title,
+            help,
+            div().relative().child(trigger).children(menu),
+            dark,
+            p,
+        )
     }
 
     fn settings_appearance(&self, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2196,7 +2388,7 @@ mod tests {
 
         cx.update(|cx| {
             gpui_kit::init(cx);
-            crate::theme::apply(true, "orange", cx);
+            crate::theme::apply(crate::theme::Appearance::builtin(true), cx);
         });
         let store = crate::store::automations::schedule_ui_fixture();
         let (handle, app) = cx.update(|cx| {
@@ -2236,7 +2428,7 @@ mod tests {
     fn developer_mode_is_a_general_setting(cx: &mut gpui_kit::TestAppContext) {
         cx.update(|cx| {
             gpui_kit::init(cx);
-            crate::theme::apply(true, "orange", cx);
+            crate::theme::apply(crate::theme::Appearance::builtin(true), cx);
         });
         let store = crate::store::automations::schedule_ui_fixture();
         let (handle, app) = cx.update(|cx| {
@@ -2268,7 +2460,7 @@ mod tests {
     fn plugin_update_shows_progress_then_the_outcome(cx: &mut gpui_kit::TestAppContext) {
         cx.update(|cx| {
             gpui_kit::init(cx);
-            crate::theme::apply(true, "orange", cx);
+            crate::theme::apply(crate::theme::Appearance::builtin(true), cx);
         });
         let mut store = crate::store::automations::schedule_ui_fixture();
         let (rpc, requests) = store.rpc_for_test("test-agent");
@@ -2346,5 +2538,293 @@ mod tests {
         render(cx);
         let mut vcx = gpui_kit::VisualTestContext::from_window(handle, cx);
         assert!(vcx.debug_bounds("maint-progress").is_none());
+    }
+
+    // ---- themes
+
+    use crate::store::{AgentsStore, Prefs};
+    use crate::theme::{Accent, Appearance, Preset, ThemeId};
+    use gpui_kit::{AnyWindowHandle, Entity, Modifiers, TestAppContext, VisualTestContext};
+
+    fn theme(key: &str, dark: bool) -> ThemeId {
+        let id = ThemeId::resolve(key, dark);
+        assert_eq!(*id.key(), *key, "no such theme");
+        id
+    }
+
+    /// Settings -> Appearance with `prefs` applied, as the app starts.
+    fn appearance_page(
+        cx: &mut TestAppContext,
+        prefs: impl FnOnce(&mut Prefs),
+    ) -> (AnyWindowHandle, Entity<QmtApp>, Entity<AgentsStore>) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::apply(Appearance::builtin(true), cx);
+        });
+        let mut store = crate::store::automations::schedule_ui_fixture();
+        prefs(&mut store.prefs);
+        let (handle, app, store) = cx.update(|cx| {
+            let store = cx.new(|_| store);
+            let (handle, app) = gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                cx.new(|cx| QmtApp::new(store.clone(), window, cx))
+            })
+            .unwrap();
+            (handle, app, store)
+        });
+        cx.update_window(handle, |_, window, cx| {
+            app.update(cx, |app, cx| {
+                app.apply_theme(window, cx);
+                app.go(Page::Settings, cx);
+                app.settings_tab = SettingsTab::Appearance;
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        (handle, app, store)
+    }
+
+    fn render(cx: &mut TestAppContext, handle: AnyWindowHandle) {
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+    }
+
+    /// Where `selector` is on screen, if it is.
+    fn bounds(
+        cx: &mut TestAppContext,
+        handle: AnyWindowHandle,
+        selector: &str,
+    ) -> Option<gpui_kit::Bounds<gpui_kit::Pixels>> {
+        let selector: &'static str = Box::leak(selector.to_string().into_boxed_str());
+        VisualTestContext::from_window(handle, cx).debug_bounds(selector)
+    }
+
+    fn click(cx: &mut TestAppContext, handle: AnyWindowHandle, selector: &str) {
+        let at = bounds(cx, handle, selector)
+            .unwrap_or_else(|| panic!("{selector} is not on screen"))
+            .center();
+        VisualTestContext::from_window(handle, cx).simulate_click(at, Modifiers::none());
+        render(cx, handle);
+    }
+
+    /// Scroll the open theme menu until `selector` is inside it.
+    fn scroll_to(cx: &mut TestAppContext, handle: AnyWindowHandle, menu: &str, selector: &str) {
+        let at = bounds(cx, handle, menu).expect("the menu is open").center();
+        for _ in 0..40 {
+            let (menu_b, row_b) = (
+                bounds(cx, handle, menu).expect("menu"),
+                bounds(cx, handle, selector).expect("row"),
+            );
+            if row_b.bottom() <= menu_b.bottom() && row_b.top() >= menu_b.top() {
+                return;
+            }
+            VisualTestContext::from_window(handle, cx).simulate_event(gpui_kit::ScrollEvent {
+                position: at,
+                delta: gpui_kit::ScrollDelta::Pixels(gpui_kit::point(
+                    gpui_kit::px(0.),
+                    gpui_kit::px(-60.),
+                )),
+                ..Default::default()
+            });
+            render(cx, handle);
+        }
+        panic!("{selector} never came into view");
+    }
+
+    fn shown_bg(cx: &mut TestAppContext) -> gpui_kit::Hsla {
+        cx.update(|cx| crate::theme::palette(cx).bg)
+    }
+
+    fn lists_only(cx: &mut TestAppContext, dark: bool) {
+        let (handle, ..) = appearance_page(cx, |_| {});
+        let which = if dark { "dark" } else { "light" };
+        assert!(bounds(cx, handle, &format!("theme-select-{which}")).is_some());
+        click(cx, handle, &format!("theme-select-{which}"));
+        let shown = ThemeId::of_appearance(dark);
+        let hidden = ThemeId::of_appearance(!dark);
+        assert_eq!(shown.len(), if dark { 29 } else { 15 });
+        for id in shown {
+            assert!(
+                bounds(cx, handle, &format!("theme-option-{}", id.key())).is_some(),
+                "{}",
+                id.label()
+            );
+        }
+        for id in hidden {
+            assert!(
+                bounds(cx, handle, &format!("theme-option-{}", id.key())).is_none(),
+                "{}",
+                id.label()
+            );
+        }
+    }
+
+    #[gpui_kit::test]
+    fn dark_select_lists_only_dark_themes(cx: &mut TestAppContext) {
+        lists_only(cx, true);
+    }
+
+    #[gpui_kit::test]
+    fn light_select_lists_only_light_themes(cx: &mut TestAppContext) {
+        lists_only(cx, false);
+    }
+
+    #[gpui_kit::test]
+    fn picking_the_shown_appearance_applies_at_once(cx: &mut TestAppContext) {
+        let (handle, _, store) = appearance_page(cx, |p| p.dark = Some(true));
+        let before = shown_bg(cx);
+        click(cx, handle, "theme-select-dark");
+        scroll_to(cx, handle, "theme-menu-dark", "theme-option-tokyo-night");
+        click(cx, handle, "theme-option-tokyo-night");
+        let tokyo = theme("tokyo-night", true);
+        assert_eq!(
+            store.read_with(cx, |s, _| s.prefs.theme_dark.clone()),
+            "tokyo-night"
+        );
+        let bg = shown_bg(cx);
+        assert_ne!(bg, before);
+        assert_eq!(
+            bg,
+            Appearance {
+                theme: tokyo,
+                accent: Accent::Theme
+            }
+            .palette()
+            .bg
+        );
+        assert!(
+            bounds(cx, handle, "theme-option-tokyo-night").is_none(),
+            "the menu closed"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn picking_the_other_appearance_keeps_the_window(cx: &mut TestAppContext) {
+        let (handle, _, store) = appearance_page(cx, |p| {
+            p.dark = Some(true);
+            p.theme_dark = "tokyo-night".into();
+        });
+        let before = cx.update(|cx| *crate::theme::palette(cx));
+        assert_eq!(before.theme, theme("tokyo-night", true));
+        click(cx, handle, "theme-select-light");
+        scroll_to(
+            cx,
+            handle,
+            "theme-menu-light",
+            "theme-option-solarized-light",
+        );
+        click(cx, handle, "theme-option-solarized-light");
+        assert_eq!(
+            store.read_with(cx, |s, _| s.prefs.theme_light.clone()),
+            "solarized-light"
+        );
+        assert_eq!(cx.update(|cx| *crate::theme::palette(cx)), before);
+    }
+
+    #[gpui_kit::test]
+    fn select_marks_the_theme_in_use(cx: &mut TestAppContext, other: &mut TestAppContext) {
+        // A saved id that names no theme, and one that names a light theme.
+        for (cx, saved) in [(cx, "removed-theme"), (other, "solarized-light")] {
+            let (handle, _, store) = appearance_page(cx, |p| p.theme_dark = saved.into());
+            click(cx, handle, "theme-select-dark");
+            assert!(
+                bounds(cx, handle, "theme-selected-qmt-dark").is_some(),
+                "{saved}"
+            );
+            for id in ThemeId::of_appearance(true).into_iter().skip(1) {
+                assert!(bounds(cx, handle, &format!("theme-selected-{}", id.key())).is_none());
+            }
+            assert_eq!(
+                store.read_with(cx, |s, _| s.prefs.theme_dark.clone()),
+                saved
+            );
+        }
+    }
+
+    /// The test platform has no public way to flip the window's appearance:
+    /// the window is light, and the dark half is given to the same code the
+    /// appearance observer runs.
+    #[gpui_kit::test]
+    fn system_mode_switches_between_the_chosen_themes(cx: &mut TestAppContext) {
+        let (handle, app, _) = appearance_page(cx, |p| {
+            p.dark = None;
+            p.theme_dark = "catppuccin-mocha".into();
+            p.theme_light = "catppuccin-latte".into();
+        });
+        let (mocha, latte) = (
+            theme("catppuccin-mocha", true),
+            theme("catppuccin-latte", false),
+        );
+        let shown = |cx: &mut TestAppContext| cx.update(|cx| crate::theme::palette(cx).theme);
+        // The window's own (light) appearance, as the observer reads it.
+        cx.update_window(handle, |_, window, cx| {
+            app.update(cx, |app, cx| app.apply_theme(window, cx))
+        })
+        .unwrap();
+        assert_eq!(shown(cx), latte);
+        cx.update(|cx| app.update(cx, |app, cx| app.apply_theme_for(true, cx)));
+        assert_eq!(shown(cx), mocha);
+        cx.update(|cx| app.update(cx, |app, cx| app.apply_theme_for(false, cx)));
+        assert_eq!(shown(cx), latte);
+    }
+
+    #[gpui_kit::test]
+    fn theme_swatch_is_selected_by_default(cx: &mut TestAppContext) {
+        let (handle, _, store) = appearance_page(cx, |_| {});
+        let prefs = store.read_with(cx, |s, _| s.prefs.clone());
+        assert_eq!(prefs.accent_choice(), Accent::Theme);
+        assert!(bounds(cx, handle, "accent-theme").is_some());
+        // Orange is a preset like any other: not selected until picked.
+        assert_ne!(prefs.accent_choice(), Accent::Preset(Preset::ORANGE));
+        click(cx, handle, "accent-orange");
+        assert_eq!(
+            store.read_with(cx, |s, _| s.prefs.accent_choice()),
+            Accent::Preset(Preset::ORANGE)
+        );
+    }
+
+    #[test]
+    fn theme_swatch_shows_the_theme_accent_with_a_preset() {
+        let tokyo = theme("tokyo-night", true);
+        let blue = Preset::all().find(|p| p.id() == "blue").expect("blue");
+        let p = Appearance {
+            theme: tokyo,
+            accent: Accent::Preset(blue),
+        }
+        .palette();
+        assert_eq!(super::theme_swatch_colour(&p), tokyo.accent());
+        assert_ne!(super::theme_swatch_colour(&p), p.accent);
+        assert_eq!(p.accent, blue.color(true));
+    }
+
+    #[gpui_kit::test]
+    fn picking_theme_swatch_restores_the_theme_accent(cx: &mut TestAppContext) {
+        let (handle, _, store) = appearance_page(cx, |p| {
+            p.dark = Some(true);
+            p.theme_dark = "tokyo-night".into();
+            p.accent = "blue".into();
+        });
+        let tokyo = theme("tokyo-night", true);
+        let accent = |cx: &mut TestAppContext| cx.update(|cx| crate::theme::palette(cx).accent);
+        assert_ne!(accent(cx), tokyo.accent());
+        click(cx, handle, "accent-theme");
+        assert_eq!(store.read_with(cx, |s, _| s.prefs.accent.clone()), "");
+        assert_eq!(accent(cx), tokyo.accent());
+    }
+
+    #[test]
+    fn previews_show_the_chosen_themes() {
+        let (dark, light) = (theme("gruvbox-dark", true), theme("flexoki-light", false));
+        assert_eq!(
+            super::preview_palette(dark, Accent::Theme).bg,
+            dark.palette_swatches()[0]
+        );
+        assert_eq!(
+            super::preview_palette(light, Accent::Theme).bg,
+            light.palette_swatches()[0]
+        );
+        assert_ne!(
+            super::preview_palette(dark, Accent::Theme).bg,
+            super::preview_palette(ThemeId::QMT_DARK, Accent::Theme).bg
+        );
     }
 }

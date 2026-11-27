@@ -12,9 +12,9 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
+use gpui_kit::base::{TextView, TextViewStyle};
 use gpui_kit::component::text::{
-    MarkdownNode, RangeHighlight, RenderedText, TextView, TextViewMotion, TextViewState,
-    TextViewStyle, markdown_ast,
+    MarkdownNode, RangeHighlight, RenderedText, TextViewMotion, TextViewState, markdown_ast,
 };
 use gpui_kit::component::{Sizable as _, Theme, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -98,90 +98,118 @@ pub fn markdown(
     )
 }
 
+/// The style of a text view in `p`: every colour (text, muted text, links,
+/// selection, code and table backgrounds, borders) comes from the palette
+/// handed in, never from the app theme. The kit's own `TextView` wrapper
+/// derives them from the theme, which painted dark text onto the quick panel
+/// when the app was in a light theme, so this module builds the base view.
+///
+/// Fence colours are not part of the style: the base view takes them from the
+/// highlighter installed with the theme (`highlight::install`), one `Arc` for
+/// every frame, which is what keeps fences from being re-highlighted.
+pub(crate) fn view_style(p: &Palette) -> TextViewStyle {
+    let radius = px(8.);
+    TextViewStyle::default()
+        .with_foreground(p.text)
+        .with_muted_foreground(p.muted)
+        .with_link(p.accent)
+        .with_selection(p.accent_dim)
+        .with_code_background(p.card)
+        .with_border(p.border)
+        .with_code_block(
+            StyleRefinement::default()
+                .rounded(radius)
+                .pt(px(42.))
+                .pb_3()
+                .text_size(px(13.)),
+        )
+        .with_table(StyleRefinement::default().rounded(radius))
+        .with_table_head(StyleRefinement::default().bg(p.card).text_color(p.muted))
+        .with_table_row_hover(p.card)
+        .with_inline_code(HighlightStyle {
+            background_color: Some(p.selected),
+            ..Default::default()
+        })
+        .with_dark(p.dark)
+}
+
 /// Transcript styling and extensions; `id` prefixes the table ids.
 fn styled(view: TextView, id: SharedString, p: &Palette, sources: SourceShown) -> TextView {
     let table_prefix = id.clone();
     let mermaid_prefix = id;
     let p = *p;
-    view.style(TextViewStyle {
-        code_block: StyleRefinement::default()
-            .rounded(px(8.))
-            .pt(px(42.))
-            .pb_3()
-            .text_size(px(13.)),
-        ..TextViewStyle::default()
-    })
-    .inline_code_style(inline_code_style(&p))
-    .code_block_actions(move |block, _, cx| {
-        let lang = block.lang();
-        let row = header_row("code-header", &p, cx)
-            .child(
-                div()
-                    .min_w_0()
-                    .truncate()
-                    .child(code_lang(lang.as_deref()).to_string()),
-            )
-            .child(CopyButton {
-                id: "copy".into(),
-                value: block.code(),
+    view.style(view_style(&p))
+        .inline_code_style(inline_code_style(&p))
+        .code_block_actions(move |block, _, cx| {
+            let lang = block.lang();
+            let row = header_row("code-header", &p, cx)
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .child(code_lang(lang.as_deref()).to_string()),
+                )
+                .child(CopyButton {
+                    id: "copy".into(),
+                    value: block.code(),
+                    p,
+                });
+            #[cfg(test)]
+            let row = {
+                use gpui_kit::test::TestSupportExt as _;
+                row.test_support()
+            };
+            CodeHeader {
+                row: row.into_any_element(),
+            }
+        })
+        .markdown_block_parser(|node, cx| match node {
+            markdown_ast::Node::Table(_) => {
+                let source = cx.node_source(node)?.to_string();
+                Some(
+                    MarkdownNode::new(TABLE_BLOCK, source.clone())
+                        .text(source.clone())
+                        .markdown(source),
+                )
+            }
+            markdown_ast::Node::Code(code) => {
+                let lang = code.lang.as_deref()?;
+                if !lang.trim().eq_ignore_ascii_case("mermaid") {
+                    return None;
+                }
+                let source = cx.node_source(node)?;
+                if !fence_closed(source) {
+                    return None;
+                }
+                Some(
+                    MarkdownNode::new(MERMAID_BLOCK, code.value.clone())
+                        .text(code.value.clone())
+                        .markdown(source.to_string()),
+                )
+            }
+            _ => None,
+        })
+        .markdown_block_renderer(MERMAID_BLOCK, move |node, _, _| {
+            let Some(body) = node.data::<String>() else {
+                return div().into_any_element();
+            };
+            let start = node.source_range().map_or(0, |r| r.start);
+            MermaidCard {
+                id: SharedString::from(format!("{mermaid_prefix}-mermaid-{start}")),
+                source: body.clone().into(),
                 p,
-            });
-        #[cfg(test)]
-        let row = {
-            use gpui_kit::test::TestSupportExt as _;
-            row.test_support()
-        };
-        CodeHeader {
-            row: row.into_any_element(),
-        }
-    })
-    .markdown_block_parser(|node, cx| match node {
-        markdown_ast::Node::Table(_) => {
-            let source = cx.node_source(node)?.to_string();
-            Some(
-                MarkdownNode::new(TABLE_BLOCK, source.clone())
-                    .text(source.clone())
-                    .markdown(source),
-            )
-        }
-        markdown_ast::Node::Code(code) => {
-            let lang = code.lang.as_deref()?;
-            if !lang.trim().eq_ignore_ascii_case("mermaid") {
-                return None;
+                sources: sources.clone(),
             }
-            let source = cx.node_source(node)?;
-            if !fence_closed(source) {
-                return None;
-            }
-            Some(
-                MarkdownNode::new(MERMAID_BLOCK, code.value.clone())
-                    .text(code.value.clone())
-                    .markdown(source.to_string()),
-            )
-        }
-        _ => None,
-    })
-    .markdown_block_renderer(MERMAID_BLOCK, move |node, _, _| {
-        let Some(body) = node.data::<String>() else {
-            return div().into_any_element();
-        };
-        let start = node.source_range().map_or(0, |r| r.start);
-        MermaidCard {
-            id: SharedString::from(format!("{mermaid_prefix}-mermaid-{start}")),
-            source: body.clone().into(),
-            p,
-            sources: sources.clone(),
-        }
-        .into_any_element()
-    })
-    .markdown_block_renderer(TABLE_BLOCK, move |node, _, _| {
-        let Some(source) = node.data::<String>() else {
-            return div().into_any_element();
-        };
-        let start = node.source_range().map_or(0, |r| r.start);
-        let id = format!("{table_prefix}-table-{start}");
-        table_card(&id, source, p).into_any_element()
-    })
+            .into_any_element()
+        })
+        .markdown_block_renderer(TABLE_BLOCK, move |node, _, _| {
+            let Some(source) = node.data::<String>() else {
+                return div().into_any_element();
+            };
+            let start = node.source_range().map_or(0, |r| r.start);
+            let id = format!("{table_prefix}-table-{start}");
+            table_card(&id, source, p).into_any_element()
+        })
 }
 
 /// The header strip of a code or diagram card: 30px, a hairline under it,
@@ -753,6 +781,7 @@ impl RenderOnce for TableCard {
         }
 
         let table = TextView::markdown(self.id.clone(), self.source.clone())
+            .style(view_style(&p))
             .inline_code_style(inline_code_style(&p));
         let (hover, click, value) = (chrome.clone(), chrome, self.source);
         let button = kit::icon_button(
@@ -1119,7 +1148,7 @@ mod tests {
     fn kept_row_waits_for_large_parse_and_keeps_document(cx: &mut gpui_kit::TestAppContext) {
         cx.update(|cx| {
             gpui_kit::init(cx);
-            crate::theme::apply(true, "orange", cx);
+            crate::theme::apply(crate::theme::Appearance::builtin(true), cx);
         });
         let kept = super::Kept::default();
         let text: gpui_kit::SharedString = "word ".repeat(2000).into();
@@ -1161,6 +1190,66 @@ mod tests {
         assert!(!fence_closed(""));
     }
 
+    /// Fences take their colours from the highlighter installed with the
+    /// theme, and keep the same one between frames: the kit re-highlights every
+    /// code block when the highlighter changes.
+    #[gpui_kit::test]
+    fn fences_use_the_installed_highlighter_for_every_theme(cx: &mut gpui_kit::TestAppContext) {
+        use crate::theme::{Accent, Appearance, ThemeId};
+        use gpui_kit::base::TextViewDefaults;
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::apply(crate::theme::Appearance::builtin(true), cx);
+        });
+        for (key, dark) in [
+            ("tokyo-night", true),
+            ("solarized-light", false),
+            ("qmt-dark", true),
+        ] {
+            let theme = ThemeId::resolve(key, dark);
+            cx.update(|cx| {
+                crate::theme::apply(
+                    Appearance {
+                        theme,
+                        accent: Accent::Theme,
+                    },
+                    cx,
+                )
+            });
+            // The view sets no highlighter of its own: the base view uses the
+            // one installed with the theme, the same one every frame.
+            assert!(
+                cx.update(|cx| TextViewDefaults::global(cx).has_code_block_highlighter()),
+                "{key}"
+            );
+        }
+    }
+
+    /// Every colour of a text view comes from the palette it is given, whatever
+    /// theme the app is in: the quick panel's text was dark on dark when the
+    /// app was light, because the kit's wrapper took them from the theme.
+    #[test]
+    fn a_views_style_takes_every_colour_from_the_palette() {
+        use crate::quick::hud::hud_palette;
+        use crate::theme::Palette;
+        for p in [
+            Palette::light(),
+            Palette::dark(),
+            hud_palette(&Palette::light(), true),
+            hud_palette(&Palette::dark(), false),
+        ] {
+            let style = super::view_style(&p);
+            assert_eq!(style.foreground(), p.text);
+            assert_eq!(style.muted_foreground(), p.muted);
+            assert_eq!(style.link(), p.accent);
+            assert_eq!(style.selection(), p.accent_dim);
+            assert_eq!(style.code_background(), p.card);
+            assert_eq!(style.border(), p.border);
+            assert_eq!(style.table_row_hover(), Some(p.card));
+            assert_eq!(style.is_dark(), p.dark);
+        }
+    }
+
     /// A transcript reply kept like the session view keeps it.
     struct Doc {
         kept: super::Kept,
@@ -1196,7 +1285,7 @@ mod tests {
     ) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<Doc>) {
         cx.update(|cx| {
             gpui_kit::init(cx);
-            crate::theme::apply(true, "orange", cx);
+            crate::theme::apply(crate::theme::Appearance::builtin(true), cx);
         });
         let text: gpui_kit::SharedString = text.to_string().into();
         let (handle, view) = cx.update(|cx| {
@@ -1470,7 +1559,7 @@ mod tests {
         fn open(cx: &mut TestAppContext, text: &str) -> Open {
             cx.update(|cx| {
                 gpui_kit::init(cx);
-                crate::theme::apply(true, "orange", cx);
+                crate::theme::apply(crate::theme::Appearance::builtin(true), cx);
             });
             let state = ListState::new(6, ListAlignment::Top, px(1200.));
             let kept = super::super::Kept::default();
@@ -1911,7 +2000,7 @@ mod tests {
         use gpui_kit::{AppContext as _, point, px};
         cx.update(|cx| {
             gpui_kit::init(cx);
-            crate::theme::apply(true, "orange", cx);
+            crate::theme::apply(crate::theme::Appearance::builtin(true), cx);
         });
         let (handle, _view) = cx.update(|cx| {
             gpui_kit::open_window(Default::default(), cx, |_, cx| cx.new(|_| SelectionFixture))

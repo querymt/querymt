@@ -3,15 +3,23 @@
 ## ADDED Requirements
 
 ### Requirement: Command descriptor from the agent
-For each advertised command the app SHALL read the agent's descriptor: its source, its effect (a model prompt or an action the agent runs), its input need (`none`, `optional`, `required`) and the submissions it accepts (prompt, queue). For a command without a descriptor the app SHALL treat an input hint as required input and no hint as no input, SHALL treat the command as accepting prompt and queue, and SHALL show no source or effect.
+For each advertised command the app SHALL read the agent's descriptor: its source, its effect (a model prompt or an action the agent runs), its input need (`none`, `optional`, `required`) and the submissions it accepts (prompt, queue). A list of accepted submissions that is present but empty SHALL mean the command accepts no submission.
 
 #### Scenario: Descriptor states an optional input
 - **GIVEN** the agent advertises `compact` with an input hint and the input need `optional`
 - **THEN** the app treats `/compact` as runnable without arguments
 
+#### Scenario: Empty list of accepted submissions
+- **GIVEN** the agent advertises `freeze` with the accepted submissions `[]`
+- **THEN** the app treats `/freeze` as accepting neither prompt nor queue, not as a command without a descriptor
+
+### Requirement: Fields missing from the descriptor
+Each descriptor field the agent did not send SHALL fall back on its own. Without an input need, an input hint SHALL mean required input and no hint no input. Without accepted submissions, the command SHALL accept prompt and queue. Without a source or effect, none SHALL be shown, and the command SHALL be treated as neither a model prompt nor an action.
+
 #### Scenario: Command without a descriptor
 - **GIVEN** an agent advertises `review` with the input hint "[scope]" and no descriptor
 - **THEN** the app treats `/review` as requiring input and as accepting prompt and queue, as before this change
+- **AND** the app treats it as neither a model prompt nor an action
 
 ### Requirement: Recognising a command in typed text
 Text SHALL be treated as a slash command only when its first word is `/` followed by the exact name of a command the session advertises, including case, and the name ends the text or is followed by whitespace. Any other text SHALL be an ordinary message, whether or not it starts with `/`.

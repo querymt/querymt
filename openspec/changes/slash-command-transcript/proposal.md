@@ -9,7 +9,7 @@ The conversation does not show that a slash command ran. Every user message is d
 - `/compact keep the API decisions` leaves a compaction row with no trace of the instructions;
 - the app guesses from text in one place (`is_compact_command`), and the guess ignores case while the agent does not.
 
-querymt now records each invocation on the update that carries its outcome (`add-slash-command-records` in the querymt repository). This change draws the conversation from those records. It treats built-in and user-defined commands by what they are: a prompt to the model, or an action the agent ran.
+querymt now records each invocation on the update that carries its outcome (`add-slash-command-records`, in this repository). This change draws the conversation from those records. It treats built-in and user-defined commands by what they are: a prompt to the model, or an action the agent ran.
 
 ## What Changes
 
@@ -38,11 +38,11 @@ None.
 
 ## Impact
 
-- **Depends on querymt `add-slash-command-records`** (records on entries, the command reply entry kind) and on `slash-command-actions` tasks 1.1 and 1.2 here (the pinned revision and `src/session/commands.rs`).
-- **This repository:**
+- **Depends on `add-slash-command-records`** (records on entries, the command reply entry kind) and on `slash-command-actions` tasks 1.1 and 1.2 (the descriptor check and `src/session/commands.rs`, including `CommandTraits::is_action`).
+- **`crates/querymt-gpui`** (paths below are relative to it):
   - `src/session.rs`: `ItemKind::User` gains the command, `ItemKind::Command` is added, `Compaction` gains the instructions; `is_compact_command` is removed.
   - `src/session/projection.rs`: rows from `UserMessage.slash_command`, `CompactionEntry.slash_command` and `EntryKind::CommandReply`.
   - `src/ui/session_view.rs`: the user bubble's command form and toggle, the command row, the compaction row, the activity label.
   - `src/quick/activity.rs`, `src/session/golden.rs`: the new row kind.
   - Tests in `src/session/projection.rs`, `src/ui/session_view.rs`, `src/quick/activity.rs`; golden files.
-- **Compatibility:** with no records, nothing changes on screen except the activity label of a `/compact` being sent, which reads "Sending prompt…" until the compaction starts.
+- **Compatibility:** with no records, nothing changes on screen except the activity label of a `/compact` being sent, which reads "Sending prompt…" until the compaction starts. An agent that sends no descriptor never gets a pending command row: only a stated `action` effect makes one.

@@ -17,7 +17,9 @@ mod windows;
 use gpui_kit::*;
 
 use super::hud::{
-    LIQUID_GLASS_TINT, LIQUID_GLASS_WHITE_THROUGH, TINT, VFX_TINT, VFX_WHITE_THROUGH,
+    LIQUID_GLASS_GREY_OVER_BLACK, LIQUID_GLASS_LIGHT_TINT, LIQUID_GLASS_TINT,
+    LIQUID_GLASS_WHITE_THROUGH, TINT, VFX_GREY_OVER_BLACK, VFX_LIGHT_TINT, VFX_TINT,
+    VFX_WHITE_THROUGH,
 };
 use crate::theme::Palette;
 
@@ -32,9 +34,11 @@ pub(crate) struct Chrome {
     pub(crate) glass: bool,
     pub(crate) radius: Pixels,
     /// How much black the panel lays over the material (design D11): little
-    /// or none where the panel makes the material dark itself, enough for
-    /// text to stay legible where the desktop picks it.
+    /// where the panel sets the material's appearance itself, enough for text
+    /// to stay legible where the desktop picks it.
     pub(crate) tint: f32,
+    /// The same for a light panel, which lays white over it.
+    pub(crate) light_tint: f32,
     /// The material draws its own edge (Liquid Glass), so the panel paints no
     /// hairline over it.
     pub(crate) rimmed: bool,
@@ -43,9 +47,15 @@ pub(crate) struct Chrome {
     /// not fade on its own.
     pub(crate) native_motion: bool,
     /// The most of a white backdrop the material lets through, 0 to 1 (an
-    /// opaque surface 0). The legibility contract is held against it
-    /// (design D11).
+    /// opaque surface 0). The legibility contract is held against it for a
+    /// dark panel (design D11).
     pub(crate) white_through: f32,
+    /// The lightest grey the material shows over a black backdrop, 0 to 1:
+    /// what the contract is held against for a light panel.
+    pub(crate) grey_over_black: f32,
+    /// The window's root frames the panel ([`frame`]): the frame's hairline
+    /// is the panel's, so the panel paints none of its own.
+    pub(crate) framed: bool,
 }
 
 /// The colours of the panel's root, picked by [`Chrome`]. Everything inside
@@ -65,57 +75,127 @@ impl Chrome {
             glass: false,
             radius: px(RADIUS),
             tint: 1.,
+            light_tint: 1.,
             rimmed: false,
             native_motion: false,
             white_through: 0.,
+            grey_over_black: 0.,
+            framed: false,
         }
     }
 
     /// A material the desktop picks (Mica, compositor blur) is drawn behind
-    /// the window. It can be light, so the panel tints it dark.
+    /// the window. It can be light or dark, so the panel tints it towards its
+    /// own appearance.
     #[cfg_attr(target_os = "macos", allow(dead_code))] // Windows and Linux; tests everywhere
     pub(crate) fn glass() -> Self {
         Self {
             glass: true,
             radius: px(RADIUS),
             tint: TINT,
+            light_tint: TINT,
             rimmed: false,
             native_motion: false,
             // Mica and compositor blur are the system's to choose, and a white
             // window behind them comes through whole.
             white_through: 1.,
+            grey_over_black: 0.,
+            framed: false,
         }
     }
 
-    /// A material set to dark aqua (macOS) is drawn behind the window by a
-    /// view of ours. `rimmed`: it is Liquid Glass, which draws its own edge;
-    /// else the visual-effect material.
+    /// A material set to the app's appearance (macOS) is drawn behind the
+    /// window by a view of ours. `rimmed`: it is Liquid Glass, which draws its
+    /// own edge; else the visual-effect material.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    pub(crate) fn dark_material(rimmed: bool) -> Self {
-        let (tint, white_through) = if rimmed {
-            (LIQUID_GLASS_TINT, LIQUID_GLASS_WHITE_THROUGH)
+    pub(crate) fn material(rimmed: bool) -> Self {
+        let (tint, light_tint, white_through, grey_over_black) = if rimmed {
+            (
+                LIQUID_GLASS_TINT,
+                LIQUID_GLASS_LIGHT_TINT,
+                LIQUID_GLASS_WHITE_THROUGH,
+                LIQUID_GLASS_GREY_OVER_BLACK,
+            )
         } else {
-            (VFX_TINT, VFX_WHITE_THROUGH)
+            (
+                VFX_TINT,
+                VFX_LIGHT_TINT,
+                VFX_WHITE_THROUGH,
+                VFX_GREY_OVER_BLACK,
+            )
         };
         Self {
             glass: true,
             radius: px(RADIUS),
             tint,
+            light_tint,
             rimmed,
             native_motion: true,
             white_through,
+            grey_over_black,
+            framed: false,
         }
     }
 
+    /// The grey level (0 black, 1 white) of the worst backdrop the material
+    /// shows for a panel of the given appearance: a white window behind a dark
+    /// panel (`white_through`), a black one behind a light panel
+    /// (`grey_over_black`).
+    #[cfg(test)]
+    pub(crate) fn worst_backdrop(&self, dark: bool) -> f32 {
+        if dark {
+            self.white_through
+        } else {
+            self.grey_over_black
+        }
+    }
+
+    /// Where the window's root frames the panel ([`frame`]), the panel takes
+    /// the frame's corners, so no gap shows between the frame's rounded
+    /// hairline and the panel's surface, and leaves the hairline to it.
+    pub(crate) fn within_frame(mut self, window: &Window, cx: &App) -> Self {
+        if frame(window) != Edges::default() {
+            self.radius = gpui_kit::component::window_corner_radii(window, cx).top_left;
+            self.framed = true;
+        }
+        self
+    }
+
     /// The root's colours for `p`, the HUD palette (design D15): over a
-    /// material a black tint of [`Self::tint`] edged by a light hairline
-    /// (none where the material has its own edge); without a material the
-    /// palette's own, which are opaque.
+    /// material a tint of [`Self::tint`] (black, for a dark panel) or
+    /// [`Self::light_tint`] (white, for a light one) edged by a hairline of the opposite colour (none where the
+    /// material has its own edge); without a material the palette's own,
+    /// which are opaque.
     pub(crate) fn surfaces(&self, p: &Palette) -> Surfaces {
-        if self.glass {
+        let surfaces = self.material_surfaces(p);
+        if self.framed {
             Surfaces {
-                bg: gpui_kit::black().opacity(self.tint),
-                border: gpui_kit::white().opacity(if self.rimmed { 0. } else { 0.14 }),
+                border: gpui_kit::transparent_black(),
+                ..surfaces
+            }
+        } else {
+            surfaces
+        }
+    }
+
+    fn material_surfaces(&self, p: &Palette) -> Surfaces {
+        if self.glass {
+            let (tint, strength, edge) = if p.dark {
+                (
+                    gpui_kit::black(),
+                    self.tint,
+                    gpui_kit::white().opacity(0.14),
+                )
+            } else {
+                (
+                    gpui_kit::white(),
+                    self.light_tint,
+                    gpui_kit::black().opacity(0.12),
+                )
+            };
+            Surfaces {
+                bg: tint.opacity(strength),
+                border: if self.rimmed { edge.opacity(0.) } else { edge },
             }
         } else {
             Surfaces {
@@ -127,9 +207,10 @@ impl Chrome {
 }
 
 /// Install the desktop's material behind `window` and report what it got. On
-/// macOS the material is set dark once, whatever the app theme or the desktop
-/// is set to (the panel is a HUD, D15). `animate`: the opening animation will
-/// run, so the material starts invisible and [`open_step`] brings it in.
+/// macOS the material is set to the app's appearance (`dark`), not the
+/// desktop's, and follows it with [`follow_theme`] (D11, D15). `animate`: the
+/// opening animation will run, so the material starts invisible and
+/// [`open_step`] brings it in.
 ///
 /// When the system asks to reduce transparency, no material is installed at
 /// all and the panel is the opaque one, as on a desktop without a material
@@ -137,27 +218,27 @@ impl Chrome {
 ///
 /// On macOS the window has no system shadow either way: it would follow the
 /// window's outline, not the panel's (see `macos::drop_window_shadow`).
-pub(crate) fn install(window: &mut Window, animate: bool) -> Chrome {
+pub(crate) fn install(window: &mut Window, animate: bool, dark: bool) -> Chrome {
     #[cfg(target_os = "macos")]
     macos::drop_window_shadow(window);
     chrome_for(reduce_transparency(), || {
         #[cfg(target_os = "macos")]
         {
-            macos::install(window, animate)
+            macos::install(window, animate, dark)
         }
         #[cfg(target_os = "windows")]
         {
-            let _ = animate;
+            let _ = (animate, dark);
             windows::install(window)
         }
         #[cfg(target_os = "linux")]
         {
-            let _ = animate;
+            let _ = (animate, dark);
             linux::install(window)
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
         {
-            let _ = (window, animate);
+            let _ = (window, animate, dark);
             Chrome::solid()
         }
     })
@@ -183,6 +264,17 @@ fn reduce_transparency() -> bool {
     return windows::reduce_transparency();
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     false
+}
+
+/// The app's theme changed to `dark` (or back): set the material's appearance
+/// to match, where it is ours to set (macOS). Elsewhere the desktop picks the
+/// material and the panel only changes its tint, which is painted from the
+/// palette.
+pub(crate) fn follow_theme(window: &Window, dark: bool) {
+    #[cfg(target_os = "macos")]
+    macos::set_appearance(window, dark);
+    #[cfg(not(target_os = "macos"))]
+    let _ = (window, dark);
 }
 
 /// A renderer of the light along the edge outside GPUI, where there is one
@@ -227,16 +319,62 @@ pub(crate) fn low_power() -> bool {
     false
 }
 
-/// Give the window `size`. On macOS the **bottom edge stays fixed**, so the
-/// composer does not move under the cursor while the panel grows; elsewhere
-/// GPUI has no reposition call and the top left stays (design D13).
+/// What the window's root draws around the panel, inside the window's size:
+/// on Linux, gpui-component frames a client-decorated window (GNOME, and any
+/// layer-shell surface) with a shadow margin and a hairline. Zero elsewhere.
+pub(crate) fn frame(window: &Window) -> Edges<Pixels> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::frame(window)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = window;
+        Edges::default()
+    }
+}
+
+/// The window size that leaves `size` for the panel inside `frame`.
+fn framed_size(size: Size<Pixels>, frame: &Edges<Pixels>) -> Size<Pixels> {
+    Size {
+        width: size.width + frame.left + frame.right,
+        height: size.height + frame.top + frame.bottom,
+    }
+}
+
+/// Give the panel `size`; the window is larger by the [`frame`] around it.
+/// On macOS the **bottom edge stays fixed**, so the composer does not move
+/// under the cursor while the panel grows; elsewhere GPUI has no reposition
+/// call and the top left stays (design D13).
 pub(crate) fn resize(window: &mut Window, size: Size<Pixels>, cx: &App) {
     #[cfg(target_os = "macos")]
     if macos::set_height(window, size, cx) {
         return;
     }
     let _ = cx;
+    let size = framed_size(size, &frame(window));
     window.resize(size);
+}
+
+/// The window takes a size asked of it only after the frame that asked for it
+/// has been drawn: GPUI's Linux backends apply a resize from a task, so a
+/// frame can still be drawn, and shown, in the old size. The panel then holds
+/// what is on screen until the window has the new size (design D13). AppKit
+/// and Windows resize at once.
+pub(crate) const RESIZE_LAGS: bool = cfg!(target_os = "linux");
+
+/// Keep the bottom edge where it was while the panel's height goes from
+/// `from` to `to`, as macOS does in [`resize`] itself (design D13). Call it
+/// while drawing the first frame of height `to`: on Wayland a toplevel cannot
+/// place itself, and the move (`wl_surface.offset`) is applied by the next
+/// commit, which must be the one that brings the new size. A move sent with
+/// the resize would be applied to a frame of the old size, which would jump
+/// by the difference. A no-op elsewhere.
+pub(crate) fn keep_bottom(window: &Window, from: f32, to: f32) {
+    #[cfg(target_os = "linux")]
+    linux::keep_bottom(window, from, to);
+    #[cfg(not(target_os = "linux"))]
+    let _ = (window, from, to);
 }
 
 #[cfg(test)]
@@ -273,27 +411,48 @@ mod tests {
     }
 
     #[test]
-    fn glass_hairline_is_light_on_the_dark_tint() {
-        let s = Chrome::glass().surfaces(&hud_palette(&Palette::light(), true));
-        assert!(s.border.l > 0.5);
-        assert!(s.bg.l < 0.1);
+    fn glass_hairline_contrasts_with_the_tint() {
+        let dark = Chrome::glass().surfaces(&hud_palette(&Palette::dark(), true));
+        assert!(dark.border.l > 0.5, "a light hairline on the dark tint");
+        assert!(dark.bg.l < 0.1);
+        let light = Chrome::glass().surfaces(&hud_palette(&Palette::light(), true));
+        assert!(light.border.l < 0.5, "a dark hairline on the light tint");
+        assert!(light.bg.l > 0.9);
+    }
+
+    #[test]
+    fn the_worst_backdrop_follows_the_appearance() {
+        let c = Chrome::material(true);
+        assert_eq!(c.worst_backdrop(true), c.white_through);
+        assert_eq!(c.worst_backdrop(false), c.grey_over_black);
+        assert!(
+            c.grey_over_black < 0.5,
+            "a black window stays dark behind it"
+        );
     }
 
     // quick-panel / Bright window behind the panel: a dark aqua material still
     // comes out light grey over a white window (task 7.19), so the panel darkens
-    // it; `hud::text_passes_over_a_white_backdrop` sets how much.
+    // it (and, mirrored, lightens an aqua one over a black window);
+    // `hud::text_passes_over_a_white_backdrop` sets how much.
     #[test]
-    fn a_macos_material_is_darkened_and_a_rimmed_one_has_no_hairline() {
-        let p = hud_palette(&Palette::light(), true);
-        let glass = Chrome::dark_material(true).surfaces(&p);
-        let effect = Chrome::dark_material(false).surfaces(&p);
+    fn a_macos_material_is_tinted_and_a_rimmed_one_has_no_hairline() {
+        let p = hud_palette(&Palette::dark(), true);
+        let glass = Chrome::material(true).surfaces(&p);
+        let effect = Chrome::material(false).surfaces(&p);
         for bg in [glass.bg, effect.bg] {
             assert!(bg.a >= 0.6, "a black tint of its own: {bg:?}");
             assert!(bg.l < 0.01);
         }
+        let light = Chrome::material(false).surfaces(&hud_palette(&Palette::light(), true));
+        assert!(
+            light.bg.a >= 0.3 && light.bg.a < effect.bg.a && light.bg.l > 0.99,
+            "a white tint, lighter than the dark panel's: {:?}",
+            light.bg
+        );
         assert_eq!(glass.border.a, 0., "Liquid Glass draws its own edge");
         assert!(effect.border.a > 0., "a visual-effect view has none");
-        assert!(Chrome::dark_material(true).native_motion);
+        assert!(Chrome::material(true).native_motion);
         assert!(!Chrome::glass().native_motion && !Chrome::solid().native_motion);
     }
 
@@ -303,7 +462,7 @@ mod tests {
         let mut installed = false;
         let chrome = super::chrome_for(true, || {
             installed = true;
-            Chrome::dark_material(true)
+            Chrome::material(true)
         });
         assert_eq!(chrome, Chrome::solid());
         assert!(!chrome.glass && !chrome.native_motion);
@@ -316,5 +475,34 @@ mod tests {
     #[test]
     fn the_panel_is_rounder_than_a_card() {
         assert_eq!(super::RADIUS, 20.);
+    }
+
+    #[test]
+    fn a_framed_panel_leaves_the_hairline_to_the_frame() {
+        let p = hud_palette(&Palette::dark(), false);
+        let framed = Chrome {
+            framed: true,
+            ..Chrome::solid()
+        };
+        let (own, inside) = (Chrome::solid().surfaces(&p), framed.surfaces(&p));
+        assert_eq!(inside.bg, own.bg);
+        assert_eq!(inside.border.a, 0.);
+    }
+
+    #[test]
+    fn the_window_is_larger_than_the_panel_by_its_frame() {
+        use gpui_kit::{Edges, px, size};
+        let frame = Edges {
+            top: px(21.),
+            right: px(21.),
+            bottom: px(21.),
+            left: px(21.),
+        };
+        let panel = size(px(super::super::panel::WIDTH), px(64.));
+        assert_eq!(
+            super::framed_size(panel, &frame),
+            size(px(super::super::panel::WIDTH + 42.), px(106.))
+        );
+        assert_eq!(super::framed_size(panel, &Edges::default()), panel);
     }
 }

@@ -5416,7 +5416,9 @@ impl SessionPane {
                         .left(px(14.))
                         .right(px(14.))
                         .h(px(1.))
-                        .bg(white().opacity(0.22)),
+                        // A bevel: a light edge on the pill, faint on dark glass
+                        // and bright on light glass, where the pill is a grey.
+                        .bg(white().opacity(if p.dark { 0.22 } else { 0.85 })),
                 )
             })
             // No shadow on a material: it would lie on the glass as a dark smudge.
@@ -5641,9 +5643,7 @@ impl SessionPane {
             .and_then(|r| turn_end.keys().copied().filter(|ix| r.contains(ix)).max());
         let rc = Rc::new(RenderCtx {
             p,
-            syntax: gpui_kit::component::ActiveTheme::theme(&**cx)
-                .highlight_theme
-                .clone(),
+            syntax: crate::theme::syntax(&p),
             weak: cx.entity().downgrade(),
             density: self.density,
             smooth_scroll: self.smooth_scroll.clone(),
@@ -6220,7 +6220,7 @@ impl SessionPane {
             .iter()
             .filter_map(|k| {
                 self.cards.update(cx, |cards, cx| {
-                    cards.request_card(k, false, false, window, cx)
+                    cards.request_card(k, false, false, p, window, cx)
                 })
             })
             .collect();
@@ -6485,7 +6485,7 @@ mod tests {
         };
         cx.update(|cx| {
             gpui_kit::init(cx);
-            crate::theme::apply(true, "orange", cx);
+            crate::theme::apply(crate::theme::Appearance::builtin(true), cx);
         });
         // Wide enough to be scaled down and tall enough to matter.
         let mut diagram = String::from("```mermaid\nflowchart LR\n");
@@ -6828,7 +6828,7 @@ mod perf {
 
         cx.update(|cx| {
             gpui_kit::init(cx);
-            crate::theme::apply(true, "orange", cx);
+            crate::theme::apply(crate::theme::Appearance::builtin(true), cx);
         });
         let (handle, app) = open_pane_for_test(
             cx,
@@ -6878,7 +6878,7 @@ mod compact_tests {
     ) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<SessionPane>) {
         cx.update(|cx| {
             gpui_kit::init(cx);
-            crate::theme::apply(true, "orange", cx);
+            crate::theme::apply(crate::theme::Appearance::builtin(true), cx);
         });
         let (handle, pane) = open_pane_with_density_for_test(
             cx,
@@ -6999,7 +6999,7 @@ mod compact_tests {
     ) -> gpui_kit::AnyWindowHandle {
         cx.update(|cx| {
             gpui_kit::init(cx);
-            crate::theme::apply(true, "orange", cx);
+            crate::theme::apply(crate::theme::Appearance::builtin(true), cx);
         });
         let (handle, _pane) = open_pane_with_density_for_test(
             cx,
@@ -7089,9 +7089,7 @@ mod compact_tests {
         let item = view.items.last().expect("the reply").clone();
         let rc = cx.update(|cx| super::RenderCtx {
             p: *crate::theme::palette(cx),
-            syntax: gpui_kit::component::ActiveTheme::theme(&*cx)
-                .highlight_theme
-                .clone(),
+            syntax: crate::theme::syntax(crate::theme::palette(cx)),
             weak: pane.downgrade(),
             density,
             smooth_scroll: Default::default(),
@@ -7306,7 +7304,7 @@ mod split_tests {
     ) -> Harness {
         cx.update(|cx| {
             gpui_kit::init(cx);
-            crate::theme::apply(true, "orange", cx);
+            crate::theme::apply(crate::theme::Appearance::builtin(true), cx);
         });
         let mut store = crate::store::automations::schedule_ui_fixture();
         let (rpc, requests) = store.rpc_for_test("test-agent");
@@ -7423,7 +7421,7 @@ mod perf_export {
         );
         cx.update(|cx| {
             gpui_kit::init(cx);
-            crate::theme::apply(true, "orange", cx);
+            crate::theme::apply(crate::theme::Appearance::builtin(true), cx);
         });
         let (handle, app) = open_pane_for_test(
             cx,
@@ -7492,7 +7490,7 @@ mod find_tests {
     ) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<SessionPane>) {
         cx.update(|cx| {
             gpui_kit::init(cx);
-            crate::theme::apply(true, "orange", cx);
+            crate::theme::apply(crate::theme::Appearance::builtin(true), cx);
         });
         let (handle, pane) =
             open_pane_for_test(cx, crate::store::automations::schedule_ui_fixture(), view);

@@ -6,7 +6,7 @@
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{
@@ -146,12 +146,35 @@ enum Sheet {
     Folder,
 }
 
+/// Frames a sheet on screen is held for the window's new height at most
+/// (see [`QuickPanel::sheets_to_draw`]).
+const HOLD_FRAMES: u8 = 8;
+
+/// How long a change waits for the window's new height at most (see
+/// [`QuickPanel::resize_then`]).
+const LANDING_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// A change that waits for the window to have the height asked of it.
+type Landing = Box<dyn FnOnce(&mut QuickPanel, &mut Window, &mut Context<QuickPanel>)>;
+
 pub(crate) struct QuickPanel {
     store: Entity<AgentsStore>,
     /// What the window's material is, and so what its surfaces are painted as.
     chrome: Chrome,
     /// Height asked of the window (design D13).
     height: f32,
+    /// Height of the panel in the last frame drawn, and whether a resize of
+    /// ours is under way: the window moves with the first frame of the new
+    /// height ([`Self::follow_resize`]).
+    drawn: Option<f32>,
+    moving: bool,
+    /// What the last frame drawn showed: the overlay, and whether a session.
+    shown: (Sheet, bool),
+    /// Frames the overlay on screen has been held for the window's height.
+    held: u8,
+    /// Changes waiting for the window to have [`Self::height`], and since when.
+    landing: Vec<Landing>,
+    landing_since: Option<Instant>,
     /// Viewport height of the transcript when the window was last resized:
     /// until it changes, the layout is older than the resize and its overflow
     /// must not be acted on twice.
@@ -281,6 +304,13 @@ fn window_kinds(_compositor: &str) -> Vec<WindowKind> {
 /// The height the panel opens at.
 fn initial_height(session: bool) -> f32 {
     if session { MIN_HEIGHT } else { BAR_HEIGHT }
+}
+
+/// The panel's height in the window as the window is now: once GPUI has
+/// applied a resize, the height the next frame is drawn at.
+fn window_height(window: &Window) -> f32 {
+    let frame = chrome::frame(window);
+    f32::from(window.bounds().size.height - frame.top - frame.bottom)
 }
 
 /// Whether a window of `kind` can be dragged: a layer-shell surface is placed
@@ -444,9 +474,15 @@ impl QuickPanel {
             picks,
         } = resume;
         // Under reduced motion GPUI draws the animation's last frame at once.
-        let chrome = chrome::install(window, !cx.reduce_motion());
+        let chrome =
+            chrome::install(window, !cx.reduce_motion(), palette(cx).dark).within_frame(window, cx);
         let hud = hud_palette(palette(cx), chrome.glass);
         let height = initial_height(session.is_some());
+        // The window was opened at the panel's size; a frame drawn inside it
+        // needs the window larger by the frame.
+        if chrome.framed {
+            chrome::resize(window, size(px(WIDTH), px(height)), cx);
+        }
         let pane = {
             let store = store.clone();
             cx.new(|cx| {
@@ -558,6 +594,12 @@ impl QuickPanel {
                 this.on_activation(window.is_window_active(), window, cx)
             }),
             cx.observe_window_bounds(window, |this, window, cx| this.bounds_changed(window, cx)),
+            // The app's theme can change while the panel is open: the panel
+            // follows it, and so does the material where it is ours.
+            cx.observe_global_in::<Palette>(window, |_, window, cx| {
+                chrome::follow_theme(window, palette(cx).dark);
+                cx.notify();
+            }),
         ];
         let edge = Edge::new(cx.background_executor().now());
         // Over the panel's own material the light is Core Animation's; when
@@ -567,6 +609,12 @@ impl QuickPanel {
             store,
             chrome,
             height,
+            drawn: None,
+            moving: false,
+            shown: (Sheet::None, false),
+            held: 0,
+            landing: Vec::new(),
+            landing_since: None,
             settling: None,
             display_height: None,
             opening: Rc::new(Cell::new(0.)),
@@ -842,6 +890,10 @@ impl QuickPanel {
 
     fn check_focus(&mut self, epoch: u64, window: &mut Window, cx: &mut Context<Self>) {
         if self.closed
+            // The frame on screen holds the sheet before (see
+            // [`Self::sheets_to_draw`]): the focus is where the open one wants
+            // it, which that frame may not show yet.
+            || self.held > 0
             || epoch != self.focus_epoch
             || !window.is_window_active()
             || self.focus.contains_focused(window, cx)
@@ -869,17 +921,17 @@ impl QuickPanel {
 
     /// Leave the session shown and start over on an empty quick chat.
     pub(crate) fn new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.launching = None;
-        self.open_after_launch = false;
-        self.error = None;
-        self.picks.mode = None;
-        self.pane.update(cx, |pane, cx| pane.clear(cx));
-        // Closes any sheet and focuses the composer.
-        self.switch_sheet(Sheet::None, window, cx);
-        // Back to the bar.
-        self.height = BAR_HEIGHT;
+        // Back to the bar, shown once the window has the bar's height.
         self.settling = None;
-        chrome::resize(window, size(px(WIDTH), px(self.height)), cx);
+        self.resize_then(BAR_HEIGHT, window, cx, |this, window, cx| {
+            this.launching = None;
+            this.open_after_launch = false;
+            this.error = None;
+            this.picks.mode = None;
+            this.pane.update(cx, |pane, cx| pane.clear(cx));
+            // Closes any sheet and focuses the composer.
+            this.switch_sheet(Sheet::None, window, cx);
+        });
         cx.notify();
     }
 
@@ -941,13 +993,159 @@ impl QuickPanel {
         sessions.max(models).max(folders).max(bar)
     }
 
-    /// Make room for a conversation before it is shown, so it is not laid out
-    /// in the bar's height first.
-    fn make_room(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Make room for a conversation, then show it with `show`, so it is not
+    /// laid out in the bar's height first.
+    fn make_room_then(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        show: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) {
         if self.height < MIN_HEIGHT {
-            self.height = MIN_HEIGHT;
             self.settling = None;
-            chrome::resize(window, size(px(WIDTH), px(self.height)), cx);
+            self.resize_then(MIN_HEIGHT, window, cx, show);
+        } else {
+            show(self, window, cx);
+        }
+    }
+
+    /// Give the panel `height`, then make `change`, which needs that height.
+    /// Where the window takes its size a frame late ([`chrome::RESIZE_LAGS`]),
+    /// `change` waits for it and is made at the start of the first frame of
+    /// that height, before it is drawn: the change and the size reach the
+    /// screen together.
+    fn resize_then(
+        &mut self,
+        height: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        change: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        self.set_height(height, window, cx);
+        if !chrome::RESIZE_LAGS || (window_height(window) - height).abs() < 0.5 {
+            change(self, window, cx);
+            return;
+        }
+        self.landing.push(Box::new(change));
+        self.landing_since
+            .get_or_insert_with(|| cx.background_executor().now());
+        self.await_landing(window, cx);
+    }
+
+    fn await_landing(&self, window: &Window, cx: &mut Context<Self>) {
+        let this = cx.entity().downgrade();
+        window.on_next_frame(move |window, cx| {
+            let _ = this.update(cx, |this, cx| this.land(window, cx));
+        });
+    }
+
+    /// At the start of a frame: once the window has the height asked of it,
+    /// make the changes that waited for it, so this frame draws them.
+    fn land(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.landing.is_empty() {
+            return;
+        }
+        let arrived = (window_height(window) - self.height).abs() < 0.5;
+        // A height that never comes must not keep a change from being made.
+        let late = self
+            .landing_since
+            .is_some_and(|since| cx.background_executor().now() - since > LANDING_TIMEOUT);
+        if !arrived && !late {
+            self.await_landing(window, cx);
+            return;
+        }
+        self.landing_since = None;
+        for change in std::mem::take(&mut self.landing) {
+            change(self, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Give the panel `height`, its bottom edge staying where it is so the
+    /// bar does not move under the cursor (design D13). A layer-shell
+    /// surface is placed by its anchors instead.
+    fn set_height(&mut self, height: f32, window: &mut Window, cx: &App) {
+        self.height = height;
+        chrome::resize(window, size(px(WIDTH), px(height)), cx);
+        // The window moves with the first frame of this height.
+        self.moving |= self.movable;
+    }
+
+    /// The frame being drawn is `now` tall. While a resize of ours is under
+    /// way, the window moves by what the height changed since the last frame,
+    /// with this frame, so its bottom edge stays put (design D13). Sent with
+    /// the resize instead, the move would be applied to a frame still of the
+    /// old height, which would jump by the difference.
+    fn follow_resize(&mut self, window: &Window, now: f32) {
+        let last = self.drawn.replace(now);
+        if !self.moving {
+            return;
+        }
+        if let Some(last) = last.filter(|last| (last - now).abs() >= 0.5) {
+            chrome::keep_bottom(window, last, now);
+        }
+        if (now - self.height).abs() < 0.5 {
+            self.moving = false;
+        }
+    }
+
+    /// The window has the height asked of it, and the panel wants no other.
+    fn fits(&self, window: &Window, cx: &App) -> bool {
+        (window_height(window) - self.height).abs() < 0.5
+            && self.wanted_height(window, cx).is_none()
+    }
+
+    /// The sheet to draw this frame, and one to lay out out of sight.
+    ///
+    /// Where the window takes a new size a frame late ([`chrome::RESIZE_LAGS`]),
+    /// the first frame of a sheet that opened, closed or changed would show it
+    /// in the old size: squeezed over the bar, or the panel empty above it. So
+    /// the sheet on screen stays until the window has the height the open one
+    /// needs, and the first frame of that height shows the open one. Until
+    /// then the open one is laid out out of sight, so its height is measured.
+    fn sheets_to_draw(
+        &mut self,
+        session: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> (Sheet, Sheet) {
+        let open = self.sheet;
+        let (shown, shown_session) = self.shown;
+        let hold = chrome::RESIZE_LAGS
+            && open != shown
+            && shown_session == session
+            && self.held < HOLD_FRAMES
+            && !self.fits(window, cx);
+        self.held = if hold { self.held + 1 } else { 0 };
+        let on_screen = if hold { shown } else { open };
+        self.shown = (on_screen, session);
+        if hold {
+            // The field the open sheet focuses may not be in this frame; the
+            // focus check stands down while held ([`Self::check_focus`]) and
+            // runs again once the open sheet is drawn.
+            self.focus_checked = None;
+            // Drawn again until the window has its height, or the hold ends.
+            let this = cx.entity().downgrade();
+            window.on_next_frame(move |_, cx| {
+                let _ = this.update(cx, |_, cx| cx.notify());
+            });
+        }
+        (on_screen, if hold { open } else { Sheet::None })
+    }
+
+    /// `sheet` in the conversation's place, or above the bar.
+    fn render_sheet(
+        &mut self,
+        sheet: Sheet,
+        session: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        match sheet {
+            Sheet::None => None,
+            Sheet::Sessions => Some(self.render_picker(window, cx)),
+            Sheet::Models => self.render_model_sheet(session, cx),
+            Sheet::Folder => Some(self.render_folder_sheet(cx)),
         }
     }
 
@@ -977,6 +1175,10 @@ impl QuickPanel {
     /// Resize the window to what the conversation and the open overlays
     /// need. Runs after layout, never while painting.
     fn fit_height(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A change waiting for a height keeps it until the change is made.
+        if !self.landing.is_empty() {
+            return;
+        }
         let Some(wanted) = self.wanted_height(window, cx) else {
             return;
         };
@@ -984,8 +1186,7 @@ impl QuickPanel {
         self.settling = pane
             .session()
             .map(|s| (s.entity_id(), pane.content_metrics().0));
-        self.height = wanted;
-        chrome::resize(window, size(px(WIDTH), px(wanted)), cx);
+        self.set_height(wanted, window, cx);
         cx.notify();
     }
 
@@ -1001,11 +1202,12 @@ impl QuickPanel {
             cwd: summary.cwd.clone(),
             title: summary.display_title(),
         };
-        self.error = None;
-        self.make_room(window, cx);
-        self.pane.update(cx, |pane, cx| pane.open(target, cx));
-        // Closes the list and focuses the composer.
-        self.switch_sheet(Sheet::None, window, cx);
+        self.make_room_then(window, cx, move |this, window, cx| {
+            this.error = None;
+            this.pane.update(cx, |pane, cx| pane.open(target, cx));
+            // Closes the list and focuses the composer.
+            this.switch_sheet(Sheet::None, window, cx);
+        });
     }
 
     /// Cmd/Ctrl+K: open the session list, or close it when it is open.
@@ -1239,24 +1441,26 @@ impl QuickPanel {
             Ok(session) => {
                 // The mode chosen was for this quick chat only.
                 self.picks.mode = None;
-                self.make_room(window, cx);
-                self.pane.update(cx, |pane, cx| {
-                    pane.show(session, cx);
-                    pane.set_draft("", window, cx);
-                });
-                // A sheet opened for the chat that just started (the folder
-                // chooser, the model picker) would cover the conversation.
-                if matches!(self.sheet, Sheet::Folder | Sheet::Models) {
-                    self.switch_sheet(Sheet::None, window, cx);
-                } else {
-                    self.focus_epoch += 1;
-                    if self.sheet == Sheet::None {
-                        self.focus_conversation(window, cx);
+                self.make_room_then(window, cx, move |this, window, cx| {
+                    this.pane.update(cx, |pane, cx| {
+                        pane.show(session, cx);
+                        pane.set_draft("", window, cx);
+                    });
+                    // A sheet opened for the chat that just started (the folder
+                    // chooser, the model picker) would cover the conversation.
+                    if matches!(this.sheet, Sheet::Folder | Sheet::Models) {
+                        this.switch_sheet(Sheet::None, window, cx);
+                    } else {
+                        this.focus_epoch += 1;
+                        if this.sheet == Sheet::None {
+                            this.focus_conversation(window, cx);
+                        }
                     }
-                }
-                if std::mem::take(&mut self.open_after_launch) {
-                    self.open_in_main(None, cx);
-                }
+                    if std::mem::take(&mut this.open_after_launch) {
+                        this.open_in_main(None, cx);
+                    }
+                    cx.notify();
+                });
             }
             Err(error) => {
                 self.open_after_launch = false;
@@ -1301,6 +1505,12 @@ impl QuickPanel {
     #[cfg(test)]
     pub(crate) fn keys_reach_panel_for_test(&self, window: &Window, cx: &App) -> bool {
         self.focus.contains_focused(window, cx)
+    }
+
+    /// The last frame drawn showed the session list.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn picker_shown_for_test(&self) -> bool {
+        self.shown.0 == Sheet::Sessions
     }
 
     /// Press the picker's layout toggle.
@@ -1466,7 +1676,8 @@ impl QuickPanel {
         cx.notify();
     }
 
-    /// The panel's colours (design D15): dark whatever the app's theme is.
+    /// The panel's colours (design D15): the app's light or dark appearance in
+    /// the panel's own look.
     fn hud(&self, cx: &App) -> Palette {
         hud_palette(palette(cx), self.chrome.glass)
     }
@@ -1703,12 +1914,9 @@ impl QuickPanel {
             .into_any_element()
     }
 
-    /// The model picker in place of the conversation, while it is open
-    /// (design D17): no dimming, card or shadow, on the panel's surface.
+    /// The model picker in place of the conversation (design D17): no
+    /// dimming, card or shadow, on the panel's surface.
     fn render_model_sheet(&mut self, session: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !self.models.read(cx).is_open() {
-            return None;
-        }
         // Before the first prompt the chosen model is the panel's own; in a
         // session it is the session's.
         let selected = if session {
@@ -1737,50 +1945,47 @@ impl QuickPanel {
         )
     }
 
-    /// The folder chooser in place of the conversation, while it is open
-    /// (design D17), its suggestions laid out under the field.
-    fn render_folder_sheet(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if self.sheet != Sheet::Folder {
-            return None;
-        }
+    /// The folder chooser in place of the conversation (design D17), its
+    /// suggestions laid out under the field. Drawn whether or not it is the
+    /// open sheet: a sheet is held on screen, or laid out unseen, while the
+    /// window takes its height ([`Self::sheets_to_draw`]).
+    fn render_folder_sheet(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let p = self.hud(cx);
         self.folders
             .update(cx, |folders, cx| folders.set_palette(Some(p), cx));
         // `flex_none` inside the scrolling box: the content keeps its natural
         // height, which is what the window's floor is measured from.
-        Some(
-            v_flex()
-                .id("quick-folders")
-                .debug_selector(|| "quick-folders".into())
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .child(
-                    v_flex()
-                        .relative()
-                        .flex_none()
-                        .px_3()
-                        .pt_3()
-                        .pb_1()
-                        .gap_2()
-                        .child(Self::measure(&self.folder_h, cx))
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(p.text)
-                                .child("Working folder"),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(p.muted)
-                                .child("Pick or type the folder this chat runs in. Esc cancels."),
-                        )
-                        .child(self.folders.clone()),
-                )
-                .into_any_element(),
-        )
+        v_flex()
+            .id("quick-folders")
+            .debug_selector(|| "quick-folders".into())
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .child(
+                v_flex()
+                    .relative()
+                    .flex_none()
+                    .px_3()
+                    .pt_3()
+                    .pb_1()
+                    .gap_2()
+                    .child(Self::measure(&self.folder_h, cx))
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(p.text)
+                            .child("Working folder"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(p.muted)
+                            .child("Pick or type the folder this chat runs in. Esc cancels."),
+                    )
+                    .child(self.folders.clone()),
+            )
+            .into_any_element()
     }
 
     /// A canvas that stores the height of the element it is placed in (which
@@ -2744,15 +2949,33 @@ impl Render for QuickPanel {
             // Alone, the input is a bar of one line.
             pane.set_composer_bar(!session, cx);
         });
-        let viewport = window.viewport_size();
-        let (width, height) = (f32::from(viewport.width), f32::from(viewport.height));
+        // The panel's own area: the window less the frame drawn around it.
+        let (viewport, frame) = (window.viewport_size(), chrome::frame(window));
+        let (width, height) = (
+            f32::from(viewport.width - frame.left - frame.right),
+            f32::from(viewport.height - frame.top - frame.bottom),
+        );
+        // This frame is drawn `height` tall: a resize of ours moves the window
+        // with it.
+        self.follow_resize(window, height);
         let edge = self.update_edge(&p, (width, height), cx);
-        // Resize after this frame's layout, at most once per frame.
-        if self.wanted_height(window, cx).is_some() {
-            let this = cx.entity().downgrade();
-            window.on_next_frame(move |window, cx| {
-                let _ = this.update(cx, |this, cx| this.fit_height(window, cx));
-            });
+        // Resize after this frame's layout, at most once per frame; not while
+        // a change waits for a height already asked for.
+        if self.landing.is_empty() && self.wanted_height(window, cx).is_some() {
+            if chrome::RESIZE_LAGS {
+                // Once this frame is shown: GPUI applies the size before the
+                // next frame, which brings it, the move and what needs it in
+                // one commit.
+                cx.spawn_in(window, async move |this, cx| {
+                    let _ = this.update_in(cx, |this, window, cx| this.fit_height(window, cx));
+                })
+                .detach();
+            } else {
+                let this = cx.entity().downgrade();
+                window.on_next_frame(move |window, cx| {
+                    let _ = this.update(cx, |this, cx| this.fit_height(window, cx));
+                });
+            }
         }
         // The final size is `viewport`; the panel starts a little smaller.
         let opening = self.opening.clone();
@@ -2805,12 +3028,20 @@ impl Render for QuickPanel {
         // conversation's place (design D17); the pane is kept, so the
         // conversation returns where it was scrolled to. In a new quick chat
         // they lie above the bar. At most one is open.
-        let list = match self.sheet {
-            Sheet::None => None,
-            Sheet::Folder => self.render_folder_sheet(cx),
-            Sheet::Models => self.render_model_sheet(session, cx),
-            Sheet::Sessions => Some(self.render_picker(window, cx)),
-        };
+        let (on_screen, unseen) = self.sheets_to_draw(session, window, cx);
+        let list = self.render_sheet(on_screen, session, window, cx);
+        // A sheet waiting for the window's height, laid out where it is not
+        // seen, so the height it needs is measured.
+        let unseen = self.render_sheet(unseen, session, window, cx).map(|sheet| {
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .h_0()
+                .overflow_hidden()
+                .child(sheet)
+        });
         // A new quick chat is only its bar.
         let header = session.then(|| self.render_header(cx));
         let body = if !session {
@@ -2884,6 +3115,7 @@ impl Render for QuickPanel {
             }))
             .children(header)
             .child(body)
+            .children(unseen)
             .children(ring)
             .children(step)
             .with_animation(
