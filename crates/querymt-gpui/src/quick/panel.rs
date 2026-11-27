@@ -444,7 +444,7 @@ impl QuickPanel {
             picks,
         } = resume;
         // Under reduced motion GPUI draws the animation's last frame at once.
-        let chrome = chrome::install(window, !cx.reduce_motion());
+        let chrome = chrome::install(window, !cx.reduce_motion(), palette(cx).dark);
         let hud = hud_palette(palette(cx), chrome.glass);
         let height = initial_height(session.is_some());
         let pane = {
@@ -558,6 +558,12 @@ impl QuickPanel {
                 this.on_activation(window.is_window_active(), window, cx)
             }),
             cx.observe_window_bounds(window, |this, window, cx| this.bounds_changed(window, cx)),
+            // The app's theme can change while the panel is open: the panel
+            // follows it, and so does the material where it is ours.
+            cx.observe_global_in::<Palette>(window, |_, window, cx| {
+                chrome::follow_theme(window, palette(cx).dark);
+                cx.notify();
+            }),
         ];
         let edge = Edge::new(cx.background_executor().now());
         // Over the panel's own material the light is Core Animation's; when
@@ -1466,7 +1472,8 @@ impl QuickPanel {
         cx.notify();
     }
 
-    /// The panel's colours (design D15): dark whatever the app's theme is.
+    /// The panel's colours (design D15): the app's light or dark appearance in
+    /// the panel's own look.
     fn hud(&self, cx: &App) -> Palette {
         hud_palette(palette(cx), self.chrome.glass)
     }

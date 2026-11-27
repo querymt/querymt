@@ -12,9 +12,9 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
+use gpui_kit::base::{TextView, TextViewStyle};
 use gpui_kit::component::text::{
-    MarkdownNode, RangeHighlight, RenderedText, TextView, TextViewMotion, TextViewState,
-    TextViewStyle, markdown_ast,
+    MarkdownNode, RangeHighlight, RenderedText, TextViewMotion, TextViewState, markdown_ast,
 };
 use gpui_kit::component::{Sizable as _, Theme, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -98,20 +98,39 @@ pub fn markdown(
     )
 }
 
-/// The style of a transcript text view in `p`: code blocks, and the syntax
-/// colours of the palette's own theme (the quick panel keeps QueryMT Dark's).
-/// The kit shares one fence highlighter per `highlight_theme` `Arc`, so the
-/// same `Arc` every frame is what keeps fences from being re-highlighted.
+/// The style of a text view in `p`: every colour (text, muted text, links,
+/// selection, code and table backgrounds, borders) comes from the palette
+/// handed in, never from the app theme. The kit's own `TextView` wrapper
+/// derives them from the theme, which painted dark text onto the quick panel
+/// when the app was in a light theme, so this module builds the base view.
+///
+/// Fence colours are not part of the style: the base view takes them from the
+/// highlighter installed with the theme (`highlight::install`), one `Arc` for
+/// every frame, which is what keeps fences from being re-highlighted.
 pub(crate) fn view_style(p: &Palette) -> TextViewStyle {
-    TextViewStyle {
-        code_block: StyleRefinement::default()
-            .rounded(px(8.))
-            .pt(px(42.))
-            .pb_3()
-            .text_size(px(13.)),
-        highlight_theme: crate::theme::syntax(p),
-        ..TextViewStyle::default()
-    }
+    let radius = px(8.);
+    TextViewStyle::default()
+        .with_foreground(p.text)
+        .with_muted_foreground(p.muted)
+        .with_link(p.accent)
+        .with_selection(p.accent_dim)
+        .with_code_background(p.card)
+        .with_border(p.border)
+        .with_code_block(
+            StyleRefinement::default()
+                .rounded(radius)
+                .pt(px(42.))
+                .pb_3()
+                .text_size(px(13.)),
+        )
+        .with_table(StyleRefinement::default().rounded(radius))
+        .with_table_head(StyleRefinement::default().bg(p.card).text_color(p.muted))
+        .with_table_row_hover(p.card)
+        .with_inline_code(HighlightStyle {
+            background_color: Some(p.selected),
+            ..Default::default()
+        })
+        .with_dark(p.dark)
 }
 
 /// Transcript styling and extensions; `id` prefixes the table ids.
@@ -762,6 +781,7 @@ impl RenderOnce for TableCard {
         }
 
         let table = TextView::markdown(self.id.clone(), self.source.clone())
+            .style(view_style(&p))
             .inline_code_style(inline_code_style(&p));
         let (hover, click, value) = (chrome.clone(), chrome, self.source);
         let button = kit::icon_button(
@@ -1170,15 +1190,13 @@ mod tests {
         assert!(!fence_closed(""));
     }
 
-    /// Fences take their colours from the palette's own theme, and keep the
-    /// same highlighter between frames: the kit re-highlights every code block
-    /// when the theme `Arc` of a view's style changes.
+    /// Fences take their colours from the highlighter installed with the
+    /// theme, and keep the same one between frames: the kit re-highlights every
+    /// code block when the highlighter changes.
     #[gpui_kit::test]
-    fn fences_use_the_palettes_syntax_and_keep_it_between_frames(
-        cx: &mut gpui_kit::TestAppContext,
-    ) {
+    fn fences_use_the_installed_highlighter_for_every_theme(cx: &mut gpui_kit::TestAppContext) {
         use crate::theme::{Accent, Appearance, ThemeId};
-        use std::sync::Arc;
+        use gpui_kit::base::TextViewDefaults;
         cx.update(|cx| {
             gpui_kit::init(cx);
             crate::theme::apply(crate::theme::Appearance::builtin(true), cx);
@@ -1198,23 +1216,38 @@ mod tests {
                     cx,
                 )
             });
-            let p = cx.update(|cx| *crate::theme::palette(cx));
-            let (first, second) = (super::view_style(&p), super::view_style(&p));
+            // The view sets no highlighter of its own: the base view uses the
+            // one installed with the theme, the same one every frame.
             assert!(
-                Arc::ptr_eq(&first.highlight_theme, &second.highlight_theme),
-                "{key}"
-            );
-            assert!(
-                Arc::ptr_eq(&first.highlight_theme, &theme.syntax()),
+                cx.update(|cx| TextViewDefaults::global(cx).has_code_block_highlighter()),
                 "{key}"
             );
         }
-        // The quick panel's palette brings QueryMT Dark's whatever is shown.
-        let hud = crate::quick::hud::hud_palette(&cx.update(|cx| *crate::theme::palette(cx)), true);
-        assert!(Arc::ptr_eq(
-            &super::view_style(&hud).highlight_theme,
-            &ThemeId::QMT_DARK.syntax()
-        ));
+    }
+
+    /// Every colour of a text view comes from the palette it is given, whatever
+    /// theme the app is in: the quick panel's text was dark on dark when the
+    /// app was light, because the kit's wrapper took them from the theme.
+    #[test]
+    fn a_views_style_takes_every_colour_from_the_palette() {
+        use crate::quick::hud::hud_palette;
+        use crate::theme::Palette;
+        for p in [
+            Palette::light(),
+            Palette::dark(),
+            hud_palette(&Palette::light(), true),
+            hud_palette(&Palette::dark(), false),
+        ] {
+            let style = super::view_style(&p);
+            assert_eq!(style.foreground(), p.text);
+            assert_eq!(style.muted_foreground(), p.muted);
+            assert_eq!(style.link(), p.accent);
+            assert_eq!(style.selection(), p.accent_dim);
+            assert_eq!(style.code_background(), p.card);
+            assert_eq!(style.border(), p.border);
+            assert_eq!(style.table_row_hover(), Some(p.card));
+            assert_eq!(style.is_dark(), p.dark);
+        }
     }
 
     /// A transcript reply kept like the session view keeps it.

@@ -4021,8 +4021,8 @@ fn the_panels_fields_use_its_palette(cx: &mut TestAppContext) {
     assert_eq!(style.selection, p.accent.opacity(0.32));
 }
 
-// The panel keeps QueryMT Dark's code colours whatever theme the main window
-// shows (desktop-themes / The quick panel keeps its own colours).
+// The panel follows the app's light or dark theme, in its own look
+// (quick-panel / Light app theme, Dark app theme).
 fn panel_pane_palette(
     cx: &mut TestAppContext,
     rig: &Rig,
@@ -4039,33 +4039,28 @@ fn panel_pane_palette(
     })
 }
 
-fn assert_qmt_dark_code(
+fn assert_follows_the_app(
     cx: &mut TestAppContext,
     hud: crate::theme::Palette,
     pane: crate::theme::Palette,
 ) {
-    use gpui_kit::component::highlighter::HighlightTheme;
-    use std::sync::Arc;
     assert_eq!(pane, hud, "the pane paints with the panel's palette");
-    assert_eq!(pane.theme, crate::theme::ThemeId::QMT_DARK);
-    assert!(Arc::ptr_eq(
-        &crate::theme::syntax(&pane),
-        &HighlightTheme::default_dark()
-    ));
-    let style = crate::ui::view_style(&pane);
-    assert!(
-        Arc::ptr_eq(&style.highlight_theme, &HighlightTheme::default_dark()),
-        "fences"
-    );
     let app = cx.update(|cx| *crate::theme::palette(cx));
-    assert!(
-        !Arc::ptr_eq(&crate::theme::syntax(&app), &HighlightTheme::default_dark()),
-        "the test needs the two to differ"
-    );
+    assert_eq!(hud.dark, app.dark, "the panel follows the app's appearance");
+    assert_eq!(hud.theme, app.theme, "and its syntax colours");
+    assert_ne!(hud.bg, app.bg, "in a look of its own");
+    assert_ne!(hud.border, app.border);
+    // The text of the transcript is the panel's, so it reads on the panel:
+    // dark on light glass, light on dark glass.
+    let style = crate::ui::view_style(&pane);
+    assert_eq!(style.foreground(), hud.text);
+    assert_eq!(style.muted_foreground(), hud.muted);
+    assert_eq!(style.link(), hud.accent);
+    assert_eq!(style.is_dark(), app.dark);
 }
 
 #[gpui_kit::test]
-fn panel_code_uses_qmt_dark_with_a_bundled_theme(cx: &mut TestAppContext) {
+fn panel_follows_a_light_theme_and_its_transcript_text_is_dark(cx: &mut TestAppContext) {
     use crate::theme::{Accent, Appearance, ThemeId};
     let rig = rig(cx);
     let theme = ThemeId::resolve("solarized-light", false);
@@ -4079,20 +4074,37 @@ fn panel_code_uses_qmt_dark_with_a_bundled_theme(cx: &mut TestAppContext) {
         )
     });
     let (hud, pane) = panel_pane_palette(cx, &rig);
-    assert_qmt_dark_code(cx, hud, pane);
-    // Its surfaces are its own dark ones, not the theme's.
-    let app = cx.update(|cx| *crate::theme::palette(cx));
-    assert!(hud.dark && !app.dark);
-    assert_ne!(hud.bg, app.bg);
-    assert_ne!(hud.border, app.border);
+    assert!(!hud.dark);
+    assert_follows_the_app(cx, hud, pane);
+    assert!(hud.text.l < 0.3, "dark text on light glass: {:?}", hud.text);
 }
 
 #[gpui_kit::test]
-fn panel_code_uses_qmt_dark_in_light_mode(cx: &mut TestAppContext) {
+fn panel_follows_a_dark_theme(cx: &mut TestAppContext) {
     let rig = rig(cx);
-    cx.update(|cx| crate::theme::apply(crate::theme::Appearance::builtin(false), cx));
+    cx.update(|cx| crate::theme::apply(crate::theme::Appearance::builtin(true), cx));
     let (hud, pane) = panel_pane_palette(cx, &rig);
-    assert_qmt_dark_code(cx, hud, pane);
+    assert!(hud.dark);
+    assert_follows_the_app(cx, hud, pane);
+    assert!(hud.text.l > 0.7);
+}
+
+#[gpui_kit::test]
+fn panel_restyles_when_the_app_theme_changes_while_open(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    cx.update(|cx| crate::theme::apply(crate::theme::Appearance::builtin(true), cx));
+    let (window, panel) = rig.open_panel(cx);
+    finish_opening(cx, window);
+    show_view(cx, &rig, &panel, long_view("code", 1, "idle"));
+    settle(cx, window);
+    assert!(panel.read_with(cx, |p, cx| {
+        p.pane_for_test().read(cx).palette_for_test(cx).dark
+    }));
+    cx.update(|cx| crate::theme::apply(crate::theme::Appearance::builtin(false), cx));
+    settle(cx, window);
+    let pane = panel.read_with(cx, |p, cx| p.pane_for_test().read(cx).palette_for_test(cx));
+    assert!(!pane.dark, "the open panel followed the theme");
+    assert!(pane.text.l < 0.3);
 }
 
 #[gpui_kit::test]

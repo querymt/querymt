@@ -5416,7 +5416,9 @@ impl SessionPane {
                         .left(px(14.))
                         .right(px(14.))
                         .h(px(1.))
-                        .bg(white().opacity(0.22)),
+                        // A bevel: a light edge on the pill, faint on dark glass
+                        // and bright on light glass, where the pill is a grey.
+                        .bg(white().opacity(if p.dark { 0.22 } else { 0.85 })),
                 )
             })
             // No shadow on a material: it would lie on the glass as a dark smudge.
@@ -6218,7 +6220,7 @@ impl SessionPane {
             .iter()
             .filter_map(|k| {
                 self.cards.update(cx, |cards, cx| {
-                    cards.request_card(k, false, false, window, cx)
+                    cards.request_card(k, false, false, p, window, cx)
                 })
             })
             .collect();
