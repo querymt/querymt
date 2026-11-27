@@ -87,14 +87,14 @@ pub(super) fn activate_window(window: &gpui_kit::Window, activation_token: Optio
 
 #[cfg(target_os = "linux")]
 mod wayland {
-    use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
-    use wayland_client::backend::{Backend, ObjectId};
     use wayland_client::globals::{GlobalListContents, registry_queue_init};
-    use wayland_client::protocol::{wl_registry, wl_surface::WlSurface};
+    use wayland_client::protocol::wl_registry;
     use wayland_client::{Connection, Dispatch, Proxy, QueueHandle, delegate_noop};
     use wayland_protocols::xdg::activation::v1::client::xdg_activation_v1::{
         Request, XdgActivationV1,
     };
+
+    use crate::quick::wayland::{Surface, surface};
 
     struct Activation;
     delegate_noop!(Activation: ignore XdgActivationV1);
@@ -112,28 +112,13 @@ mod wayland {
     }
 
     pub(super) fn activate(window: &gpui_kit::Window, token: String) -> Result<bool, String> {
-        let (Ok(display), Ok(surface)) = (
-            window.display_handle(),
-            HasWindowHandle::window_handle(window),
-        ) else {
-            return Ok(false);
-        };
-        let (RawDisplayHandle::Wayland(display), RawWindowHandle::Wayland(surface)) =
-            (display.as_raw(), surface.as_raw())
+        let Some(Surface {
+            connection,
+            surface,
+        }) = surface(window)?
         else {
             return Ok(false);
         };
-
-        // SAFETY: GPUI lends both handles for the lifetime of this window borrow.
-        // The temporary backend uses its own event queue without owning the display;
-        // neither the backend nor the imported surface escapes this call.
-        let (connection, surface_id) = unsafe {
-            let backend = Backend::from_foreign_display(display.display.as_ptr().cast());
-            let id = ObjectId::from_ptr(WlSurface::interface(), surface.surface.as_ptr().cast());
-            (Connection::from_backend(backend), id)
-        };
-        let surface = WlSurface::from_id(&connection, surface_id.map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
         let (globals, queue) =
             registry_queue_init::<Activation>(&connection).map_err(|e| e.to_string())?;
         let activation = globals.bind::<XdgActivationV1, _, _>(&queue.handle(), 1..=1, ());
