@@ -2672,7 +2672,7 @@ mod todo_rewind {
     /// The next `TodoPlanRestored` entries on the stream, `None` when the next
     /// event after a sentinel is the sentinel itself.
     async fn next_restored(
-        events: &mut tokio::sync::broadcast::Receiver<EventEnvelope>,
+        events: &mut tokio::sync::broadcast::Receiver<std::sync::Arc<EventEnvelope>>,
         fixture: &UndoTestFixture,
         session: &str,
     ) -> Option<Vec<PlanEntry>> {

@@ -404,7 +404,7 @@ impl SessionForkHelper {
                     &parent_id.to_string(),
                     session_id,
                     &fork_point_ref,
-                    &info.fork_instructions,
+                    info.fork_instructions.as_deref(),
                 )
                 .await?;
             }
@@ -414,7 +414,7 @@ impl SessionForkHelper {
                     &parent_id.to_string(),
                     session_id,
                     &fork_point_ref,
-                    &info.fork_instructions,
+                    info.fork_instructions.as_deref(),
                 )
                 .await?;
             }
@@ -429,7 +429,7 @@ impl SessionForkHelper {
         parent_id: &str,
         child_id: &str,
         message_index: &str,
-        fork_instructions: &Option<String>,
+        fork_instructions: Option<&str>,
     ) -> SessionResult<()> {
         let index: usize = message_index.parse().map_err(|e| {
             SessionError::InvalidMessageIndex(format!("Invalid message index: {}", e))
@@ -458,7 +458,7 @@ impl SessionForkHelper {
         parent_id: &str,
         child_id: &str,
         progress_entry_id: &str,
-        fork_instructions: &Option<String>,
+        fork_instructions: Option<&str>,
     ) -> SessionResult<()> {
         let progress_entry = store
             .get_progress_entry(progress_entry_id)
@@ -504,7 +504,7 @@ impl SessionForkHelper {
         store: Arc<dyn SessionStore>,
         parent_id: &str,
         child_id: &str,
-        fork_instructions: &Option<String>,
+        fork_instructions: Option<&str>,
     ) -> SessionResult<()> {
         let parent_intent = store.get_current_intent_snapshot(parent_id).await?;
 

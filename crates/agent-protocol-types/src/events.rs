@@ -1405,6 +1405,23 @@ impl EventEnvelope {
         matches!(self, EventEnvelope::Ephemeral(_))
     }
 
+    /// The durable event, when this is one. Works through an
+    /// `Arc<EventEnvelope>` too, which cannot be matched on directly.
+    pub fn as_durable(&self) -> Option<&DurableEvent> {
+        match self {
+            EventEnvelope::Durable(e) => Some(e),
+            EventEnvelope::Ephemeral(_) => None,
+        }
+    }
+
+    /// The ephemeral event, when this is one.
+    pub fn as_ephemeral(&self) -> Option<&EphemeralEvent> {
+        match self {
+            EventEnvelope::Ephemeral(e) => Some(e),
+            EventEnvelope::Durable(_) => None,
+        }
+    }
+
     /// Sequence number: `stream_seq` for durable events, `0` for ephemeral.
     pub fn seq(&self) -> i64 {
         match self {

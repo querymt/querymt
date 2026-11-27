@@ -297,7 +297,7 @@ impl Tool for ReplaceSymbolTool {
                 for (i, result_info) in indices.iter().zip(file_results.iter()) {
                     resolved[*i].new_start_line = result_info.new_start_line;
                     resolved[*i].new_end_line = result_info.new_end_line;
-                    resolved[*i].new_hash = result_info.new_hash.clone();
+                    resolved[*i].new_hash.clone_from(&result_info.new_hash);
                 }
 
                 tokio::fs::write(file_path, &new_content)

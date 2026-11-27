@@ -149,7 +149,7 @@ impl Tool for GetSymbolTool {
                 Ok(c) => c,
                 Err(e) => {
                     let err = format!("{}\n- Failed to read file: {e}", target.display());
-                    append_file_result(&mut file_results, target, err);
+                    append_file_result(&mut file_results, &target, err);
                     continue;
                 }
             };
@@ -157,7 +157,7 @@ impl Tool for GetSymbolTool {
                 Ok(idx) => idx,
                 Err(e) => {
                     let err = format!("{}\n- Failed to index file: {e}", target.display());
-                    append_file_result(&mut file_results, target, err);
+                    append_file_result(&mut file_results, &target, err);
                     continue;
                 }
             };
@@ -175,7 +175,7 @@ impl Tool for GetSymbolTool {
                 context_mode,
                 max_relevant,
             );
-            append_file_result(&mut file_results, target, result);
+            append_file_result(&mut file_results, &target, result);
         }
 
         let output = file_results
@@ -250,7 +250,7 @@ fn parse_request_array(requests: &[&Value]) -> Result<Vec<SymbolRequest>, ToolEr
 
 fn append_file_result(
     file_results: &mut Vec<(String, Vec<String>)>,
-    target: std::path::PathBuf,
+    target: &std::path::Path,
     result: String,
 ) {
     let display = target.display().to_string();

@@ -619,8 +619,8 @@ mod tests {
     }
 
     async fn recv_event(
-        rx: &mut broadcast::Receiver<querymt_agent_core::events::EventEnvelope>,
-    ) -> querymt_agent_core::events::EventEnvelope {
+        rx: &mut broadcast::Receiver<std::sync::Arc<querymt_agent_core::events::EventEnvelope>>,
+    ) -> std::sync::Arc<querymt_agent_core::events::EventEnvelope> {
         tokio::time::timeout(tokio::time::Duration::from_secs(1), rx.recv())
             .await
             .expect("timed out waiting for retry event")
@@ -628,7 +628,7 @@ mod tests {
     }
 
     async fn assert_no_event(
-        rx: &mut broadcast::Receiver<querymt_agent_core::events::EventEnvelope>,
+        rx: &mut broadcast::Receiver<std::sync::Arc<querymt_agent_core::events::EventEnvelope>>,
     ) {
         assert!(
             tokio::time::timeout(tokio::time::Duration::from_millis(50), rx.recv())

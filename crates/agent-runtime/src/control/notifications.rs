@@ -105,7 +105,9 @@ pub(crate) fn session_plans_changed_notification(
 /// `deliver` is a plain `FnMut` returning a future, not an `AsyncFnMut`, so
 /// that the returned future can be proven `Send` and spawned.
 pub async fn announce_session_plans<F, Fut>(
-    mut events: tokio::sync::broadcast::Receiver<querymt_agent_core::events::EventEnvelope>,
+    mut events: tokio::sync::broadcast::Receiver<
+        std::sync::Arc<querymt_agent_core::events::EventEnvelope>,
+    >,
     cancel: tokio_util::sync::CancellationToken,
     plan_source: Option<std::sync::Arc<dyn crate::session::projection::ViewStore>>,
     mut deliver: F,

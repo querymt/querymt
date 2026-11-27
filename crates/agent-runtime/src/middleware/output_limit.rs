@@ -883,7 +883,9 @@ mod tests {
 
     /// Next `OutputLimitRecovery` event on `rx`, with its durability.
     async fn next_recovery(
-        rx: &mut tokio::sync::broadcast::Receiver<querymt_agent_core::events::EventEnvelope>,
+        rx: &mut tokio::sync::broadcast::Receiver<
+            std::sync::Arc<querymt_agent_core::events::EventEnvelope>,
+        >,
     ) -> (AgentEventKind, bool) {
         let deadline = std::time::Duration::from_secs(5);
         loop {
@@ -899,7 +901,7 @@ mod tests {
 
     async fn bound_middleware() -> (
         Run,
-        tokio::sync::broadcast::Receiver<querymt_agent_core::events::EventEnvelope>,
+        tokio::sync::broadcast::Receiver<std::sync::Arc<querymt_agent_core::events::EventEnvelope>>,
         crate::test_utils::TestAgent,
     ) {
         let agent = crate::test_utils::TestAgent::new().await;

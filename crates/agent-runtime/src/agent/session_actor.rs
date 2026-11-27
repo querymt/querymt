@@ -6297,7 +6297,9 @@ mod tests {
         owner: ActorFixture,
         journal: Arc<dyn EventJournal>,
         sink: Arc<querymt_agent_services::event_sink::EventSink>,
-        rx: tokio::sync::broadcast::Receiver<querymt_agent_core::events::EventEnvelope>,
+        rx: tokio::sync::broadcast::Receiver<
+            std::sync::Arc<querymt_agent_core::events::EventEnvelope>,
+        >,
     }
 
     #[cfg(feature = "remote")]
@@ -8888,7 +8890,9 @@ mod tests {
     }
 
     fn drain_provider_changes(
-        rx: &mut tokio::sync::broadcast::Receiver<querymt_agent_core::events::EventEnvelope>,
+        rx: &mut tokio::sync::broadcast::Receiver<
+            std::sync::Arc<querymt_agent_core::events::EventEnvelope>,
+        >,
     ) -> usize {
         let mut changes = 0;
         while let Ok(envelope) = rx.try_recv() {

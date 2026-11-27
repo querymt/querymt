@@ -80,20 +80,23 @@ pub fn project_request<'a>(
     let mut messages = Vec::with_capacity(history.len() + 1);
     for (index, stored) in history.iter().enumerate() {
         let keep_changes = target.tool_changes && baseline_at.is_some_and(|at| index > at);
-        let stored: Cow<'_, AgentMessage> = if stored.parts.iter().any(MessagePart::is_tool_record)
-        {
-            let mut copy = stored.clone();
-            copy.parts.retain(|part| match part {
-                MessagePart::ToolBaseline { .. } => false,
-                MessagePart::ToolChange { .. } => keep_changes,
-                _ => true,
-            });
-            if copy.parts.is_empty() {
-                continue;
-            }
-            Cow::Owned(copy)
-        } else {
+        let keep = |part: &MessagePart| match part {
+            MessagePart::ToolBaseline { .. } => false,
+            MessagePart::ToolChange { .. } => keep_changes,
+            _ => true,
+        };
+        // Decide before copying: a stored tool record carries the full tool
+        // schema list, and in production it is always a message of its own, so
+        // it is either skipped or used as stored. Only a message that mixes a
+        // dropped record with other parts needs a stripped copy.
+        let stored: Cow<'_, AgentMessage> = if stored.parts.iter().all(keep) {
             Cow::Borrowed(stored)
+        } else if !stored.parts.iter().any(keep) {
+            continue;
+        } else {
+            let mut copy = stored.clone();
+            copy.parts.retain(|part| keep(part));
+            Cow::Owned(copy)
         };
         messages.push(
             stored.to_chat_message_with_output_target(target.output, target.max_prompt_bytes)?,
@@ -253,6 +256,58 @@ mod tests {
         );
 
         assert!(project_request(&[invalid], &target(false)).is_err());
+    }
+
+    #[test]
+    fn a_record_mixed_with_other_parts_is_stripped_and_the_rest_kept() {
+        let text = || MessagePart::Text {
+            content: "hello".into(),
+        };
+        // A baseline sharing a message with text: the baseline is always
+        // dropped, the text stays.
+        let with_baseline = stored(
+            ChatRole::User,
+            vec![
+                MessagePart::ToolBaseline {
+                    tools: vec![tool("a")],
+                    origin: "p/m".into(),
+                },
+                text(),
+            ],
+        );
+        for tool_changes in [false, true] {
+            let history = vec![with_baseline.clone()];
+            let projected = project_request(&history, &target(tool_changes)).unwrap();
+            assert_eq!(projected.messages.len(), 1);
+            assert_eq!(projected.messages[0].text(), "hello");
+            // The stored history is never modified by the projection.
+            assert_eq!(history[0].parts.len(), 2);
+        }
+
+        // A change after the baseline sharing a message with text: kept only
+        // when the provider takes changes.
+        let with_change = stored(
+            ChatRole::User,
+            vec![
+                text(),
+                MessagePart::ToolChange {
+                    added: vec![tool("late")],
+                    removed: Vec::new(),
+                },
+            ],
+        );
+        let history = vec![baseline(&["a"]), with_change];
+
+        let without = project_request(&history, &target(false)).unwrap();
+        assert_eq!(without.messages.len(), 1);
+        assert_eq!(without.messages[0].text(), "hello");
+        assert!(!without.messages[0].has_tool_change());
+
+        let with = project_request(&history, &target(true)).unwrap();
+        assert_eq!(with.messages.len(), 1);
+        assert_eq!(with.messages[0].text(), "hello");
+        assert!(with.messages[0].has_tool_change());
+        assert_eq!(history[1].parts.len(), 2);
     }
 
     #[test]

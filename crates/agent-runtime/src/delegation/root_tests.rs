@@ -266,7 +266,7 @@ async fn protocol_target_activity_reaches_the_parents_client() {
             .expect("event arrives on the root's fanout")
             .expect("fanout open");
         if is_event_owned(&owners, "conn-1", &event).await {
-            delivered.push(event);
+            delivered.push(std::sync::Arc::unwrap_or_clone(event));
         }
     }
     let child_kinds: Vec<&AgentEventKind> = delivered
@@ -523,7 +523,9 @@ mod remote_members {
         parent: String,
         child: String,
         owners: crate::acp::shared::SessionOwnerMap,
-        events: tokio::sync::broadcast::Receiver<querymt_agent_core::events::EventEnvelope>,
+        events: tokio::sync::broadcast::Receiver<
+            std::sync::Arc<querymt_agent_core::events::EventEnvelope>,
+        >,
         _dir: tempfile::TempDir,
     }
 
@@ -616,7 +618,7 @@ mod remote_members {
                 let owned =
                     crate::acp::shared::is_event_owned(&self.owners, "conn-1", &event).await;
                 if owned && event.session_id() == self.child && wanted(event.kind()) {
-                    return event;
+                    return std::sync::Arc::unwrap_or_clone(event);
                 }
             }
         }

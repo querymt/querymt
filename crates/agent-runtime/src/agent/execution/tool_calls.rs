@@ -5059,7 +5059,7 @@ mod mcp_tool_tests {
         harness: McpHarness,
         exec: TurnEnv,
         turn: Turn,
-        events: broadcast::Receiver<EventEnvelope>,
+        events: broadcast::Receiver<std::sync::Arc<EventEnvelope>>,
     }
 
     async fn fixture() -> Fixture {
@@ -5080,14 +5080,14 @@ mod mcp_tool_tests {
 
     /// Everything published within `window`, in order.
     async fn collect(
-        rx: &mut broadcast::Receiver<EventEnvelope>,
+        rx: &mut broadcast::Receiver<std::sync::Arc<EventEnvelope>>,
         window: Duration,
     ) -> Vec<EventEnvelope> {
         let deadline = tokio::time::Instant::now() + window;
         let mut out = Vec::new();
         while let Ok(received) = tokio::time::timeout_at(deadline, rx.recv()).await {
             match received {
-                Ok(envelope) => out.push(envelope),
+                Ok(envelope) => out.push(std::sync::Arc::unwrap_or_clone(envelope)),
                 Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => break,
             }
@@ -5503,7 +5503,9 @@ mod mcp_tool_tests {
     }
 
     /// Wait for the next `ElicitationRequested` on `events` and return its ID.
-    async fn next_request_id(events: &mut broadcast::Receiver<EventEnvelope>) -> String {
+    async fn next_request_id(
+        events: &mut broadcast::Receiver<std::sync::Arc<EventEnvelope>>,
+    ) -> String {
         loop {
             let envelope = tokio::time::timeout(Duration::from_secs(5), events.recv())
                 .await

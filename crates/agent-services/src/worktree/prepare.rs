@@ -289,7 +289,7 @@ fn commit_tree(repo: &gix::Repository, role: &str, expr: &str) -> Result<ObjectI
 
 fn flatten(repo: &gix::Repository, tree: ObjectId) -> WorktreeResult<FlatTree> {
     let mut flat = FlatTree::new();
-    flatten_tree(repo, tree, &mut flat, String::new())?;
+    flatten_tree(repo, tree, &mut flat, "")?;
     Ok(flat)
 }
 

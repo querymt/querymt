@@ -268,18 +268,27 @@ pub(super) async fn transition_before_llm_call(
         },
     )
     .map_err(|error| anyhow::anyhow!("Invalid stored message content: {error}"))?;
-    let leading = projected
-        .baseline_tools
-        .map_or_else(|| tools.clone(), <[querymt::chat::Tool]>::to_vec);
-    let offered_tools = if tool_changes {
-        super::tool_history::offered(turn.history.as_slice())
+    // The request lists share the tools offered now whenever their contents
+    // match, so the schema list is copied only for a baseline that differs.
+    let tools: Arc<[querymt::chat::Tool]> = Arc::from(tools);
+    let (leading, leading_json): (Arc<[querymt::chat::Tool]>, Vec<u8>) =
+        match projected.baseline_tools {
+            Some(baseline) if baseline != &tools[..] => (
+                Arc::from(baseline),
+                serde_json::to_vec(baseline)
+                    .context("Failed to serialize tools for hash computation")?,
+            ),
+            _ => (Arc::clone(&tools), tools_json),
+        };
+    let offered_tools: Arc<[querymt::chat::Tool]> = if tool_changes {
+        let offered = super::tool_history::offered_refs(turn.history.as_slice());
+        if offered.iter().copied().eq(leading.iter()) {
+            Arc::clone(&leading)
+        } else {
+            offered.into_iter().cloned().collect()
+        }
     } else {
-        tools.clone()
-    };
-    let leading_json = if leading == tools {
-        tools_json
-    } else {
-        serde_json::to_vec(&leading).context("Failed to serialize tools for hash computation")?
+        Arc::clone(&tools)
     };
     let leading_hash = querymt_agent_core::hash::RapidHash::new(&leading_json);
 
@@ -403,8 +412,8 @@ pub(super) async fn transition_before_llm_call(
     Ok(Step::Continue(Stage::CallModel(Box::new(
         PreparedModelRequest {
             messages: Arc::from(messages.into_boxed_slice()),
-            tools: Arc::from(leading.into_boxed_slice()),
-            offered_tools: Arc::from(offered_tools.into_boxed_slice()),
+            tools: leading,
+            offered_tools,
             estimated_tokens,
             options,
         },
@@ -2881,7 +2890,7 @@ mod tests {
                 // Drain with no await between this and the cancel, so
                 // everything left in `events` was published afterwards.
                 while let Ok(e) = events.try_recv() {
-                    before_cancel.push(e);
+                    before_cancel.push(std::sync::Arc::unwrap_or_clone(e));
                 }
                 token.cancel();
             };
@@ -2895,7 +2904,7 @@ mod tests {
             let mut after_cancel = Vec::new();
             let deadline = tokio::time::Instant::now() + Duration::from_millis(700);
             while let Ok(Ok(e)) = tokio::time::timeout_at(deadline, events.recv()).await {
-                after_cancel.push(e);
+                after_cancel.push(std::sync::Arc::unwrap_or_clone(e));
             }
             (result, before_cancel, after_cancel)
         }
@@ -3036,7 +3045,7 @@ mod tests {
             let mut published = Vec::new();
             let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
             while let Ok(Ok(event)) = tokio::time::timeout_at(deadline, events.recv()).await {
-                published.push(event);
+                published.push(std::sync::Arc::unwrap_or_clone(event));
             }
             published
         }
@@ -4518,7 +4527,9 @@ mod tests {
             config: AgentConfig,
             exec: crate::agent::execution::turn::TurnEnv,
             turn: crate::agent::execution::turn::Turn,
-            events: tokio::sync::broadcast::Receiver<querymt_agent_core::events::EventEnvelope>,
+            events: tokio::sync::broadcast::Receiver<
+                std::sync::Arc<querymt_agent_core::events::EventEnvelope>,
+            >,
         }
 
         impl SkillProblemRun {
@@ -7280,7 +7291,7 @@ mod tests {
 
         async fn request_end_costs(
             events: &mut tokio::sync::broadcast::Receiver<
-                querymt_agent_core::events::EventEnvelope,
+                std::sync::Arc<querymt_agent_core::events::EventEnvelope>,
             >,
         ) -> (Option<f64>, Option<f64>) {
             loop {
@@ -7435,7 +7446,7 @@ mod tests {
             exec: &mut TurnEnv,
             turn: &mut Turn,
             events: &mut tokio::sync::broadcast::Receiver<
-                querymt_agent_core::events::EventEnvelope,
+                std::sync::Arc<querymt_agent_core::events::EventEnvelope>,
             >,
             model: &str,
             messages: Vec<ChatMessage>,
@@ -8048,7 +8059,9 @@ mod tests {
             assert!(error.to_string().contains("accounting"), "{error:#}");
         }
 
-        type Events = tokio::sync::broadcast::Receiver<querymt_agent_core::events::EventEnvelope>;
+        type Events = tokio::sync::broadcast::Receiver<
+            std::sync::Arc<querymt_agent_core::events::EventEnvelope>,
+        >;
 
         /// The next `LlmRequestEnd` as (cost, accounting), or `None` if none
         /// arrives within the window.

@@ -332,7 +332,7 @@ impl SearchTextTool {
             }
 
             // Get or create the lines vector for this file
-            let lines = file_results.entry(rel_path.clone()).or_default();
+            let lines = file_results.entry(rel_path).or_default();
 
             // Separate non-contiguous context groups in the same file.
             if has_context && prev_line.is_some_and(|prev| prev.checked_add(1) != Some(m.line)) {

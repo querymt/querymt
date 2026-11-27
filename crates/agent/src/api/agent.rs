@@ -1243,7 +1243,9 @@ impl Agent {
         Ok(())
     }
 
-    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<crate::events::EventEnvelope> {
+    pub fn subscribe(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<std::sync::Arc<crate::events::EventEnvelope>> {
         self.inner.subscribe_events()
     }
 
@@ -2010,7 +2012,9 @@ impl ChatRunner for Agent {
         Ok(Box::new(session))
     }
 
-    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<crate::events::EventEnvelope> {
+    fn subscribe(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<std::sync::Arc<crate::events::EventEnvelope>> {
         Agent::subscribe(self)
     }
 

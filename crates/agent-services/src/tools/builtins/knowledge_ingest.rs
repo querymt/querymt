@@ -288,7 +288,7 @@ mod tests {
         // Check that a KnowledgeIngested event was emitted
         let mut found = false;
         while let Ok(envelope) = rx.try_recv() {
-            if let querymt_agent_core::events::EventEnvelope::Durable(ev) = envelope
+            if let Some(ev) = envelope.as_durable()
                 && matches!(
                     ev.kind,
                     querymt_agent_core::events::AgentEventKind::KnowledgeIngested { .. }

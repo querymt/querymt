@@ -1223,7 +1223,9 @@ async fn provider_failure_at_run_start_is_reported_after_the_prompt_is_stored() 
 /// The `outcome` of every `RunCompleted` of `session`, in order, once `count`
 /// of them were published.
 async fn run_outcomes(
-    events: &mut tokio::sync::broadcast::Receiver<querymt_agent_core::events::EventEnvelope>,
+    events: &mut tokio::sync::broadcast::Receiver<
+        std::sync::Arc<querymt_agent_core::events::EventEnvelope>,
+    >,
     session: &str,
     count: usize,
 ) -> Vec<String> {

@@ -126,7 +126,9 @@ impl SchedulerHandle {
     /// Process an event from the fanout.
     pub async fn process_event(&self, envelope: EventEnvelope) -> SessionResult<()> {
         self.actor_ref
-            .tell(ProcessEvent { envelope })
+            .tell(ProcessEvent {
+                envelope: Arc::new(envelope),
+            })
             .await
             .map_err(|e| crate::session::error::SessionError::Other(e.to_string()))?;
         Ok(())

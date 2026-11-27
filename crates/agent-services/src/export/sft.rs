@@ -315,7 +315,9 @@ pub async fn export_all_sessions(
         // If scrubbing, we wrap the options to include home dir
         let mut session_options = options.clone();
         if let Some(ref home) = home_dir {
-            session_options.path_replacement = options.path_replacement.clone();
+            session_options
+                .path_replacement
+                .clone_from(&options.path_replacement);
             // Store the home dir pattern for scrub_paths to use
             SCRUB_HOME.with(|cell| cell.replace(Some(home.clone())));
         }

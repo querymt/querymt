@@ -1918,7 +1918,7 @@ fn acp_session_scope_from_meta(meta: Option<&Meta>) -> SessionScope {
         .get("session_scope")
         .or_else(|| meta.get("sessionScope"));
     match value {
-        Some(serde_json::Value::String(scope)) => SessionScope::from_option(Some(scope.clone())),
+        Some(serde_json::Value::String(scope)) => SessionScope::from_option(Some(scope.as_str())),
         _ => SessionScope::All,
     }
 }

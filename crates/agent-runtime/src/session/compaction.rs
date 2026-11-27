@@ -3586,7 +3586,7 @@ mod tests {
         /// initiated it (the ledger's), whatever session the history names.
         #[tokio::test]
         async fn retry_events_go_to_the_initiating_session_not_the_histories() {
-            use querymt_agent_core::events::{AgentEventKind, EventEnvelope};
+            use querymt_agent_core::events::AgentEventKind;
             let config = config_with(|_| {}).await;
             let mut events = config.subscribe_events();
             let provider = ScriptedProvider::new(true, vec![overloaded(0), summary("a summary")]);
@@ -3616,7 +3616,7 @@ mod tests {
 
             let mut sessions = Vec::new();
             while let Ok(envelope) = events.try_recv() {
-                if let EventEnvelope::Durable(event) = envelope
+                if let Some(event) = envelope.as_durable()
                     && matches!(
                         event.kind,
                         AgentEventKind::LlmRetryWait { .. }
@@ -3625,7 +3625,7 @@ mod tests {
                             | AgentEventKind::RateLimitResume { .. }
                     )
                 {
-                    sessions.push(event.session_id);
+                    sessions.push(event.session_id.clone());
                 }
             }
             assert_eq!(

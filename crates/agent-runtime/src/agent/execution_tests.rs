@@ -636,7 +636,9 @@ fn stop_then_recover(stop_steps: usize) -> ScriptedMiddleware {
 
 /// Count `MiddlewareStopped` events currently buffered on `events`.
 async fn drain_middleware_stopped(
-    events: &mut tokio::sync::broadcast::Receiver<querymt_agent_core::events::EventEnvelope>,
+    events: &mut tokio::sync::broadcast::Receiver<
+        std::sync::Arc<querymt_agent_core::events::EventEnvelope>,
+    >,
 ) -> usize {
     let mut stopped = 0;
     while let Ok(Ok(envelope)) =

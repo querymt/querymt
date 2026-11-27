@@ -741,15 +741,18 @@ mod tests {
     }
 
     fn take_compaction_events(
-        receiver: &mut tokio::sync::broadcast::Receiver<EventEnvelope>,
+        receiver: &mut tokio::sync::broadcast::Receiver<std::sync::Arc<EventEnvelope>>,
     ) -> Vec<DurableEvent> {
         let mut events = Vec::new();
         loop {
             match receiver.try_recv() {
-                Ok(EventEnvelope::Durable(event)) if is_compaction_event(&event.kind) => {
-                    events.push(event);
+                Ok(envelope) => {
+                    if let Some(event) = envelope.as_durable()
+                        && is_compaction_event(&event.kind)
+                    {
+                        events.push(event.clone());
+                    }
                 }
-                Ok(_) => {}
                 Err(tokio::sync::broadcast::error::TryRecvError::Empty) => return events,
                 Err(error) => panic!("failed to receive compaction event: {error}"),
             }
@@ -886,18 +889,19 @@ mod tests {
         let mut retry_events = Vec::new();
         loop {
             match events.try_recv() {
-                Ok(EventEnvelope::Durable(event)) => {
-                    if matches!(
-                        event.kind,
-                        AgentEventKind::LlmRetryWait { .. }
-                            | AgentEventKind::LlmRetryResume { .. }
-                            | AgentEventKind::RateLimited { .. }
-                            | AgentEventKind::RateLimitResume { .. }
-                    ) {
-                        retry_events.push(event.kind);
+                Ok(envelope) => {
+                    if let Some(event) = envelope.as_durable()
+                        && matches!(
+                            event.kind,
+                            AgentEventKind::LlmRetryWait { .. }
+                                | AgentEventKind::LlmRetryResume { .. }
+                                | AgentEventKind::RateLimited { .. }
+                                | AgentEventKind::RateLimitResume { .. }
+                        )
+                    {
+                        retry_events.push(event.kind.clone());
                     }
                 }
-                Ok(_) => {}
                 Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
                 Err(error) => panic!("failed to receive event: {error}"),
             }

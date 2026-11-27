@@ -42,7 +42,7 @@ impl ListTool {
     /// List directory contents recursively
     fn list_directory(
         root: &Path,
-        ignore_patterns: Vec<&str>,
+        ignore_patterns: &[&str],
         limit: usize,
     ) -> Result<(Vec<PathBuf>, bool), ToolError> {
         use glob::Pattern;
@@ -103,7 +103,7 @@ impl ListTool {
     /// 0 Cargo.toml
     /// (5 entries)
     /// ```
-    fn format_tree(entries: Vec<PathBuf>, root: &Path, truncated: bool) -> String {
+    fn format_tree(entries: &[PathBuf], root: &Path, truncated: bool) -> String {
         if entries.is_empty() {
             return format!("{}/\n(0 entries)", root.display());
         }
@@ -296,13 +296,13 @@ impl Tool for ListTool {
         let root_for_format = root.clone();
         let (entries, truncated) = tokio::task::spawn_blocking(move || {
             let patterns: Vec<&str> = ignore_patterns.iter().map(|s| s.as_str()).collect();
-            Self::list_directory(&root, patterns, limit)
+            Self::list_directory(&root, &patterns, limit)
         })
         .await
         .map_err(|e| ToolError::ProviderError(format!("list task failed: {}", e)))??;
 
         Ok(vec![ToolResultPart::text(Self::format_tree(
-            entries,
+            &entries,
             &root_for_format,
             truncated,
         ))])
@@ -356,7 +356,7 @@ mod tests {
             root.join("subdir/file2.txt"),
         ];
 
-        let result = ListTool::format_tree(entries, root, false);
+        let result = ListTool::format_tree(&entries, root, false);
 
         // First line is the root path with trailing /
         let lines: Vec<&str> = result.lines().collect();
@@ -407,7 +407,7 @@ mod tests {
             root.join("a/b/c/deep.txt"),
         ];
 
-        let result = ListTool::format_tree(entries, root, false);
+        let result = ListTool::format_tree(&entries, root, false);
         let lines: Vec<&str> = result.lines().collect();
 
         assert!(lines.contains(&"0 a/"), "depth-0 dir a/");
@@ -421,7 +421,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let root = temp_dir.path();
 
-        let result = ListTool::format_tree(vec![], root, false);
+        let result = ListTool::format_tree(&[], root, false);
         assert!(result.contains("(0 entries)"));
     }
 
@@ -434,7 +434,7 @@ mod tests {
 
         let entries = vec![root.to_path_buf(), root.join("a.txt")];
 
-        let result = ListTool::format_tree(entries, root, true);
+        let result = ListTool::format_tree(&entries, root, true);
         assert!(
             result.contains("entries, truncated)"),
             "Should indicate truncation"
@@ -455,7 +455,7 @@ mod tests {
             root.join("zdir"),
         ];
 
-        let result = ListTool::format_tree(entries, root, false);
+        let result = ListTool::format_tree(&entries, root, false);
         let lines: Vec<&str> = result.lines().collect();
 
         // Find positions of the dir and file lines
@@ -495,7 +495,7 @@ mod tests {
             root.join("top.txt"),
         ];
 
-        let result = ListTool::format_tree(entries, root, false);
+        let result = ListTool::format_tree(&entries, root, false);
         let lines: Vec<&str> = result.lines().collect();
 
         // Files must appear directly after their parent directory, not after

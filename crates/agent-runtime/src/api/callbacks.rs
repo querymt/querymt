@@ -73,7 +73,10 @@ impl EventCallbacksState {
         self.callbacks.lock().on_error = Some(Box::new(callback));
     }
 
-    pub fn ensure_listener(&self, receiver: tokio::sync::broadcast::Receiver<EventEnvelope>) {
+    pub fn ensure_listener(
+        &self,
+        receiver: tokio::sync::broadcast::Receiver<std::sync::Arc<EventEnvelope>>,
+    ) {
         let mut task = self.task.lock();
         if task.is_some() {
             return;

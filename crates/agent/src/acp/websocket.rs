@@ -1882,7 +1882,7 @@ pub(super) async fn forward_session_event(
     state: &WsServerState,
     connection: &ConnectionEventState,
     translator: &Arc<StdMutex<AcpLiveEventTranslator>>,
-    event: crate::events::EventEnvelope,
+    event: Arc<crate::events::EventEnvelope>,
 ) -> bool {
     if matches!(
         event.kind(),

@@ -363,7 +363,7 @@ pub(crate) fn plan_integration(
         ));
     }
     Ok(IntegrationPlan {
-        target_root: target.checkout.root.clone(),
+        target_root: target.checkout.root,
         common_dir: record.repository.common_dir.clone(),
         baseline,
         integration_ref: format!("{INTEGRATION_REF_PREFIX}/{}/{result_commit}", record.id),

@@ -116,7 +116,7 @@ mod event_relay_mesh_tests {
 
         assert_eq!(received.session_id(), "s-f1");
         assert!(received.is_durable());
-        if let EventEnvelope::Durable(de) = &received {
+        if let Some(de) = received.as_durable() {
             assert!(matches!(de.origin, EventOrigin::Remote));
             assert_eq!(de.source_node.as_deref(), Some("f1"));
             assert!(matches!(de.kind, AgentEventKind::SessionCreated));
@@ -217,7 +217,7 @@ mod event_relay_mesh_tests {
                 .await
                 .expect("timeout")
                 .expect("recv");
-            if let EventEnvelope::Durable(de) = env {
+            if let Some(de) = env.as_durable() {
                 received_seqs.push(de.stream_seq);
             }
         }
@@ -558,9 +558,11 @@ mod event_relay_mesh_tests {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         while tokio::time::Instant::now() < deadline {
             match tokio::time::timeout(std::time::Duration::from_millis(250), rx.recv()).await {
-                Ok(Ok(EventEnvelope::Durable(de)))
-                    if matches!(de.kind, AgentEventKind::WorkspaceIndexReady { .. })
-                        && de.session_id == session_id =>
+                Ok(Ok(env))
+                    if env.as_durable().is_some_and(|de| {
+                        matches!(de.kind, AgentEventKind::WorkspaceIndexReady { .. })
+                            && de.session_id == session_id
+                    }) =>
                 {
                     saw_ready = true;
                     break;
@@ -987,7 +989,7 @@ mod event_relay_mesh_tests {
                 loop {
                     match rx.recv().await {
                         Ok(env) if env.is_durable() => {
-                            if let EventEnvelope::Durable(de) = &env
+                            if let Some(de) = env.as_durable()
                                 && matches!(de.origin, EventOrigin::Remote)
                             {
                                 return true;
@@ -1053,10 +1055,12 @@ mod event_relay_mesh_tests {
         let check_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
         while tokio::time::Instant::now() < check_deadline {
             match tokio::time::timeout(std::time::Duration::from_millis(200), rx2.recv()).await {
-                Ok(Ok(EventEnvelope::Durable(de)))
-                    if matches!(de.origin, EventOrigin::Remote)
-                        && de.session_id == session_id
-                        && de.event_id == post_detach_event_id =>
+                Ok(Ok(env))
+                    if env.as_durable().is_some_and(|de| {
+                        matches!(de.origin, EventOrigin::Remote)
+                            && de.session_id == session_id
+                            && de.event_id == post_detach_event_id
+                    }) =>
                 {
                     saw_remote = true;
                     break;

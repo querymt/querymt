@@ -87,7 +87,7 @@ pub(crate) fn after_step(folded: Folded<StepVerdict>) -> Step {
 pub(crate) struct Run<'a> {
     config: &'a AgentConfig,
     stack: TurnStack,
-    events: broadcast::Receiver<EventEnvelope>,
+    events: broadcast::Receiver<std::sync::Arc<EventEnvelope>>,
 }
 
 /// Run the loop to its outcome.

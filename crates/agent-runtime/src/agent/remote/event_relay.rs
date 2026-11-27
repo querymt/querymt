@@ -434,7 +434,7 @@ mod tests {
             .expect("Should successfully receive event");
 
         assert_eq!(received.session_id(), "test-session");
-        if let EventEnvelope::Durable(de) = &received {
+        if let Some(de) = received.as_durable() {
             assert!(matches!(de.origin, EventOrigin::Remote));
             assert_eq!(de.source_node.as_deref(), Some("remote-a"));
             assert!(matches!(
@@ -799,7 +799,7 @@ mod tests {
             .await
             .expect("timeout")
             .expect("recv");
-        match received {
+        match std::sync::Arc::unwrap_or_clone(received) {
             EventEnvelope::Ephemeral(event) => match event.kind {
                 AgentEventKind::RemoteSessionDisconnected { message, node_id } => {
                     assert!(message.contains("disconnect-node"));
