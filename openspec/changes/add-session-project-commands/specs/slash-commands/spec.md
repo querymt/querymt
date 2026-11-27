@@ -56,3 +56,49 @@ A session without a working directory, an agent with command discovery off or un
 - **GIVEN** an agent with command discovery disabled
 - **WHEN** a session opens in a folder that holds `.qmt/commands/explain.md`
 - **THEN** `explain` is not advertised and `/explain` is not expanded
+
+### Requirement: Command files are read without a restart
+When a command file in the user's global folder (`~/.qmt/commands`) or in a live session's `<root>/.qmt/commands` is added, edited or removed, the agent SHALL use the new set for that session's next prompt. It SHALL also send the session's connected clients an `available_commands_update` with the full catalog, built-ins included, without a restart or reopen. A running turn SHALL keep the commands it started with.
+
+#### Scenario: New global command appears in an open session
+- **GIVEN** an open session and an existing `~/.qmt/commands` folder without `standup.md`
+- **WHEN** `~/.qmt/commands/standup.md` is created
+- **THEN** the session's clients receive an `available_commands_update` that lists `standup` with source `global`, together with the built-ins
+- **AND** `/standup` in that session expands the new file
+
+#### Scenario: New project command appears in an open session
+- **GIVEN** an open session in `~/proj` whose `.qmt/commands` is not ignored by Git
+- **WHEN** `~/proj/.qmt/commands/explain.md` is created
+- **THEN** the session's clients receive an `available_commands_update` that lists `explain` with source `project`
+- **AND** `/explain closures` in that session expands the new file
+
+#### Scenario: Edited template is used by the next prompt
+- **GIVEN** an open session that has run `/explain` from `.qmt/commands/explain.md`
+- **WHEN** the file's template is changed and `/explain` is sent again
+- **THEN** the new template is expanded
+
+#### Scenario: Deleted command disappears
+- **GIVEN** an open session that advertises the project command `explain`
+- **WHEN** `.qmt/commands/explain.md` is deleted
+- **THEN** the session's clients receive an `available_commands_update` without `explain`
+- **AND** `/explain` is sent to the model as ordinary text
+
+#### Scenario: Session without a working directory sees global edits
+- **GIVEN** an open session without a working directory
+- **WHEN** a file in `~/.qmt/commands` is created
+- **THEN** that session's catalog and expansion include it
+
+#### Scenario: Unrelated file changes send no update
+- **GIVEN** an open session in `~/proj`
+- **WHEN** a file outside `.qmt/commands`, or a non-`.md` file inside it, changes
+- **THEN** no `available_commands_update` is sent
+
+#### Scenario: Configured paths are read at startup only
+- **GIVEN** an agent with a configured `slash_commands.paths` entry
+- **WHEN** a file in that path is created while a session is open
+- **THEN** that change alone sends no update, and the session lists the file once it next opens or its commands are next reloaded
+
+#### Scenario: Ignored commands folder is read on open
+- **GIVEN** a repository whose `.gitignore` ignores `.qmt/`, and an open session in it
+- **WHEN** `.qmt/commands/explain.md` is created
+- **THEN** no update is sent, and `explain` is listed when the session next opens, loads or resumes
