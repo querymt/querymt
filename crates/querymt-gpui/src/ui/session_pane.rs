@@ -313,6 +313,13 @@ impl SessionPane {
         self.prompt.update(cx, |input, cx| input.focus(window, cx));
     }
 
+    /// The composer is shown: a new chat, or a session that takes input. A
+    /// read-only session (archived, handed off) has none to focus.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))] // used by the desktop-only quick panel
+    pub(crate) fn takes_input(&self, cx: &App) -> bool {
+        self.view(cx).is_none_or(|v| v.access.is_none())
+    }
+
     /// Hand focus back to the composer after one of the pane's popovers
     /// closes, when the shown session takes input (not read-only).
     pub(super) fn restore_focus(&self, window: &mut Window, cx: &mut Context<Self>) {

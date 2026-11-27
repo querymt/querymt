@@ -10,11 +10,11 @@ The quick panel's session picker shows only a title, the agent and folder, and a
   - It keeps a listed session's plans current from the `querymt/session/plansChanged` notification, without re-listing.
   - A session open in the app uses its live plan instead.
   - Agents that do not send the key show no progress; nothing else changes.
-- **Progress in the list layout.** Each picker row gets a background fill as wide as the share of completed todos, and a `done/total` count. Rows without todos are unchanged.
+- **Progress in the list layout.** Each picker row gets a bar after its text with one section per todo. Its colour says whether the session is live: the accent with the todo in progress breathing while it runs, the warning colour while it waits for the user, a dim still grey once idle. A running session without todos shows a sliding segment; an idle one without todos shows no bar. A live row's subtitle names the todo in progress; an idle row shows how long ago it was active. The subtitle names the folder (the project for a worktree session). (The first versions, a row fill and then a ring with a `done/total` count, were dropped after trying them by hand; see design D4.)
 - **Card grid layout.** A second picker layout shows the sessions as cards in two columns. Each card has:
   - the title and status;
   - agent · workspace · last updated;
-  - a progress bar with `done/total`;
+  - the list's bar;
   - the in-progress todo and the next pending ones, then "+N more".
 - **Layout switch.** A toggle in the picker's search row switches between the list and the grid. The choice is saved in the quick panel settings, and the list is the default.
 - The picker keeps its current order (waiting, then running, then newest) and its limit of eight sessions, in both layouts.

@@ -1627,6 +1627,320 @@ fn cmd_k_opens_the_session_list_from_a_new_quick_chats_bar(cx: &mut TestAppConte
     assert!(!panel.read_with(cx, |p, _| p.picker_open_for_test()));
 }
 
+/// Which sheets are open: sessions, models, folder.
+fn sheets(cx: &mut TestAppContext, panel: &Entity<QuickPanel>) -> (bool, bool, bool) {
+    panel.read_with(cx, |p, cx| {
+        (
+            p.picker_open_for_test(),
+            p.models_for_test().read(cx).is_open(),
+            p.folder_open_for_test(),
+        )
+    })
+}
+
+fn keys_reach_panel(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    panel: &Entity<QuickPanel>,
+) -> bool {
+    cx.update_window(window, |_, window, cx| {
+        panel.read(cx).keys_reach_panel_for_test(window, cx)
+    })
+    .unwrap()
+}
+
+/// Presses `keys` one after another; after each, at most one sheet is open
+/// and the keyboard is inside the panel, so the next key is not lost.
+fn press_all(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    panel: &Entity<QuickPanel>,
+    keys: &[&str],
+) {
+    for key in keys {
+        press(cx, window, key);
+        settle(cx, window);
+        let (sessions, models, folder) = sheets(cx, panel);
+        assert!(
+            [sessions, models, folder].iter().filter(|o| **o).count() <= 1,
+            "after {key}: sessions {sessions}, models {models}, folder {folder}"
+        );
+        assert!(keys_reach_panel(cx, window, panel), "after {key}");
+    }
+}
+
+// quick-panel / Session list by keyboard: Cmd+M and Cmd+K in any order leave
+// one sheet open and the keyboard working; Esc then closes the sheet and the
+// panel, without the mouse.
+fn alternating_cmd_m_and_cmd_k(cx: &mut TestAppContext, session: bool) {
+    bind_keys(cx);
+    let rig = rig(cx);
+    with_models(&rig, cx);
+    rig.summaries(cx, vec![summary("a", "Session A", "idle", "1")]);
+    let (window, panel) = rig.open_panel(cx);
+    if session {
+        show_view(cx, &rig, &panel, long_view("chat", 1, "idle"));
+    }
+    settle(cx, window);
+    let (m, k) = (secondary(cx, "m"), secondary(cx, "k"));
+
+    // Each key opens its sheet, and the sheet it finds open closes.
+    press_all(cx, window, &panel, &[&m]);
+    assert_eq!(sheets(cx, &panel), (false, true, false));
+    press_all(cx, window, &panel, &[&k]);
+    assert_eq!(sheets(cx, &panel), (true, false, false), "K replaces M");
+    press_all(cx, window, &panel, &[&m]);
+    assert_eq!(sheets(cx, &panel), (false, true, false), "M replaces K");
+    press_all(cx, window, &panel, &[&m]);
+    assert_eq!(sheets(cx, &panel), (false, false, false), "M closes M");
+    assert!(composer_focused(cx, window, &panel));
+    press_all(cx, window, &panel, &[&k, &k]);
+    assert_eq!(sheets(cx, &panel), (false, false, false), "K closes K");
+    assert!(composer_focused(cx, window, &panel));
+
+    // A long alternating run, as it was found by hand.
+    press_all(cx, window, &panel, &[&m, &k, &m, &k, &m, &k, &k, &m, &k]);
+    assert_eq!(sheets(cx, &panel), (true, false, false));
+
+    // Esc closes the sheet, the next Esc the panel.
+    press(cx, window, "escape");
+    assert_eq!(sheets(cx, &panel), (false, false, false));
+    assert!(composer_focused(cx, window, &panel));
+    assert!(!closed(cx, &rig));
+    press(cx, window, "escape");
+    assert!(closed(cx, &rig), "the second Esc closes the panel");
+}
+
+#[gpui_kit::test]
+fn alternating_cmd_m_and_cmd_k_keeps_the_keyboard_in_a_conversation(cx: &mut TestAppContext) {
+    alternating_cmd_m_and_cmd_k(cx, true);
+}
+
+#[gpui_kit::test]
+fn alternating_cmd_m_and_cmd_k_keeps_the_keyboard_in_a_new_quick_chat(cx: &mut TestAppContext) {
+    alternating_cmd_m_and_cmd_k(cx, false);
+}
+
+/// A read-only session (archived, handed off): no composer.
+fn read_only(mut view: SessionView) -> SessionView {
+    view.access = Some(crate::session::SessionAccess {
+        reason: None,
+        owner_session_id: None,
+    });
+    view
+}
+
+/// Run `f` on the panel and then what waits for the next frame, with no
+/// frame drawn in between: the platform's order. The harness's own helpers
+/// draw after an input, which hides a check that looks at the frame from
+/// before it.
+fn then_next_frame(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    panel: &Entity<QuickPanel>,
+    f: impl FnOnce(&mut QuickPanel, &mut gpui_kit::Window, &mut gpui_kit::Context<QuickPanel>),
+) {
+    cx.update_window(window, |_, window, cx| {
+        panel.update(cx, |p, cx| f(p, window, cx));
+        window.simulate_next_frame(cx);
+    })
+    .unwrap();
+}
+
+// quick-panel / Session list by keyboard: Cmd/Ctrl+K puts the keyboard on
+// the list's search, so typing filters and the arrows move the cursor. Found
+// by hand: a focus check scheduled before the list was drawn found its
+// search missing and took the keyboard.
+#[gpui_kit::test]
+fn cmd_k_puts_the_keyboard_on_the_search(cx: &mut TestAppContext) {
+    bind_keys(cx);
+    let rig = rig(cx);
+    rig.summaries(
+        cx,
+        vec![
+            summary("a", "Alpha", "idle", "3"),
+            summary("b", "Beta", "idle", "2"),
+            summary("c", "Gamma", "idle", "1"),
+        ],
+    );
+    let (window, panel) = rig.open_panel(cx);
+    show_view(cx, &rig, &panel, long_view("chat", 1, "idle"));
+    settle(cx, window);
+    // A frame drawn just before the key (another session shown) leaves a
+    // focus check waiting; it looks at that frame, without the list.
+    show_view(cx, &rig, &panel, long_view("other", 1, "idle"));
+    cx.update_window(window, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    // The key, then the next frame's callbacks, before the list is drawn.
+    then_next_frame(cx, window, &panel, |p, window, cx| {
+        p.toggle_picker_for_test(window, cx)
+    });
+    assert!(
+        list_search_focused(cx, window, &panel),
+        "the search keeps the keyboard until the list is drawn"
+    );
+    settle(cx, window);
+    assert!(list_search_focused(cx, window, &panel), "and after");
+    // Typing filters.
+    VisualTestContext::from_window(window, cx).simulate_input("gam");
+    settle(cx, window);
+    assert_eq!(row_ids(cx, &panel), ["c"], "typing filters the list");
+    // Clear, then Down moves the cursor.
+    for _ in 0..3 {
+        press(cx, window, "backspace");
+    }
+    settle(cx, window);
+    press(cx, window, "down");
+    assert_eq!(panel.read_with(cx, |p, _| p.picker_cursor_for_test()), 1);
+}
+
+// A read-only session shows no composer: opened from the list, the panel
+// keeps the keyboard, so Esc still closes it. Found by hand with an archived
+// worktree session.
+#[gpui_kit::test]
+fn esc_closes_the_panel_over_a_read_only_session_picked_from_the_list(cx: &mut TestAppContext) {
+    bind_keys(cx);
+    let rig = rig(cx);
+    rig.summaries(cx, vec![summary("a", "Alpha", "idle", "3")]);
+    let (window, panel) = rig.open_panel(cx);
+    show_view(
+        cx,
+        &rig,
+        &panel,
+        read_only(long_view("archived", 1, "idle")),
+    );
+    settle(cx, window);
+    let k = secondary(cx, "k");
+    press(cx, window, &k);
+    settle(cx, window);
+    assert!(list_search_focused(cx, window, &panel));
+    // Closing the list goes back to the read-only conversation.
+    then_next_frame(cx, window, &panel, |p, window, cx| {
+        p.toggle_picker_for_test(window, cx)
+    });
+    settle(cx, window);
+    assert!(
+        keys_reach_panel(cx, window, &panel),
+        "the keyboard is in the panel"
+    );
+    press(cx, window, "escape");
+    assert!(closed(cx, &rig), "Esc closes the panel");
+}
+
+// The panel opened on a read-only session: its composer is not shown, so the
+// keyboard goes to the panel and Esc closes it.
+#[gpui_kit::test]
+fn esc_closes_the_panel_opened_on_a_read_only_session(cx: &mut TestAppContext) {
+    bind_keys(cx);
+    let rig = rig(cx);
+    let (window, panel) = rig.open_panel(cx);
+    show_view(
+        cx,
+        &rig,
+        &panel,
+        read_only(long_view("archived", 1, "idle")),
+    );
+    settle(cx, window);
+    assert!(
+        keys_reach_panel(cx, window, &panel),
+        "the keyboard is in the panel"
+    );
+    press(cx, window, "escape");
+    assert!(closed(cx, &rig), "Esc closes the panel");
+}
+
+// A session that turns read-only once loaded (an archived worktree): its
+// composer, which had the keyboard, goes away; the panel takes the keyboard
+// and Esc still closes it.
+#[gpui_kit::test]
+fn esc_closes_the_panel_when_the_session_turns_read_only(cx: &mut TestAppContext) {
+    bind_keys(cx);
+    let rig = rig(cx);
+    let (window, panel) = rig.open_panel(cx);
+    let session = show_view(cx, &rig, &panel, long_view("loading", 1, "idle"));
+    settle(cx, window);
+    assert!(
+        composer_focused(cx, window, &panel),
+        "the composer to begin with"
+    );
+    // The load answers: read-only.
+    session.update(cx, |s, cx| {
+        s.view.access = Some(crate::session::SessionAccess {
+            reason: None,
+            owner_session_id: None,
+        });
+        cx.notify();
+    });
+    settle(cx, window);
+    assert!(
+        keys_reach_panel(cx, window, &panel),
+        "the keyboard is in the panel"
+    );
+    press(cx, window, "escape");
+    assert!(closed(cx, &rig), "Esc closes the panel");
+}
+
+// quick-panel / Session list by keyboard: a click in the list (a row, the
+// glass) leaves the keyboard on its search, so the arrows keep working.
+// Found by hand: the panel, focusable as the keyboard's last resort, took
+// the focus on any click that nothing deeper took.
+#[gpui_kit::test]
+fn a_click_in_the_list_leaves_the_arrows_working(cx: &mut TestAppContext) {
+    bind_keys(cx);
+    let rig = rig(cx);
+    rig.summaries(
+        cx,
+        vec![
+            summary("a", "Alpha", "idle", "3"),
+            summary("b", "Beta", "idle", "2"),
+            summary("c", "Gamma", "idle", "1"),
+        ],
+    );
+    let (window, panel) = rig.open_panel(cx);
+    show_view(cx, &rig, &panel, long_view("chat", 1, "idle"));
+    settle(cx, window);
+    let k = secondary(cx, "k");
+    press(cx, window, &k);
+    settle(cx, window);
+    assert!(list_search_focused(cx, window, &panel));
+    // Press (no release, so nothing is picked) on the second row.
+    let at = centre(bounds_dyn(cx, window, "quick-pick-row:1".into()).expect("row"));
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_mouse_down(at, gpui_kit::MouseButton::Left, gpui_kit::Modifiers::none());
+    cx.run_until_parked();
+    settle(cx, window);
+    assert!(
+        list_search_focused(cx, window, &panel),
+        "the click left the keyboard on the search"
+    );
+    let before = panel.read_with(cx, |p, _| p.picker_cursor_for_test());
+    press(cx, window, "down");
+    assert_eq!(
+        panel.read_with(cx, |p, _| p.picker_cursor_for_test()),
+        before + 1,
+        "Down still moves the cursor"
+    );
+}
+
+// The keyboard lands in the sheet that replaced another one.
+#[gpui_kit::test]
+fn the_sheet_that_replaces_another_has_the_keyboard(cx: &mut TestAppContext) {
+    bind_keys(cx);
+    let rig = rig(cx);
+    with_models(&rig, cx);
+    rig.summaries(cx, vec![summary("a", "Session A", "idle", "1")]);
+    let (window, panel) = rig.open_panel(cx);
+    show_view(cx, &rig, &panel, long_view("chat", 1, "idle"));
+    settle(cx, window);
+    let (m, k) = (secondary(cx, "m"), secondary(cx, "k"));
+    press_all(cx, window, &panel, &[&m, &k]);
+    assert!(list_search_focused(cx, window, &panel), "K from the models");
+    // Down and Enter reach the list: the session of the row is shown.
+    press(cx, window, "enter");
+    assert_eq!(pane_key(cx, &panel).as_deref(), Some("a"));
+    assert!(composer_focused(cx, window, &panel));
+}
+
 // quick-panel / New quick chat from a conversation.
 #[gpui_kit::test]
 fn cmd_n_starts_a_new_quick_chat_in_the_panel(cx: &mut TestAppContext) {
@@ -2391,43 +2705,291 @@ fn picker_rows_carry_the_listed_plan(cx: &mut TestAppContext) {
     assert!(rows[1].plan.is_none());
 }
 
-// quick-panel / Picker rows show progress: Half-done session, Session without
-// todos, Finished plan
+// quick-panel / Picker rows show progress: the bar of each state
 #[gpui_kit::test]
-fn list_rows_fill_as_far_as_the_todos_are_done(cx: &mut TestAppContext) {
+fn a_bar_has_a_section_per_todo_and_says_whether_the_session_is_live(cx: &mut TestAppContext) {
+    use super::panel::{BarPulse, BarSection, live_bar};
+    let rig = rig(cx);
+    let half = ["completed", "completed", "in_progress", "pending"];
+    rig.summaries(
+        cx,
+        vec![
+            with_plan(summary("run", "Run", "running", "6"), &half),
+            summary("spin", "Spin", "running", "5"),
+            with_plan(summary("ask", "Ask", "running", "4"), &half),
+            with_plan(summary("left", "Left", "idle", "3"), &half),
+            summary("none", "None", "idle", "2"),
+            with_plan(
+                summary("between", "Between", "running", "1"),
+                &["completed", "pending"],
+            ),
+        ],
+    );
+    cx.update(|cx| {
+        rig.store.update(cx, |s, cx| {
+            s.request_for_test(
+                "test-agent",
+                1,
+                "session/request_permission",
+                json!({
+                    "sessionId": "ask",
+                    "toolCall": { "toolCallId": "t1", "title": "Run ls", "kind": "execute" },
+                    "options": [{ "optionId": "o", "name": "Allow", "kind": "allow_once" }],
+                }),
+                cx,
+            )
+        })
+    });
+    let rows = rig.store.read_with(cx, |s, cx| picker_rows(s, "", cx));
+    let bar = |id: &str| live_bar(rows.iter().find(|r| r.id == id).expect(id));
+    use BarSection::{Active, Done, Pending};
+    let sections = vec![Done, Done, Active, Pending];
+
+    // Running: one section per todo, the one being worked on breathing.
+    let run = bar("run").expect("a bar");
+    assert_eq!(run.sections, sections);
+    assert_eq!(run.pulse, BarPulse::Section(2));
+    assert!(!run.idle && !run.waiting && !run.indeterminate && !run.finished);
+    // Running without todos: nothing to count, a segment slides.
+    let spin = bar("spin").expect("a bar");
+    assert!(spin.indeterminate && !spin.idle);
+    // Running between todos: the whole bar breathes.
+    assert_eq!(bar("between").expect("a bar").pulse, BarPulse::Whole);
+    // Waiting for the user: the same sections, still.
+    let ask = bar("ask").expect("a bar");
+    assert_eq!(ask.sections, sections);
+    assert!(ask.waiting && !ask.idle && !ask.indeterminate);
+    assert_eq!(ask.pulse, BarPulse::None);
+    // Idle: the todos as they were left, still and grey.
+    let left = bar("left").expect("a bar");
+    assert_eq!(left.sections, sections);
+    assert!(left.idle && !left.waiting);
+    assert_eq!(left.pulse, BarPulse::None);
+    // Idle without todos: no bar.
+    assert!(bar("none").is_none());
+
+    // Only the waiting session has a chip, and it asks for the user.
+    let (window, panel) = rig.open_panel(cx);
+    show_picker(cx, window, &panel);
+    let ids = row_ids(cx, &panel);
+    for (ix, id) in ids.iter().enumerate() {
+        let chip = bounds_dyn(cx, window, format!("quick-pick-tone:{ix}:Needs input"));
+        assert_eq!(chip.is_some(), id == "ask", "{id}");
+    }
+}
+
+// quick-panel / The bar stays readable and calm: Reduced motion
+#[gpui_kit::test]
+fn with_motion_off_the_bars_are_still_and_ask_for_no_frames(cx: &mut TestAppContext) {
+    use super::panel::bar_motion;
+    let rig = rig(cx);
+    rig.summaries(
+        cx,
+        vec![with_plan(
+            summary("run", "Run", "running", "2"),
+            &["completed", "in_progress"],
+        )],
+    );
+    let live = rig.store.read_with(cx, |s, cx| picker_rows(s, "", cx));
+    rig.summaries(
+        cx,
+        vec![with_plan(
+            summary("left", "Left", "idle", "2"),
+            &["completed", "pending"],
+        )],
+    );
+    let idle = rig.store.read_with(cx, |s, cx| picker_rows(s, "", cx));
+
+    // Moving: a live bar breathes and wants the next frame; idle ones do not.
+    let (a, b) = (bar_motion(&live, true, 0.), bar_motion(&live, true, 700.));
+    assert!(a.animate && a.alpha != b.alpha && a.slide != b.slide);
+    assert!(
+        !bar_motion(&idle, true, 0.).animate,
+        "nothing moves, no frames"
+    );
+    // Motion off: the same at every moment, and no frames.
+    let still: Vec<_> = [0., 350., 700., 1100.]
+        .map(|t| bar_motion(&live, false, t))
+        .to_vec();
+    assert!(
+        still.iter().all(|m| !m.animate && *m == still[0]),
+        "{still:?}"
+    );
+    assert!(
+        still[0].alpha < 1. && still[0].alpha > 0.4,
+        "set apart, not out"
+    );
+}
+
+// quick-panel / Picker rows show progress: the pulse breathes between 40% and
+// full, never out, and is the same for every row at one moment.
+#[test]
+fn the_pulse_breathes_and_never_goes_out() {
+    use super::panel::pulse_alpha;
+    let alphas: Vec<f32> = (0..300).map(|i| pulse_alpha(f64::from(i) * 10.)).collect();
+    let (lo, hi) = alphas
+        .iter()
+        .fold((f32::MAX, f32::MIN), |(lo, hi), a| (lo.min(*a), hi.max(*a)));
+    assert!(
+        (lo - 0.4).abs() < 0.01 && (hi - 1.).abs() < 0.01,
+        "{lo} {hi}"
+    );
+}
+
+// quick-panel / Picker rows show progress: Live session, Session without todos,
+// Idle session with todos
+#[gpui_kit::test]
+fn list_rows_put_the_bar_beside_the_title_and_say_what_a_live_session_does(
+    cx: &mut TestAppContext,
+) {
     let rig = rig(cx);
     rig.summaries(
         cx,
         vec![
             with_plan(
-                summary("half", "Half", "idle", "3"),
-                &["completed", "completed", "pending", "pending"],
+                summary("half", "Half", "running", "2025-01-05T11:00:00Z"),
+                &["completed", "completed", "in_progress", "pending"],
             ),
-            summary("none", "None", "idle", "2"),
-            with_plan(summary("done", "Done", "idle", "1"), &["completed"; 4]),
+            summary("none", "None", "idle", "2025-01-05T10:00:00Z"),
+            with_plan(
+                summary("left", "Left", "idle", "2025-01-05T09:00:00Z"),
+                &["completed", "in_progress", "pending"],
+            ),
         ],
     );
     let (window, panel) = rig.open_panel(cx);
     show_picker(cx, window, &panel);
-    assert_eq!(row_ids(cx, &panel), ["half", "none", "done"]);
+    assert_eq!(row_ids(cx, &panel), ["half", "none", "left"]);
 
-    let row = |cx: &mut TestAppContext, ix: usize| {
-        bounds_dyn(cx, window, format!("quick-pick-row:{ix}")).expect("the row shows")
+    let at = |cx: &mut TestAppContext, sel: String| bounds_dyn(cx, window, sel);
+    let row = |cx: &mut TestAppContext, ix: usize| at(cx, format!("quick-pick-row:{ix}")).unwrap();
+    let title =
+        |cx: &mut TestAppContext, ix: usize| at(cx, format!("quick-pick-title:{ix}")).unwrap();
+    let bar = |cx: &mut TestAppContext, ix: usize| at(cx, format!("quick-pick-bar:{ix}"));
+
+    // Live: a bar after the title, inside the row; the folder and the todo
+    // being worked on under the title; no time, it is now.
+    let (r, t, b) = (row(cx, 0), title(cx, 0), bar(cx, 0).expect("a bar"));
+    assert!(
+        f32::from(t.right()) <= f32::from(b.left()) + 0.5,
+        "{t:?} {b:?}"
+    );
+    assert!(
+        b.top() >= r.top() && b.bottom() <= r.bottom(),
+        "{b:?} in {r:?}"
+    );
+    assert!(width(b) > 0.);
+    assert!(at(cx, "quick-pick-sub:0:work/half".into()).is_some());
+    assert!(at(cx, "quick-pick-doing:0:todo 2".into()).is_some());
+    assert!(at(cx, "quick-pick-time:0:".into()).is_some());
+
+    // Idle without todos: no bar, but its place is kept, so the times form a
+    // column; the title shares the column of the others, the row is no taller.
+    assert!(bar(cx, 1).is_none());
+    let time = |cx: &mut TestAppContext, ix: usize| {
+        at(cx, format!("quick-pick-time:{ix}:Jan 5")).expect("the time")
     };
-    let fill = |cx: &mut TestAppContext, ix: usize| {
-        bounds_dyn(cx, window, format!("quick-pick-fill:{ix}"))
+    let (t1, t2) = (time(cx, 1), time(cx, 2));
+    assert!((f32::from(t1.left()) - f32::from(t2.left())).abs() < 0.5);
+    assert!((f32::from(title(cx, 1).left()) - f32::from(t.left())).abs() < 0.5);
+    assert!((f32::from(row(cx, 0).size.height) - f32::from(row(cx, 1).size.height)).abs() < 0.5);
+
+    // Idle with todos: its bar, as it was left, and when; not what it was
+    // doing, it is not doing it now.
+    assert!(bar(cx, 2).is_some());
+    assert!(at(cx, "quick-pick-doing:2:todo 1".into()).is_none());
+}
+
+// quick-panel / Picker rows show progress: Worktree session
+#[gpui_kit::test]
+fn a_worktree_row_names_its_project_and_only_a_branch_a_person_named(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    let worktree = |id: &str, branch: &str| {
+        let mut s = summary(id, id, "idle", "2");
+        s.cwd = format!("/home/me/.qmt/worktrees/ab12/{id}");
+        s.worktree = Some(crate::store::Worktree {
+            branch: Some(branch.into()),
+            source_cwd: Some("/home/me/qmt/querymt".into()),
+            ..Default::default()
+        });
+        s
     };
-    // Half done: filled across half the row, with `2/4`.
-    let (r, f) = (row(cx, 0), fill(cx, 0).expect("a fill"));
-    assert!((width(f) - width(r) / 2.).abs() < 1.5, "{f:?} in {r:?}");
-    assert!(bounds_dyn(cx, window, "quick-pick-count:0:2/4".into()).is_some());
-    // No todos: no fill and no count.
-    assert!(fill(cx, 1).is_none());
-    assert!(bounds_dyn(cx, window, "quick-pick-count:1:0/0".into()).is_none());
-    // Finished: the whole row, `4/4`.
-    let (r, f) = (row(cx, 2), fill(cx, 2).expect("a fill"));
-    assert!((width(f) - width(r)).abs() < 1.5, "{f:?} in {r:?}");
-    assert!(bounds_dyn(cx, window, "quick-pick-count:2:4/4".into()).is_some());
+    rig.summaries(
+        cx,
+        vec![
+            worktree("gen", "qmt/workspace/0f3c"),
+            worktree("named", "fix-login"),
+        ],
+    );
+    let (window, panel) = rig.open_panel(cx);
+    show_picker(cx, window, &panel);
+    assert_eq!(row_ids(cx, &panel), ["gen", "named"]);
+    let has = |cx: &mut TestAppContext, sel: &str| bounds_dyn(cx, window, sel.into()).is_some();
+    // The project, not the worktree's hashed folder.
+    assert!(has(cx, "quick-pick-sub:0:qmt/querymt"));
+    assert!(has(cx, "quick-pick-sub:1:qmt/querymt"));
+    // Both have the branch mark; only the branch a person named is named.
+    assert!(has(cx, "quick-pick-worktree:0") && has(cx, "quick-pick-worktree:1"));
+    assert!(!has(cx, "quick-pick-branch:0:qmt/workspace/0f3c"));
+    assert!(has(cx, "quick-pick-branch:1:fix-login"));
+}
+
+// quick-panel / Rows keep their columns: No session has a bar
+#[gpui_kit::test]
+fn a_list_without_bars_keeps_no_place_for_one(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    rig.summaries(cx, vec![summary("a", "A", "idle", "2")]);
+    let (window, panel) = rig.open_panel(cx);
+    show_picker(cx, window, &panel);
+    let title = |cx: &mut TestAppContext| {
+        width(bounds_dyn(cx, window, "quick-pick-title:0".into()).expect("the title"))
+    };
+    assert!(bounds_dyn(cx, window, "quick-pick-bar:0".into()).is_none());
+    let without = title(cx);
+
+    // The session gets todos: a bar, and the title gives up its place.
+    cx.update(|cx| {
+        rig.store.update(cx, |s, cx| {
+            s.notify_for_test(
+                "test-agent",
+                "_querymt/session/plansChanged",
+                json!({ "session_id": "a", "plans": [{ "type": "items", "planId": "querymt-todos",
+                    "entries": [{ "content": "x", "priority": "medium", "status": "pending" }] }] }),
+                cx,
+            )
+        })
+    });
+    settle(cx, window);
+    assert!(bounds_dyn(cx, window, "quick-pick-bar:0".into()).is_some());
+    let with = title(cx);
+    assert!(without - with >= 56. - 0.5, "{without} then {with}");
+}
+
+// quick-panel / Picker rows show progress: the list has one highlight, the
+// row the keyboard is on, which the pointer moves too.
+#[gpui_kit::test]
+fn the_pointer_moves_the_list_cursor_so_there_is_one_highlight(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    rig.summaries(
+        cx,
+        vec![
+            summary("a", "Session A", "idle", "3"),
+            summary("b", "Session B", "idle", "2"),
+        ],
+    );
+    let (window, panel) = rig.open_panel(cx);
+    show_picker(cx, window, &panel);
+    let cursor = |cx: &mut TestAppContext| panel.read_with(cx, |p, _| p.picker_cursor_for_test());
+    assert_eq!(cursor(cx), 0);
+    let at = centre(bounds_dyn(cx, window, "quick-pick-row:1".into()).expect("row"));
+    VisualTestContext::from_window(window, cx).simulate_mouse_move(
+        at,
+        None,
+        gpui_kit::Modifiers::none(),
+    );
+    cx.run_until_parked();
+    settle(cx, window);
+    assert_eq!(cursor(cx), 1, "the pointer's row is the keyboard's row");
 }
 
 // quick-panel / Picker rows show progress: Progress moves while the picker is open
@@ -2439,17 +3001,29 @@ fn progress_moves_while_the_picker_is_open(cx: &mut TestAppContext) {
         vec![
             with_plan(
                 summary("a", "A", "running", "2"),
-                &["completed", "pending", "pending"],
+                &["completed", "in_progress", "pending"],
             ),
             summary("b", "B", "idle", "1"),
         ],
     );
     let (window, panel) = rig.open_panel(cx);
     show_picker(cx, window, &panel);
-    assert!(bounds_dyn(cx, window, "quick-pick-count:0:1/3".into()).is_some());
+    let doing = |cx: &mut TestAppContext, todo: &str| {
+        bounds_dyn(cx, window, format!("quick-pick-doing:0:{todo}")).is_some()
+    };
+    let done = |cx: &mut TestAppContext| {
+        panel.read_with(cx, |p, cx| {
+            p.picker_rows(cx)[0]
+                .plan
+                .as_ref()
+                .map(|d| (d.done, d.total))
+        })
+    };
+    assert!(doing(cx, "todo 1"));
+    assert_eq!(done(cx), Some((1, 3)));
     let before = row_ids(cx, &panel);
 
-    let entries: Vec<Value> = ["completed", "completed", "pending"]
+    let entries: Vec<Value> = ["completed", "completed", "in_progress"]
         .iter()
         .enumerate()
         .map(|(i, s)| json!({ "content": format!("todo {i}"), "priority": "medium", "status": s }))
@@ -2467,8 +3041,9 @@ fn progress_moves_while_the_picker_is_open(cx: &mut TestAppContext) {
         })
     });
     settle(cx, window);
-    assert!(bounds_dyn(cx, window, "quick-pick-count:0:2/3".into()).is_some());
-    assert!(bounds_dyn(cx, window, "quick-pick-count:0:1/3".into()).is_none());
+    assert!(doing(cx, "todo 2") && !doing(cx, "todo 1"));
+    assert_eq!(done(cx), Some((2, 3)), "the bar has one more section done");
+    assert!(bounds_dyn(cx, window, "quick-pick-bar:0".into()).is_some());
     assert_eq!(row_ids(cx, &panel), before, "no reordering");
     assert!(
         panel.read_with(cx, |p, _| p.picker_open_for_test()),
@@ -2546,12 +3121,12 @@ fn a_card_shows_the_todos_a_session_is_at(cx: &mut TestAppContext) {
     show_picker(cx, window, &panel);
     let has = |cx: &mut TestAppContext, sel: &str| bounds_dyn(cx, window, sel.into()).is_some();
 
-    assert!(has(cx, "quick-card-bar:0:2/6"), "a bar with 2/6");
-    let fill = bounds_dyn(cx, window, "quick-card-fill:0".into()).expect("filled");
-    let bar = bounds_dyn(cx, window, "quick-card-bar:0:2/6".into()).unwrap();
+    // A bar across the card, under the title.
+    let card = bounds_dyn(cx, window, "quick-pick-card:0".into()).expect("a card");
+    let bar = bounds_dyn(cx, window, "quick-pick-bar:0".into()).expect("a bar");
     assert!(
-        width(fill) > 0. && width(fill) < width(bar) / 2.,
-        "a third of the track"
+        width(bar) > width(card) / 2. && top(bar) > top(card),
+        "{bar:?} in {card:?}"
     );
     // The one in progress, the next two, and what is left.
     assert!(has(cx, "quick-card-line:0:todo 2"));
@@ -2566,7 +3141,7 @@ fn a_card_shows_the_todos_a_session_is_at(cx: &mut TestAppContext) {
 
     // The plain session: a card, with no bar and no todo lines.
     assert!(has(cx, "quick-pick-card:1"));
-    assert!(!has(cx, "quick-card-fill:1"));
+    assert!(!has(cx, "quick-pick-bar:1"));
     assert!(!has(cx, "quick-card-more:1:1"));
 }
 
