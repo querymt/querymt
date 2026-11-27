@@ -34,7 +34,7 @@ Clients fill the gap by guessing from text, and the guesses disagree with the ag
 - Records on native command replies (`/worktree`), a reply for `/compact` outcomes that have no compaction, command replies as their own view entries, and replacing the optimistic prompt by the entry that answers it. They are in `add-slash-command-replies`.
 - Making transient replies durable (`/worktree list`, `status`, `result`, `create`). They stay live-only.
 - Enforcing `arguments: required`. The agent still expands a command sent without arguments; the key tells clients what to ask for.
-- Structured subcommands in the catalog. That is a separate change; it adds `subcommands` next to the descriptor fields.
+- Structured subcommands in the catalog. Not planned; a later change would add `subcommands` next to the descriptor fields.
 - Script-backed commands. Scripts stay declared and not executed.
 - Changing how a restricted mesh turn treats a slash command (it is not expanded).
 - `/agents`. It should deliver its output as a command reply with a record (`add-slash-command-replies`); see design.md, Open Questions.
@@ -69,4 +69,4 @@ None.
 - **querymt-desktop UI follow-up (not planned here):**
   - regenerate typeshare types;
   - render user messages and compactions that carry a record.
-- **Follow-ups in this repository:** `add-slash-command-replies` (the deferred reply work, agent to app), and the app changes `slash-command-actions`, `slash-command-transcript` and `slash-subcommands` (code in `crates/querymt-gpui`).
+- **Follow-ups in this repository:** `add-slash-command-replies` (the deferred reply work, agent to app), and the app changes `slash-command-actions` and `slash-command-transcript` (code in `crates/querymt-gpui`).

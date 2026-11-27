@@ -96,7 +96,7 @@ See proposal.md for the motivation. Paths are relative to `crates/querymt-gpui`,
 
 ## Risks / Trade-offs
 
-- **Enter on `compact` compacts at once.** A mis-pick replaces the context with a summary. → The footer names what Enter does. `slash-subcommands` adds the rule for destructive commands; if `compact` needs a guard, the descriptor is where it would be stated, in a later change.
+- **Enter on `compact` compacts at once.** A mis-pick replaces the context with a summary. → The footer names what Enter does. No command has a confirmation guard; `/compact` is the only command that runs on Enter without input, since `/worktree` needs its subcommand typed. If a guard is needed, the descriptor is where it would be stated, in a later change.
 - **The descriptor comes from another change.** → `add-slash-command-records` lands first in this workspace (task 1.1 checks it). With no descriptor every decision falls back to today's behaviour (D1).
 - **Tab is taken from the search field.** → The palette has no other focus target.
 - **A prompt-only command waits for the turn to end although the agent would take it.** → Accepted for now: starting a prompt while a turn runs would need its own run-state handling in `OpenSession`.

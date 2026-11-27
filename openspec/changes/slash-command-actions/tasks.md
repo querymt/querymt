@@ -46,5 +46,4 @@ Paths are relative to `crates/querymt-gpui`. Verification commands (from the wor
 
 ## Workflow follow-up
 
-- Archive before `slash-subcommands`, which modifies the same requirements.
-- `slash-subcommands` holds both its agent work (group 1) and its app work (group 2). Its subcommand descriptors follow the catalog descriptor of `add-slash-command-records` (`input`, `accepts`, same value names).
+- Archive after `add-slash-command-records`; archive before `add-slash-command-replies`, which builds on `src/session/commands.rs`.

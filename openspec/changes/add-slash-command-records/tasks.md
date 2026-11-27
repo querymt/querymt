@@ -53,4 +53,4 @@ Runtime commands below use the CI feature set `remote,oauth,plugin-loaders,api` 
 - Archive `add-agent-session-core` before this change, so the `session-view-state` delta lands on an existing spec.
 - Report the querymt-desktop follow-up from proposal.md, Impact.
 - If `add-agents-slash-command` landed first, add the `/agents` descriptor in task 2.2 (design.md, Open Questions). Its output switches to `SlashCommandReply` in `add-slash-command-replies`.
-- Next: `slash-command-actions` and `slash-command-transcript` (code in `crates/querymt-gpui`); then `add-slash-command-replies` and `slash-subcommands`.
+- Next: `slash-command-actions` and `slash-command-transcript` (code in `crates/querymt-gpui`); then `add-slash-command-replies`.

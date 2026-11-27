@@ -28,7 +28,7 @@ This change replaces the earlier draft of `slash-command-actions`. The conversat
 ## Non-goals
 
 - How commands look in the conversation (`slash-command-transcript`, `add-slash-command-replies`).
-- Subcommands and destructive commands (`slash-subcommands`, which builds on this change).
+- Subcommands in the palette, and a guard for destructive commands. Not planned; `/worktree` subcommands are still typed after picking `worktree`.
 - Markers in the composer's own command list. Completing there never sends, so "runs or asks for more" does not apply.
 - Sending a prompt-only command (`/worktree`) while a turn runs. The agent would accept it; the app waits for the turn to end.
 - A confirmation step before `compact`. Enter runs it, as it does for every command without required input.
@@ -58,4 +58,4 @@ None.
   - `src/session/open.rs`: `OpenSession::send` takes the delivery decision instead of testing for a leading `/`.
   - Tests in `src/ui/keys.rs`, `src/ui/slash.rs`, `src/session/open.rs`.
 - **Compatibility:** with an agent that sends no descriptor, commands behave as before this change, except that text starting with `/` that names no command is no longer forced to queue.
-- **Related:** `slash-subcommands` depends on this change's input need, accepted submissions and unavailable rows. `add-slash-command-replies` builds on tasks 1.1 and 1.2 of this change (the descriptor check and `src/session/commands.rs`, for pending command rows). `slash-command-transcript` does not depend on this change.
+- **Related:** `add-slash-command-replies` builds on tasks 1.1 and 1.2 of this change (the descriptor check and `src/session/commands.rs`, for pending command rows). `slash-command-transcript` does not depend on this change.
