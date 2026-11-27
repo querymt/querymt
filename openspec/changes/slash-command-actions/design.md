@@ -2,7 +2,7 @@
 
 ## Context
 
-See proposal.md for the motivation. The current state:
+See proposal.md for the motivation. Paths are relative to `crates/querymt-gpui`, which is a member of this workspace and depends on `querymt-agent-session-core` by path. The current state:
 
 - **Catalog in the app.** `SessionView.slash_commands` (`src/session.rs`) holds `querymt_agent_session_core::view::SlashCommandView { name, description, input_hint }`. `SessionPane::slash_commands` (`src/ui/slash.rs`) returns it, or nothing for a read-only session.
 - **Palette.** `App::palette_groups` (`src/ui/keys.rs`) builds `PaletteTarget::SlashCommand { name, takes_input: input_hint.is_some() }`. `App::run_palette` sets `palette_open = false` before it looks at the target. `SessionPane::run_slash_command` then fills the composer or sends; when the session is not ready it does neither.
@@ -12,7 +12,7 @@ See proposal.md for the motivation. The current state:
   - binds Esc, Enter, Up and Down only;
   - has `on_select`, `on_confirm(IndexPath)`, `footer`, and `CommandItem::child` for custom row content;
   - skips disabled items when it picks the highlighted row (`CommandState::selected_index`), so the highlight moves to the first enabled row.
-- **Agent rules** (querymt `add-slash-command-records`): `SlashCommandView` gains `source`, `effect`, `input` and `accepts`, each absent when the agent sends no descriptor. No command is steerable. `/worktree` accepts only `session/prompt`.
+- **Agent rules** (`add-slash-command-records`): `SlashCommandView` gains `source`, `effect`, `input` (each an `Option`) and `accepts: Option<Vec<..>>`, each `None` when the agent sends no descriptor. No command is steerable. `/worktree` accepts only `session/prompt`.
 
 ## Goals / Non-Goals
 
@@ -28,9 +28,13 @@ See proposal.md for the motivation. The current state:
 ### D1. One resolver turns the agent's view into what the app acts on
 
 - New module `src/session/commands.rs` (no UI types, so `open.rs` can use it):
-  - `CommandTraits::of(&SlashCommandView) -> CommandTraits { input: InputNeed, accepts_queue: bool, prompt: bool, source: Option<Source> }`;
+  - `CommandTraits::of(&SlashCommandView) -> CommandTraits { input: InputNeed, accepts_queue: bool, effect: Option<Effect>, source: Option<Source> }`, with `is_prompt()` (`effect == Some(Prompt)`) and `is_action()` (`effect == Some(Action)`);
   - `recognise(text, &[SlashCommandView]) -> Option<&SlashCommandView>`.
-- `CommandTraits::of` is the only place with the no-descriptor fallback: a hint means `Required`, no hint means `None`, `accepts_queue` is true, `prompt` is false, `source` is `None`.
+- `CommandTraits::of` is the only place with the no-descriptor fallback, decided per field from `None`:
+  - `input` `None`: a hint means `Required`, no hint means `None`;
+  - `accepts` `None`: `accepts_queue` is true; `Some(list)`: true exactly when the list holds `queue` (an empty list accepts nothing);
+  - `effect` and `source` are copied, so they stay `None`.
+- A command without an effect is neither a prompt nor an action. No caller may read `!is_prompt()` as "action" or `!is_action()` as "prompt"; `slash-command-transcript` relies on this for agents that send no descriptor.
 - `recognise` follows the agent's own rule (querymt `Builtin::parse`, `try_parse_invocation`): leading whitespace skipped, then `/`, then a word that equals an advertised name exactly and is followed by whitespace or the end.
 - Alternative considered: keeping the fallback in `agent-session-core`. Rejected: the core reports what the agent sent; what an absent field means is this app's policy.
 
@@ -66,7 +70,7 @@ See proposal.md for the motivation. The current state:
 ### D5. Row content
 
 - Every slash row uses `CommandItem::child` (rows with a description already do):
-  - first line: the bare name, plus `…` when `input` is `Required`; at the row's end, `Prompt` in `text_xs` and `p.muted` when `prompt` is true;
+  - first line: the bare name, plus `…` when `input` is `Required`; at the row's end, `Prompt` in `text_xs` and `p.muted` when `is_prompt()` is true;
   - second line: the description, or the `Blocked` copy.
 - `PaletteEntry` gains `mark: Option<SharedString>`; `description` carries the reason when blocked.
 - Keywords add the source name (`builtin`, `global`, `project`, `configured`) and `prompt` for prompt commands.
@@ -93,13 +97,13 @@ See proposal.md for the motivation. The current state:
 ## Risks / Trade-offs
 
 - **Enter on `compact` compacts at once.** A mis-pick replaces the context with a summary. → The footer names what Enter does. `slash-subcommands` adds the rule for destructive commands; if `compact` needs a guard, the descriptor is where it would be stated, in a later change.
-- **The descriptor is in another repository.** → Task 1.1 pins the revision first. With no descriptor every decision falls back to today's behaviour (D1).
+- **The descriptor comes from another change.** → `add-slash-command-records` lands first in this workspace (task 1.1 checks it). With no descriptor every decision falls back to today's behaviour (D1).
 - **Tab is taken from the search field.** → The palette has no other focus target.
 - **A prompt-only command waits for the turn to end although the agent would take it.** → Accepted for now: starting a prompt while a turn runs would need its own run-state handling in `OpenSession`.
-- **`…` and `Prompt` add text to a 560 px row.** → The name truncates before the mark; task 2.3 checks the longest advertised names.
+- **`…` and `Prompt` add text to a 560 px row.** → The name truncates before the mark; task 3.3 checks the longest advertised names.
 
 ## Migration Plan
 
-1. Merge querymt `add-slash-command-records` and pin its revision here.
+1. Land `add-slash-command-records` in this workspace. No revision pin: `querymt-gpui` uses `querymt-agent-session-core` by path.
 2. Ship this change. No stored data changes.
 3. Rollback: revert this change; the agent's descriptor is ignored by the previous build.

@@ -3,7 +3,7 @@
 ## ADDED Requirements
 
 ### Requirement: Subcommands in the command palette
-When a command advertises subcommands, the command palette SHALL list one entry per subcommand instead of the command itself. Each entry SHALL show `name subcommand` on the first line and the subcommand's description on the second. The search SHALL match the command name, the subcommand name and the subcommand description. Picking an entry SHALL follow the subcommand's own input arity and deliveries, as for a command.
+When a command advertises subcommands, the command palette SHALL list one entry per subcommand instead of the command itself. Each entry SHALL show `name subcommand` on the first line and the subcommand's description on the second. The search SHALL match the command name, the subcommand name and the subcommand description. Picking an entry SHALL follow the subcommand's own input need and accepted submissions, as for a command.
 
 #### Scenario: Worktree operations listed
 - **GIVEN** the session advertises `worktree` with the subcommands `list`, `status` and `remove`
@@ -20,8 +20,16 @@ When a command advertises subcommands, the command palette SHALL list one entry 
 - **WHEN** the user types `isolated state`
 - **THEN** `worktree status` is listed
 
+### Requirement: Subcommands the session cannot take
+A subcommand without its own accepted submissions SHALL use its command's. A subcommand the session cannot take now SHALL be shown and picked as an unavailable command is: dimmed with the reason, sending nothing, and keeping the palette open.
+
+#### Scenario: Unavailable subcommand
+- **GIVEN** a turn is running and `worktree list` accepts only the prompt submission
+- **WHEN** the user opens the command palette
+- **THEN** `worktree list` is dimmed with "Available when the turn ends", and picking it sends nothing and keeps the palette open
+
 ### Requirement: Destructive subcommands go through the composer
-A subcommand the agent marks as destructive SHALL NOT be sent from the command palette. Picking it SHALL put `/name subcommand ` in the composer, focus it and show its hint, whatever its input arity. Its palette row SHALL carry a destructive marker (an icon and colour, with the word "Destructive" in its tooltip).
+A subcommand the agent marks as destructive SHALL NOT be sent from the command palette. Picking an available one SHALL put `/name subcommand ` in the composer, focus it and show its hint, whatever its input need. Its palette row SHALL carry a destructive marker (an icon and colour, with the word "Destructive" in its tooltip).
 
 #### Scenario: Remove from the palette
 - **GIVEN** `worktree remove` is destructive and its input is optional

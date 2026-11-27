@@ -1,27 +1,27 @@
 # Tasks
 
-Verification commands:
+Paths are relative to `crates/querymt-gpui`. Verification commands (from the workspace root):
 - `cargo nextest run --package querymt-gpui --bins --locked`
 - `cargo clippy --package querymt-gpui --all-targets --locked -- -D warnings`
-- `cargo fmt --all -- --check`
+- `cargo fmt -p querymt-gpui -- --check`
 - `RUSTC_BOOTSTRAP=1 cargo build --locked --bin querymt-gpui --target wasm32-unknown-unknown`
 
-Prerequisite: `slash-command-actions` tasks 1.1 and 1.2 are done (pinned querymt revision with `add-slash-command-records`, and `src/session/commands.rs`).
+Prerequisite: `add-slash-command-records` has landed in this workspace, and `slash-command-actions` tasks 1.1 and 1.2 are done (`src/session/commands.rs` with `CommandTraits::is_action`).
 
 ## 1. Row model and projection
 
-- [ ] 1.1 Add `command: Option<UserCommand>` to `ItemKind::User`, `ItemKind::Command` with `CommandState`, and `requested: Option<String>` to `Compaction` (design D1, D2, D4). Set `command: None` and `requested: None` at every existing construction (about 18 `ItemKind::User` sites, mostly tests). No behaviour change. Verify: `cargo check --locked --all-targets` and the full suite pass unchanged.
+- [ ] 1.1 Add `command: Option<UserCommand>` to `ItemKind::User`, `ItemKind::Command` with `CommandState`, and `requested: Option<String>` to `Compaction` (design D1, D2, D4). Set `command: None` and `requested: None` at every existing construction (about 18 `ItemKind::User` sites, mostly tests). No behaviour change. Verify: `cargo check -p querymt-gpui --locked --all-targets` and the full suite pass unchanged.
 - [ ] 1.2 Project the records in `src/session/projection.rs`:
   - a user message with a record: `text` is what was typed, `command.expansion` is the block text;
   - `EntryKind::CommandReply`: `ItemKind::Command`, with JSON output indented;
   - a compaction with a record: `requested`;
-  - a pending or failed local prompt that names an advertised action command: `ItemKind::Command` in `Running` or `Failed` (design D3).
+  - a pending or failed local prompt that names an advertised command with `is_action()`: `ItemKind::Command` in `Running` or `Failed` (design D3); a command without a descriptor stays a prompt bubble.
   Verify: projection tests named after the spec scenarios:
   - `user_defined_command_shows_what_was_typed`, `reloaded_prompt_command`;
   - `worktree_list_and_its_output`, `refused_command`, `reply_stored_by_the_agent_survives_a_reload`, `reply_the_agent_does_not_store_is_gone_after_a_reload`;
   - `compact_with_instructions`, `compact_without_instructions`, `automatic_compaction`, `compact_on_an_empty_conversation`;
   - `pending_action_command`, `pending_prompt_command`, `failed_action_command`;
-  - `agent_without_records`, `prompt_that_only_starts_with_a_slash`.
+  - `agent_without_records`, `pending_command_without_a_descriptor`, `prompt_that_only_starts_with_a_slash`.
 - [ ] 1.3 Add `Row::Command` and the user row's command to `src/session/golden.rs`, and regenerate the golden files with `UPDATE_GOLDEN=1`. Verify: review the diff (only cases with command records may change) and the golden test passes without `UPDATE_GOLDEN`.
 
 ## 2. Drawing

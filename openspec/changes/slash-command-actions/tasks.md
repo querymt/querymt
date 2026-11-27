@@ -1,15 +1,15 @@
 # Tasks
 
-Verification commands:
+Paths are relative to `crates/querymt-gpui`. Verification commands (from the workspace root):
 - `cargo nextest run --package querymt-gpui --bins --locked`
 - `cargo clippy --package querymt-gpui --all-targets --locked -- -D warnings`
-- `cargo fmt --all -- --check`
+- `cargo fmt -p querymt-gpui -- --check`
 - `RUSTC_BOOTSTRAP=1 cargo build --locked --bin querymt-gpui --target wasm32-unknown-unknown`
 
 ## 1. Descriptor and recognition
 
-- [ ] 1.1 After querymt `add-slash-command-records` is merged, bump the `querymt-agent-session-core` revision in `Cargo.toml` (both entries) and fix any construction of `SlashCommandView` in tests (`src/ui/slash.rs` `command`, `src/session/view_tests.rs`). Verify: `cargo check --locked --all-targets` passes and the full suite passes with no behaviour change.
-- [ ] 1.2 Add `src/session/commands.rs` with `CommandTraits::of` and `recognise` (design D1). Verify: unit tests `descriptor_states_an_optional_input`, `command_without_a_descriptor`, `path_is_not_a_command`, `name_case_must_match` (spec: Descriptor states an optional input, Command without a descriptor, and the recognition half of Path is not a command and Name case must match).
+- [ ] 1.1 Check that `add-slash-command-records` has landed in this workspace: `SlashCommandView` has `source`, `effect`, `input` and `accepts: Option<Vec<..>>`, and that change's task 4.1 already fixed the test helper `src/ui/slash.rs` `command`. No revision to bump (path dependency). Extend the helper so tests can set a descriptor. Verify: `cargo check -p querymt-gpui --locked --all-targets` passes and the full suite passes with no behaviour change.
+- [ ] 1.2 Add `src/session/commands.rs` with `CommandTraits::of` and `recognise` (design D1). Verify: unit tests `descriptor_states_an_optional_input`, `command_without_a_descriptor` (also asserts `is_prompt()` and `is_action()` are both false), `empty_accepts_is_not_a_missing_descriptor` (`accepts: Some(vec![])` gives `accepts_queue` false), `path_is_not_a_command`, `name_case_must_match` (spec: Descriptor states an optional input, Command without a descriptor, and the recognition half of Path is not a command and Name case must match).
 
 ## 2. Submission and readiness
 
@@ -47,4 +47,4 @@ Verification commands:
 ## Workflow follow-up
 
 - Archive before `slash-subcommands`, which modifies the same requirements.
-- `slash-subcommands` keeps its querymt work as tasks in this repository. Its subcommand descriptors should follow the catalog descriptor of querymt `add-slash-command-records` (`input`, `accepts`); review that before applying it.
+- `slash-subcommands` holds both its agent work (group 1) and its app work (group 2). Its subcommand descriptors follow the catalog descriptor of `add-slash-command-records` (`input`, `accepts`, same value names).
