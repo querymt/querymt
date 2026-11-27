@@ -2317,3 +2317,82 @@ async fn invalid_cursor_error_is_surfaced() {
     assert!(message.contains("cursor is not forkable"), "{message}");
     server.finish().await;
 }
+
+fn account_capabilities() -> Value {
+    json!({
+        "features": {"auth_account": true},
+        "methods": ["querymt/auth/account"],
+    })
+}
+
+#[tokio::test]
+async fn account_command_prints_the_server_payload() {
+    let server = MockServer::start(|request| match request["method"].as_str() {
+        Some("_querymt/capabilities") => Reply::Result(account_capabilities()),
+        Some("_querymt/auth/account") => Reply::Result(json!({
+            "accounts": [{"provider": "codex", "status": "ok", "fetched_at": 1,
+                          "account": {"limits": [{"id": "primary", "used_percent": 99.0, "reached": false}]}}],
+        })),
+        _ => unexpected(request),
+    })
+    .await;
+
+    let out = invoke(
+        cli().args([
+            "--quiet",
+            "--url",
+            &server.url,
+            "account",
+            "--provider",
+            "codex",
+        ]),
+        None,
+    )
+    .await;
+
+    assert!(out.status.success(), "{out:?}");
+    let printed = &events(&out)[0];
+    assert_eq!(printed["ok"], true);
+    assert_eq!(printed["accounts"][0]["provider"], "codex");
+    assert_eq!(
+        printed["accounts"][0]["account"]["limits"][0]["id"],
+        "primary"
+    );
+    let requests = server.finish().await;
+    let call = requests
+        .iter()
+        .find(|request| request["method"] == "_querymt/auth/account")
+        .expect("account request");
+    assert_eq!(call["params"], json!({"provider": "codex"}));
+}
+
+#[tokio::test]
+async fn account_command_refuses_an_older_server() {
+    let server = MockServer::start(|request| match request["method"].as_str() {
+        Some("_querymt/capabilities") => {
+            Reply::Result(json!({"features": {"auth": true}, "methods": ["querymt/auth/status"]}))
+        }
+        _ => unexpected(request),
+    })
+    .await;
+
+    let out = invoke(
+        cli().args(["--quiet", "--url", &server.url, "account"]),
+        None,
+    )
+    .await;
+
+    assert!(!out.status.success());
+    let printed = &events(&out)[0];
+    assert_eq!(printed["ok"], false);
+    assert!(
+        printed.to_string().contains("querymt/auth/account"),
+        "{printed}"
+    );
+    let requests = server.finish().await;
+    assert!(
+        requests
+            .iter()
+            .all(|request| request["method"] != "_querymt/auth/account")
+    );
+}

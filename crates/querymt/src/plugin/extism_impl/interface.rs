@@ -236,6 +236,18 @@ pub struct ExtismListModelsRequest {
     pub cfg: serde_json::Value,
 }
 
+/// Input of the optional `account_request` export: the resolved provider config.
+#[derive(Serialize, Deserialize)]
+pub struct ExtismAccountRequest {
+    pub cfg: serde_json::Value,
+}
+
+/// Input of the optional `parse_account_response` export.
+#[derive(Deserialize, Serialize)]
+pub struct ExtismAccountParseRequest {
+    pub resp: SerializableHttpResponse,
+}
+
 #[derive(Deserialize, Serialize)]
 pub struct ExtismCompleteRequest<C> {
     pub cfg: C,

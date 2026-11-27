@@ -1,6 +1,9 @@
 use http::{Method, Request, Response, header::CONTENT_TYPE};
 use querymt::{
-    HTTPLLMProvider, error::LLMError, handle_http_error, plugin::HTTPLLMProviderFactory,
+    HTTPLLMProvider,
+    error::LLMError,
+    handle_http_error,
+    plugin::{HTTPLLMProviderFactory, ProviderAccount},
 };
 use schemars::schema_for;
 use serde_json::Value;
@@ -14,7 +17,7 @@ pub fn create_http_factory() -> Arc<dyn HTTPLLMProviderFactory> {
     Arc::new(AnthropicFactory)
 }
 
-struct AnthropicFactory;
+pub(crate) struct AnthropicFactory;
 
 impl HTTPLLMProviderFactory for AnthropicFactory {
     fn name(&self) -> &str {
@@ -103,6 +106,14 @@ impl HTTPLLMProviderFactory for AnthropicFactory {
     fn from_config(&self, cfg: &str) -> Result<Box<dyn HTTPLLMProvider>, LLMError> {
         let provider: Anthropic = serde_json::from_str(cfg)?;
         Ok(Box::new(provider))
+    }
+
+    fn account_request(&self, cfg: &str) -> Result<Option<Request<Vec<u8>>>, LLMError> {
+        crate::account::account_request(cfg)
+    }
+
+    fn parse_account(&self, resp: Response<Vec<u8>>) -> Result<ProviderAccount, LLMError> {
+        crate::account::parse_account(&resp)
     }
 }
 

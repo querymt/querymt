@@ -137,4 +137,39 @@ impl LocalAgentHandle {
             .await;
         ext_json_response(&result)
     }
+
+    /// `querymt/auth/account`: plan, usage limits and credits per provider.
+    pub(super) async fn handle_ext_auth_account(
+        &self,
+        req: ExtRequest,
+    ) -> Result<ExtResponse, Error> {
+        #[derive(serde::Deserialize, Default)]
+        struct AccountReq {
+            #[serde(default)]
+            provider: Option<String>,
+            #[serde(default)]
+            refresh: bool,
+        }
+
+        // Absent params mean "every provider, cached"; malformed params are rejected.
+        let raw = req.params.get().trim();
+        let parsed: AccountReq = if raw.is_empty() || raw == "null" {
+            AccountReq::default()
+        } else {
+            serde_json::from_str(raw).map_err(|e| {
+                Error::invalid_params().data(serde_json::json!({"error": e.to_string()}))
+            })?
+        };
+        let accounts = self
+            .oauth_service
+            .provider_accounts(parsed.provider.as_deref(), parsed.refresh)
+            .await
+            .map_err(|error| {
+                Error::invalid_params().data(serde_json::json!({
+                    "message": error,
+                    "error": error,
+                }))
+            })?;
+        ext_json_response(&serde_json::json!({ "accounts": accounts }))
+    }
 }

@@ -1803,7 +1803,7 @@ pub fn codex_parse_list_models(response: Response<Vec<u8>>) -> Result<Vec<String
     }
 }
 
-fn chatgpt_account_id(access_token: &str) -> Result<String, LLMError> {
+pub(crate) fn chatgpt_account_id(access_token: &str) -> Result<String, LLMError> {
     let payload = access_token
         .split('.')
         .nth(1)

@@ -171,6 +171,7 @@ async fn serve_acp(
             "_querymt/profiles"
                 | "_querymt/models"
                 | "_querymt/refreshModels"
+                | "_querymt/auth/account"
                 | "_querymt/session/getLifecycle"
                 | "_querymt/session/setLifecycle"
                 | "_querymt/session/setPinned"
@@ -189,7 +190,17 @@ async fn serve_acp(
                 json!({"protocolVersion": 1, "agentInfo": {"name": "fixture", "version": "1"}, "agentCapabilities": {"loadSession": true, "sessionCapabilities": {"list": {}, "resume": {}, "close": {}}}})
             }
             "_querymt/capabilities" => {
-                json!({"features": {"session_lifecycle": true, "session_pins": true}, "methods": ["querymt/session/getLifecycle", "querymt/session/setLifecycle", "querymt/session/setPinned"]})
+                // Account support is advertised only by fixtures that can answer it.
+                let accounts = extension_payload.is_some();
+                let mut methods = vec![
+                    "querymt/session/getLifecycle",
+                    "querymt/session/setLifecycle",
+                    "querymt/session/setPinned",
+                ];
+                if accounts {
+                    methods.push("querymt/auth/account");
+                }
+                json!({"features": {"session_lifecycle": true, "session_pins": true, "auth_account": accounts}, "methods": methods})
             }
             "_querymt/profiles" => json!({"profiles": [{"id": "fixture-profile"}]}),
             "session/new" => json!({"sessionId": "fixture-session"}),
@@ -472,7 +483,7 @@ async fn exercise_bridge(http: bool) {
     let backend = MockAcp::start().await;
     let mut mcp = Mcp::start(&backend.url, http).await;
     let catalog = mcp.rpc("tools/list", json!({})).await;
-    assert_eq!(catalog["tools"].as_array().unwrap().len(), 25);
+    assert_eq!(catalog["tools"].as_array().unwrap().len(), 26);
     assert!(
         backend.recorded().is_empty(),
         "discovery must not connect to ACP"
@@ -1981,4 +1992,51 @@ async fn http_rejects_unsupported_methods_and_untrusted_hosts_and_origins() {
         assert_eq!(response.status(), 403);
     }
     assert!(backend.recorded().is_empty());
+}
+
+#[tokio::test]
+async fn account_tool_returns_the_payload_under_result() {
+    let payload = json!({"accounts": [{"provider": "codex", "status": "ok", "fetched_at": 1}]});
+    let backend = MockAcp::with_extension_payload(payload.clone()).await;
+    let mut mcp = Mcp::start(&backend.url, false).await;
+
+    let catalog = mcp.rpc("tools/list", json!({})).await;
+    let response = mcp
+        .tool("account", json!({"provider": "codex", "refresh": true}))
+        .await;
+
+    let tool = catalog["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "account")
+        .expect("account tool");
+    assert_eq!(tool["annotations"]["readOnlyHint"], true, "{tool}");
+    assert_eq!(response["isError"], false, "{response}");
+    assert_eq!(response["structuredContent"]["result"], payload);
+    let call = backend
+        .recorded()
+        .into_iter()
+        .find(|request| request["method"] == "_querymt/auth/account")
+        .expect("account request");
+    assert_eq!(call["params"]["provider"], "codex");
+    assert_eq!(call["params"]["refresh"], true);
+}
+
+#[tokio::test]
+async fn account_tool_refuses_an_older_server() {
+    let backend = MockAcp::start().await;
+    let mut mcp = Mcp::start(&backend.url, false).await;
+
+    let response = mcp.tool("account", json!({})).await;
+
+    assert_eq!(response["isError"], true, "{response}");
+    let text = response["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(text.contains("querymt/auth/account"), "{response}");
+    assert!(
+        backend
+            .recorded()
+            .iter()
+            .all(|request| request["method"] != "_querymt/auth/account")
+    );
 }

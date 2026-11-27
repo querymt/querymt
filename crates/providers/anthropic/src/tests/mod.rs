@@ -2,6 +2,7 @@
 
 mod support;
 
+mod account;
 mod auth;
 mod cache_breakpoints;
 mod config;

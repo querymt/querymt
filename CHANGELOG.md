@@ -4,6 +4,31 @@
 
 ### Added
 
+- **Provider account snapshots: plan, usage limits and credits.** The new ACP
+  method `querymt/auth/account` (`features.auth_account` in
+  `querymt/capabilities`) reports, per configured provider, what the provider
+  says about the credential QueryMT uses: an optional plan, usage limits
+  (percent used, window, reset time, scope) and credits, with a status of
+  `ok`, `unsupported`, `unauthenticated` or `error`. Credentials are resolved
+  as for model listing, providers are queried concurrently with a 10 s bound
+  each, and `ok`/`unsupported` answers are cached for 60 s (`refresh: true`
+  bypasses the cache; auth mutations clear it). Codex reports the ChatGPT
+  plan, weekly window and credits; xAI (Grok OAuth logins) the weekly credit
+  pool and per-product usage; Anthropic (Claude OAuth logins) the five-hour and
+  seven-day windows and model-scoped limits. API keys report `unsupported`.
+  `qmacp account [--provider] [--refresh]` and the qmcp `account` tool expose
+  it.
+- **Account contract for provider plugins.** `LLMProviderFactory::account`
+  returns `AccountReport::{Unsupported, Account(ProviderAccount)}`; HTTP
+  factories implement it with `HTTPLLMProviderFactory::account_request` and
+  `parse_account`, like model listing, and may declare extra account hosts
+  with `account_hosts`. `impl_extism_http_plugin!` exports
+  `account_request`, `parse_account_response` and `account_hosts`; plugins
+  built before this report `unsupported`. The Wasm host issues an account
+  request only to an allowed host or a host the plugin declared at load;
+  declared hosts do not widen the plugin's own HTTP reach. New public types
+  `ProviderAccount`, `UsageLimit`, `CreditBalance` and
+  `querymt::plugin::account::parse_rfc3339_utc`.
 - **The embedded dashboard is served gzipped and cached.** `qmtcode
   --dashboard` embeds the QueryMT Desktop web assets gzipped (level 9,
   reproducible): the wasm drops from 17.6 MiB to 7.2 MiB in the binary and on
@@ -782,6 +807,17 @@
 
 ### Breaking
 
+- **Native plugin API version 3 (BREAKING, native plugins).** The account
+  methods change the `LLMProviderFactory` and `HTTPLLMProviderFactory`
+  vtables, so `NATIVE_PLUGIN_API` is now 3. Native plugins (`.so`/`.dylib`
+  providers such as llama-cpp, mrs and izwi, and natively loaded HTTP
+  providers) must be rebuilt against this release; older ones are rejected at
+  load. Wasm plugins are unaffected.
+- **`ControlFeatureInfo` gains `auth_account` (BREAKING, Rust API).** The
+  `querymt/capabilities` feature flags struct is not `#[non_exhaustive]`, so
+  Rust code that builds it with a struct literal must add the field. The wire
+  format is compatible: payloads without `auth_account` deserialize it as
+  `false`.
 - **The `qmtcode --dashboard` UI is QueryMT Desktop web (BREAKING, build
   inputs).** The `dashboard` feature of `querymt-agent` now embeds the wasm
   build of `crates/querymt-gpui` instead of the querymt-desktop Svelte

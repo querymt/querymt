@@ -74,6 +74,15 @@ pub enum Command {
         #[arg(long)]
         provider: Option<String>,
     },
+    /// Plan, usage limits and credits per provider, as each provider reports them.
+    Account {
+        /// Only this provider.
+        #[arg(long)]
+        provider: Option<String>,
+        /// Ignore cached answers and ask the providers again.
+        #[arg(long)]
+        refresh: bool,
+    },
     /// Create a session.
     New {
         #[arg(long)]
@@ -292,6 +301,10 @@ pub async fn run(
             query,
             provider,
         } => write_ok(pretty, models(client, refresh, query, provider).await?),
+        Command::Account { provider, refresh } => write_ok(
+            pretty,
+            session::provider_accounts(client, provider, refresh).await?,
+        ),
         Command::New {
             cwd,
             profile,

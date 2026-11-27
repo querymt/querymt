@@ -83,6 +83,14 @@ pub enum Command {
         query: Option<String>,
         provider: Option<String>,
     },
+    /// Plan, usage limits and credits per provider, as each provider reports them.
+    Account {
+        /// Only this provider.
+        provider: Option<String>,
+        /// Ignore cached answers and ask the providers again.
+        #[serde(default)]
+        refresh: bool,
+    },
     /// Create a session without sending a prompt.
     New {
         cwd: Option<PathBuf>,
@@ -487,6 +495,9 @@ async fn run_inner(
             query,
             provider,
         } => models(client, refresh, query, provider).await?,
+        Command::Account { provider, refresh } => {
+            json!({ "result": session::provider_accounts(client, provider, refresh).await? })
+        }
         Command::New {
             cwd,
             profile,

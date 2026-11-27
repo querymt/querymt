@@ -12,7 +12,7 @@ use querymt::{
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
     error::LLMError,
-    plugin::HTTPLLMProviderFactory,
+    plugin::{HTTPLLMProviderFactory, ProviderAccount},
 };
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use url::Url;
 
+mod account;
 pub mod api;
 
 #[derive(Debug, Clone, Deserialize, JsonSchema, Serialize)]
@@ -368,6 +369,14 @@ impl HTTPLLMProviderFactory for CodexFactory {
     fn from_config(&self, cfg: &str) -> Result<Box<dyn HTTPLLMProvider>, LLMError> {
         let provider: Codex = serde_json::from_str(cfg)?;
         Ok(Box::new(provider))
+    }
+
+    fn account_request(&self, cfg: &str) -> Result<Option<Request<Vec<u8>>>, LLMError> {
+        account::account_request(cfg)
+    }
+
+    fn parse_account(&self, resp: Response<Vec<u8>>) -> Result<ProviderAccount, LLMError> {
+        account::parse_account(&resp)
     }
 }
 

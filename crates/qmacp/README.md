@@ -48,7 +48,9 @@ Explicit `--cwd` values must be absolute paths on the QueryMT host. POSIX and Wi
 
 ## Commands
 
-Discover: `caps`, `profiles`, `models`
+Discover: `caps`, `profiles`, `models`, `account`
+
+Account: `account [--provider <name>] [--refresh]` prints `querymt/auth/account`: one entry per provider with `status` (`ok`, `unsupported`, `unauthenticated`, `error`) and, for `ok`, the provider-reported `plan`, usage `limits` (percent used, window, reset time, scope) and `credits`. It fails explicitly when the server does not advertise `auth_account`.
 
 Sessions: `new`, `sessions`, `find`, `inspect`, `status`, `close`
 

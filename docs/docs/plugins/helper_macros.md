@@ -89,6 +89,7 @@ For **Native Plugin** development, you should implement the `LLMProviderFactory`
     -   `chat()` (uses `$ConfigType::chat_request()` and `$ConfigType::parse_chat()`)
     -   `embed()` (uses `$ConfigType::embed_request()` and `$ConfigType::parse_embed()`)
     -   `complete()` (uses `$ConfigType::complete_request()` and `$ConfigType::parse_complete()`)
+    -   `account_request()`, `parse_account_response()` and `account_hosts()` (delegate to `$FactoryType`'s account methods, whose defaults report no account data; see [Account snapshots](interface_spec.md#3-account-snapshots))
 -   **Requirements for `$ConfigType`**:
     -   Must derive `serde::Serialize`, `serde::Deserialize`, `schemars::JsonSchema`, `Clone`.
     -   Must implement a `default_base_url() -> String` static method.

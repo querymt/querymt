@@ -1,6 +1,9 @@
 use crate::{LLMProvider, error::LLMError};
 use futures::future::BoxFuture;
 
+pub mod account;
+pub use account::{AccountReport, CreditBalance, ProviderAccount, UsageLimit};
+
 #[cfg(feature = "http-client")]
 pub mod adapters;
 
@@ -21,7 +24,8 @@ pub type Fut<'a, T> = BoxFuture<'a, T>;
 /// Native Rust plugin ABI version required by this QueryMT release.
 ///
 /// Version 2 includes item-aware chat response and streaming contracts.
-pub const NATIVE_PLUGIN_API: u32 = 2;
+/// Version 3 adds the account methods to the factory traits.
+pub const NATIVE_PLUGIN_API: u32 = 3;
 
 /// FFI-safe logging callback that native plugins can use to forward log messages
 /// to the host process logger.
@@ -62,6 +66,22 @@ pub trait LLMProviderFactory: Send + Sync {
     /// Examples: llama_cpp (GGUF files), ollama (pulled models), mrs (local models)
     fn supports_custom_models(&self) -> bool {
         false
+    }
+
+    /// Report plan, usage limits and credits for the credential in `cfg`.
+    ///
+    /// `cfg` is the same resolved configuration [`from_config`](Self::from_config)
+    /// accepts. This is the dispatch point for HTTP factories, whose adapters
+    /// implement it over
+    /// [`HTTPLLMProviderFactory::account_request`](http::HTTPLLMProviderFactory::account_request);
+    /// other factories inherit [`AccountReport::Unsupported`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the classified HTTP error for a non-success account response, or
+    /// the parser's error for a body it cannot read.
+    fn account<'a>(&'a self, _cfg: &str) -> Fut<'a, Result<AccountReport, LLMError>> {
+        Box::pin(async { Ok(AccountReport::Unsupported) })
     }
 }
 

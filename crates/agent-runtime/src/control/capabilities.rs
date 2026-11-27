@@ -45,6 +45,9 @@ pub struct ControlFeatureInfo {
     pub remote_schedules: bool,
     pub profiles: bool,
     pub auth: bool,
+    /// `querymt/auth/account` reports plan, usage limits and credits per provider.
+    #[serde(default)]
+    pub auth_account: bool,
     pub models: bool,
     pub steering: bool,
 }
@@ -105,6 +108,7 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
         "querymt/auth/setApiToken".to_string(),
         "querymt/auth/clearApiToken".to_string(),
         "querymt/auth/setMethod".to_string(),
+        "querymt/auth/account".to_string(),
         "querymt/session/steer".to_string(),
         "querymt/session/queue".to_string(),
         "querymt/session/discardQueuedInput".to_string(),
@@ -239,6 +243,7 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
             remote_schedules: cfg!(feature = "remote") && mesh_enabled,
             profiles: agent.profiles().is_some(),
             auth: true,
+            auth_account: true,
             models: true,
             steering: true,
         },

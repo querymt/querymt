@@ -44,6 +44,13 @@ impl LLMProviderFactory for NativeFactoryWrapper {
     ) -> crate::plugin::Fut<'a, Result<Vec<String>, LLMError>> {
         self.factory_impl.list_models(cfg)
     }
+
+    fn account<'a>(
+        &'a self,
+        cfg: &str,
+    ) -> crate::plugin::Fut<'a, Result<crate::plugin::AccountReport, LLMError>> {
+        self.factory_impl.account(cfg)
+    }
 }
 
 /// Host-side logging callback that forwards plugin log calls to the host's logger.
@@ -306,6 +313,13 @@ mod tests {
         )
     }
 
+    /// Source exporting the host's current API version, followed by `rest`.
+    fn current_api_source(rest: &str) -> String {
+        format!(
+            "#[unsafe(no_mangle)] pub extern \"C\" fn querymt_plugin_api() -> u32 {{ {NATIVE_PLUGIN_API} }} {rest}"
+        )
+    }
+
     #[test]
     fn every_native_plugin_rejects_missing_api_export() {
         let error = validate_fixture("", false, None).expect_err("missing API export must fail");
@@ -325,29 +339,21 @@ mod tests {
 
     #[test]
     fn configured_api_accepts_match() {
-        validate_fixture(
-            "#[unsafe(no_mangle)] pub extern \"C\" fn querymt_plugin_api() -> u32 { 2 }",
-            false,
-            Some(NATIVE_PLUGIN_API),
-        )
-        .expect("matching API must pass");
+        validate_fixture(&current_api_source(""), false, Some(NATIVE_PLUGIN_API))
+            .expect("matching API must pass");
     }
 
     #[test]
     fn locked_plugin_rejects_missing_name() {
-        let error = validate_fixture(
-            "#[unsafe(no_mangle)] pub extern \"C\" fn querymt_plugin_api() -> u32 { 2 }",
-            true,
-            None,
-        )
-        .expect_err("missing name export must fail");
+        let error = validate_fixture(&current_api_source(""), true, None)
+            .expect_err("missing name export must fail");
         assert!(error.to_string().contains("querymt_plugin_name"));
     }
 
     #[test]
     fn locked_plugin_rejects_name_mismatch() {
         let error = validate_fixture(
-            "#[unsafe(no_mangle)] pub extern \"C\" fn querymt_plugin_api() -> u32 { 2 } #[unsafe(no_mangle)] pub extern \"C\" fn querymt_plugin_name() -> *const std::ffi::c_char { c\"other_provider\".as_ptr() }",
+            &current_api_source("#[unsafe(no_mangle)] pub extern \"C\" fn querymt_plugin_name() -> *const std::ffi::c_char { c\"other_provider\".as_ptr() }"),
             true,
             None,
         )
@@ -358,7 +364,7 @@ mod tests {
     #[test]
     fn locked_plugin_accepts_expected_name() {
         validate_fixture(
-            "#[unsafe(no_mangle)] pub extern \"C\" fn querymt_plugin_api() -> u32 { 2 } #[unsafe(no_mangle)] pub extern \"C\" fn querymt_plugin_name() -> *const std::ffi::c_char { c\"expected_provider\".as_ptr() }",
+            &current_api_source("#[unsafe(no_mangle)] pub extern \"C\" fn querymt_plugin_name() -> *const std::ffi::c_char { c\"expected_provider\".as_ptr() }"),
             true,
             None,
         )

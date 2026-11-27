@@ -35,6 +35,7 @@ Start with `caps`, `profiles`, and `models` to discover available capabilities.
 | Tools | Purpose |
 | --- | --- |
 | `caps`, `profiles`, `models` | Discover protocol features, profiles, and models |
+| `account` | Plan, usage limits and credits per provider (`querymt/auth/account`) |
 | `new`, `sessions`, `find` | Create, list, and search sessions |
 | `status`, `inspect`, `runtime` | Read configuration, history, and live runtime |
 | `get_lifecycle`, `set_lifecycle` | Read or explicitly patch resolved/archived state |
@@ -48,7 +49,7 @@ Start with `caps`, `profiles`, and `models` to discover available capabilities.
 Use `prompt` with `new: true` to start a session, then its returned `sessionId`
 as `session_id` to continue. A new session requires an absolute `cwd` on the
 QueryMT host; existing sessions keep their stored `cwd`, and `prompt` rejects a
-`cwd` when continuing one. `profiles`, `models`, lifecycle, and pin tools
+`cwd` when continuing one. `profiles`, `models`, `account`, lifecycle, and pin tools
 return provider data under `result`, separate from bridge status and event metadata.
 
 ## Important Behavior
