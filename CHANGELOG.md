@@ -165,6 +165,37 @@
   `--remove` run after the source contains the result, and a failure there never
   undoes the merge. See "Merging a worktree" in the worktrees guide.
 
+- **New crates: `querymt-agent-protocol-types` and `querymt-agent-session-core`.**
+  `querymt-agent-protocol-types` (`crates/agent-protocol-types`) holds the plain
+  wire types clients consume (agent events, the load snapshot payload, accounting
+  and history-window payloads, input-state notifications, the shared replay
+  projection). It has no async runtime and builds for `wasm32-unknown-unknown`;
+  the old `querymt_agent_core`, services and runtime paths re-export it.
+  `querymt-agent-session-core` (`crates/agent-session-core`) is a pure,
+  deterministic reducer from the load snapshot, ACP `session/update`
+  notifications, older-history pages and client observations to a conversation
+  view (turns that are runs, entries with stable ids and revisions) with change
+  reports and borrowed reads; querymt-gpui uses it natively. Both are in hakari
+  `[final-excludes]`. `querymt` builds for `wasm32-unknown-unknown` without
+  default features (`which` is now optional, enabled by `mcp`). A WebAssembly
+  build and release artifact of the reducer was dropped from the plan.
+
+- **ACP: run identity and gap-free loads (QueryMT extensions on v1).** New
+  extension notification `querymt/session/stateUpdate` (`sessionId`, `state`
+  `running` / `requires_action` / `idle`, `runId`, `stopReason`), sent for every
+  run transition in order and not coalesced; message, thought, tool call and
+  compaction updates carry `_meta.querymt.runId`, live and on replay; the
+  `session/prompt` response carries `_meta.querymt.messageId`. On `session/load`
+  the agent holds live updates from before it reads the history, drops those at
+  or before the cut point, sends the text of a message still streaming at the
+  cut as one chunk, and then sends the current run state, so a load no longer
+  loses or repeats events (local and remote-hosted sessions). Every load
+  snapshot carries the whole-session `summary`, and a model change sends a
+  `session_info_update` with `_meta.querymt.contextInvalidated` and the new
+  model. The live `completed` compaction update carries its summary, and replay
+  sends the todo plan once as a `plan_update` for plan-operations clients.
+  Clients that ignore unknown notifications and `_meta` keys see no change.
+
 ### Behavior changes
 
 - **QueryMT Desktop: button label on light accent presets.** On QueryMT Light
@@ -805,6 +836,14 @@
 
 ### Breaking
 
+- **BREAKING (Rust API): wire types moved to `querymt-agent-protocol-types`.**
+  `impl From<McpServerConfig> for McpServerInfo` is replaced by
+  `McpServerConfig::server_info()`, and `AccountingSnapshot::from_reducer` /
+  `from_events` are now `querymt_agent_services::accounting::snapshot_from_reducer`
+  / `snapshot_from_events`. The reducer mutators of `ScopeTotals`,
+  `ComponentSums` and `TokenSums` are private functions in
+  `agent-services`. Other paths under `querymt_agent_core`, services and
+  runtime keep resolving through re-exports.
 - **Slash command files validate a new `arguments` key (BREAKING, slash
   commands).** A command file may declare `arguments: none | optional |
   required`. A file whose `arguments` value is anything else is not loaded and

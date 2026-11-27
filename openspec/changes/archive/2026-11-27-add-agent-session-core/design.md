@@ -1,5 +1,7 @@
 # Design
 
+> **Scope at archive:** the WebAssembly boundary (D5), release publishing (D6), the wasm crate in D1 and the WebAssembly parts of D7, the risks and the migration plan are descoped. querymt-desktop, their only consumer, was replaced by querymt-gpui, which uses session-core natively (D5a). Descoped text is kept for history and marked; it was not implemented.
+
 ## Context
 
 See proposal.md (Why). Current state that shapes the approach:
@@ -51,7 +53,7 @@ flowchart BT
   acps["agent-client-protocol-schema 1.19 (default-features = false, unstable)"]
   apt["querymt-agent-protocol-types"]
   asc["querymt-agent-session-core"]
-  wasm["querymt-agent-session-core-wasm (cdylib, publish = false)"]
+  wasm["querymt-agent-session-core-wasm (descoped, not created)"]
   core["querymt-agent-core"]
   svc["querymt-agent-services"]
   rt["querymt-agent-runtime"]
@@ -71,7 +73,7 @@ flowchart BT
 - `querymt-agent-session-core` depends only on protocol-types, serde and serde_json.
 - **Workspace hack.** `querymt-agent-protocol-types`, `querymt-agent-session-core` and `querymt-agent-session-core-wasm` go under hakari `[final-excludes]`, like `querymt`. They still count for feature unification but never get the `querymt-workspace-hack` dependency, so their closure has no tokio or rusqlite on any target and is the same when built from another workspace.
   - Dev-dependencies, crate-local: `proptest` (new, `default-features = false, features = ["std"]`) and `criterion = "0.8"` (already in the lockfile, without `async_tokio`).
-- `querymt-agent-session-core-wasm` depends on session-core and `wasm-bindgen = "=0.2.130"` (the version already locked). The pin keeps the generated JS glue in step with `wasm-bindgen-cli`.
+- Descoped: `querymt-agent-session-core-wasm` depends on session-core and `wasm-bindgen = "=0.2.130"` (the version already locked). The pin keeps the generated JS glue in step with `wasm-bindgen-cli`.
 - Provider crates and their `wasm32-wasip1` builds are untouched. The tasks check one provider build anyway, because `querymt` features change.
 - *Alternative considered:* mirror types inside session-core (option A). Rejected by the user in favour of a real extraction, so drift becomes a compile error.
 
@@ -153,7 +155,7 @@ flowchart BT
   - *Alternative rejected:* narrowing the equivalence scenario to what a snapshot happened to carry ("option B"). That would write a gap into the spec as intended behaviour; the snapshot now carries the summary instead (D8).
 - **Schema version.** `SCHEMA_VERSION: u32 = 1` is exported. It is bumped whenever an input or output shape changes in a way old clients cannot read.
 
-### D5. WebAssembly boundary
+### D5. WebAssembly boundary (descoped, not implemented)
 - **Exported class.** `SessionCore` with `new(sessionId)`, `apply(batchJson: string): string`, `applyBytes(batch: Uint8Array): string`, `header(): string`, `turnIds(): string`, `turns(idsJson: string): string`, `debugLog(): string`, `free()`, plus `schemaVersion()` and `version()`.
 - **JSON strings in both directions.** Clients already hold JSON text from the transport, and only changed turns cross the boundary. `serde-wasm-bindgen` is not used.
 - **Build.**
@@ -172,7 +174,7 @@ flowchart BT
 - **Out-of-workspace check.** `scripts/session-core-native/check.sh` creates a temporary crate outside the workspace with a path dependency on session-core, runs `cargo check` natively and for `wasm32-unknown-unknown`, and fails if `cargo tree` lists tokio, rusqlite or `querymt-workspace-hack`.
 - *Alternative considered:* publish to crates.io. Rejected for now; protocol-types would pull `querymt` into the published set, and a git rev is enough for one consumer.
 
-### D6. Release publishing
+### D6. Release publishing (descoped, not implemented)
 - `nightly.yml` and `release.yml` build the module in a new job. The job's artifact is named `qmt-agent-session-core-wasm` so the existing `qmt*-*` download pattern picks it up.
 - The job uploads `agent-session-core-wasm-<version>.tar.gz` and its `.sha256`.
 - `scripts/release/write-release-json.sh` gains an optional fifth argument, the archive path. It adds `session_core_wasm: { file, sha256, schema_version }` to `release.json`. The fields that querymt-desktop's `resolve-qmtcode.mjs` reads today are unchanged.
@@ -188,7 +190,7 @@ flowchart BT
 - **Usage in generated traces.** Per model call the generator emits `ProviderChanged` (with a context limit) where the model changes, `LlmAttemptStarted`, `LlmAttemptSettled` and `LlmRequestEnd` with usage and context tokens. One request reports no usage (partial totals), one model change follows the last request (context invalidated), and one seed has no model call at all (no cost).
 - **Delegations in generated traces.** The generator emits delegations as the agent journals them: `DelegationRequested`, the child's `SessionForked`, `DelegationStageChanged` (verifying), then `DelegationCompleted`, or `DelegationFailed` with the delegate tool call failed. The conformance test's gpui capabilities include `subagents`. A delegate tool call is linked to its child through `session` content on the live path and through `summary.childSessions` on a load, so the comparison covers subagents (state, stage) and tool-call child links on live, snapshot and replay; the `delegation` and `subagent` golden traces then come from the generator instead of hand-built updates.
 - **Proptest** in session-core for chunking invariance, determinism and the "unchanged turns keep id and content" property.
-- **Golden traces.** `crates/agent-session-core/tests/traces/*.json` holds inputs plus expected outputs, regenerated by `cargo run -p querymt-agent-session-core --example regen-traces --features test-support`. The native tests compare against them. `scripts/session-core-wasm/conformance.mjs` loads the built module in Node, applies the same traces and diffs the output byte for byte. The desktop reuses these traces.
+- **Golden traces.** `crates/agent-session-core/tests/traces/*.json` holds inputs plus expected outputs, regenerated by `cargo run -p querymt-agent-session-core --example regen-traces --features test-support`. The native tests compare against them. (Descoped: `scripts/session-core-wasm/conformance.mjs`, which would have applied the same traces to the built module in Node.)
 - **Criterion benchmark** `stream_into_long_session` at 1x and 4x session size, with a second case that reads the last turn by reference after each update. It is informational; the CI gates are the change-report test and the borrowed-read test in the spec.
 - **Borrowed-read test.** An integration test binary with a counting `#[global_allocator]` streams chunks into a turn holding a 400 KB tool result, reads the turn by reference after each chunk, and asserts that the bytes allocated per read stay under a small bound that does not depend on the result size.
 
@@ -217,7 +219,7 @@ flowchart BT
 - **[Git-dependency consumers lag]** → gpui pins a rev and moves it deliberately; `SCHEMA_VERSION` signals breaking view changes.
 - **[Entry revisions add bookkeeping cost]** → One counter per view and in-place updates; the criterion bench covers it.
 - **[ACP schema version skew]** → The compile-time identity assertion (D1) fails the build if `agent-client-protocol` and the direct schema dependency diverge.
-- **[WASM size]** → The ACP schema and serde_json dominate. Mitigated by the size budget, `opt-level = "s"` and `wasm-opt`. If the budget fails, decode ACP updates through narrower local structs.
+- **[WASM size] (descoped)** → The ACP schema and serde_json dominate. Mitigated by the size budget, `opt-level = "s"` and `wasm-opt`. If the budget fails, decode ACP updates through narrower local structs.
 - **[Reducer behaviour differs from today's desktop]** → The desktop change runs a differential test against its current TS path on the same traces before switching. Intentional differences are listed there.
 - **[Hidden non-wasm dependency in the extracted closure]** → Spike task 1.1 runs first, and a CI step `cargo check -p querymt-agent-session-core --target wasm32-unknown-unknown` keeps it that way.
 - **[Ordering with `adopt-acp-subagents-cursors-usage`]** → The reducer reads subagents and cursors only; the gpui pin requires that change's additive subagent tasks (1.1, 4.1, 4.2, 4.5) on the agent, not its cursors. Tasks 5.4 and 5.5 can land before it, tested with fixture updates, since the shapes come from the ACP schema. The cursor part of 4.5 waits for its cursor helper (its task 3.1).
@@ -229,8 +231,8 @@ flowchart BT
 
 1. Land protocol-types with re-exports. This is a pure move; typeshare declarations stay identical.
 2. Land the agent wire additions (D8) and the reducer's run, identity, subagent and cursor model, then the conformance test against the live translator.
-3. Land the wasm crate, the traces and the release job. Nightly then publishes the module.
-4. querymt-desktop adopts it (`adopt-agent-session-core`).
+3. (Descoped) Land the wasm crate, the traces and the release job.
+4. (Descoped) querymt-desktop adopts it (`adopt-agent-session-core`).
 5. querymt-gpui adopts it natively (git dependency on a pinned rev) once step 2 and `adopt-acp-subagents-cursors-usage` tasks 1.1, 4.1, 4.2 and 4.5 have landed, without waiting for the release job.
 6. Rollback: the desktop pins a module version and gpui pins a rev; the crates can stay in the agent unused. The wire additions are additive and can stay.
 

@@ -1,5 +1,7 @@
 # Proposal
 
+> **Scope at archive:** the WebAssembly module (`querymt-agent-session-core-wasm`), its build scripts, CI job and release artifacts, and the querymt-desktop follow-up were descoped, because querymt-desktop was replaced by querymt-gpui, which uses session-core natively. The sections below keep their original text; read the items marked "Descoped" as not implemented.
+
 ## Why
 
 Every QueryMT client turns the same agent output (the `querymt/sessionLoadSnapshot.v1` load snapshot plus ACP `session/update` notifications) into a conversation view, and each one does it separately: querymt-desktop in about 3,000 lines of TypeScript (`session-updates.ts`, `session-snapshot.ts`, `session-conversation.ts`), querymt-mobile in its own `sessionUpdateReducer.ts`, and querymt-gpui in about 3,000 lines of Rust over untyped JSON (`src/session.rs`, including a hand-copied version of the agent's replay projection). The desktop version copies the whole session on most updates and rebuilds every turn on each change, so it slows down as sessions get longer. All three drift from the agent's wire types, because they re-declare them by hand. One pure, deterministic Rust reducer that is built from the agent's own types and runs natively (as a plain Rust dependency, for querymt-gpui) and as WebAssembly (for querymt-desktop) fixes both problems at the source.
@@ -43,9 +45,9 @@ The wire types the reducer needs (`AgentEvent`, `AgentEventKind`, the load-snaps
   - a bounded debug event log (newest 1,000 entries).
   - `SessionCore` is `Send + 'static`, so native clients can hydrate large snapshots off their UI thread.
   - Native clients read turns and entries by reference: reading a turn copies no entry content, so reading the last turn after every update costs the same however large its tool results are. The owned `turn`/`turns` accessors stay for serialization and the WebAssembly boundary.
-- **New package `querymt-agent-session-core-wasm`** (`crates/agent-session-core-wasm`, `publish = false`). These are wasm-bindgen bindings that keep the state inside the module and exchange JSON batches and change reports.
+- **Descoped: new package `querymt-agent-session-core-wasm`** (`crates/agent-session-core-wasm`, `publish = false`). These are wasm-bindgen bindings that keep the state inside the module and exchange JSON batches and change reports.
 - **Native Rust consumers.** A client outside this workspace (querymt-gpui) depends on `querymt-agent-session-core` through a git dependency pinned to a revision. The three new crates are listed under hakari `[final-excludes]`, so they never depend on `querymt-workspace-hack` and their dependency closure is the same inside and outside the workspace.
-- **Release artifacts.** Nightly and stable releases publish `agent-session-core-wasm-<version>.tar.gz` plus its `.sha256`, listed in `release.json`.
+- **Descoped: release artifacts.** Nightly and stable releases publish `agent-session-core-wasm-<version>.tar.gz` plus its `.sha256`, listed in `release.json`.
 - **Toolchain.** `rust-toolchain.toml` gains the `wasm32-unknown-unknown` target. The devShell gains `wasm-bindgen-cli` (matching the locked `wasm-bindgen` 0.2.130) and `binaryen`.
 - **`querymt` features.** The `which` dependency becomes optional and is enabled by the `mcp` feature, which is its only user. As a result, `querymt` with `default-features = false` builds for `wasm32-unknown-unknown`.
 - **Typeshare.** `scripts/generate-types.sh` reads the two new crates. Declarations of moved types are unchanged. The new session event and view types are added.
@@ -69,7 +71,7 @@ The wire types the reducer needs (`AgentEvent`, `AgentEventKind`, the load-snaps
 ## Capabilities
 
 ### New Capabilities
-- `session-view-state`: deterministic reduction of agent session output (load snapshot, ACP session updates, history pages and client observations) into a client conversation view and change reports, available as a native Rust library and as a published WebAssembly module.
+- `session-view-state`: deterministic reduction of agent session output (load snapshot, ACP session updates, history pages and client observations) into a client conversation view and change reports, available as a native Rust library (the published WebAssembly module was descoped).
 
 ### Modified Capabilities
 - `acp-session-updates`: adds run-state notifications, run identity on session updates, the inserted message id on prompt responses, gap-free loads (hold and cut, including a message still streaming at the cut), cursors in load snapshots and history pages, a whole-session summary in every load snapshot, and context invalidation on a model change.
@@ -82,7 +84,7 @@ The wire types the reducer needs (`AgentEvent`, `AgentEventKind`, the load-snaps
 |---|---|---|
 | `querymt-agent-protocol-types` | New | none |
 | `querymt-agent-session-core` | New | none |
-| `querymt-agent-session-core-wasm` | New, unpublished | none |
+| `querymt-agent-session-core-wasm` | Descoped, not created | none |
 | `querymt` | `which` becomes optional | `mcp` gains `dep:which` |
 | `querymt-agent-core` | Moved modules become re-exports; `McpServerConfig::server_info()` | none |
 | `querymt-agent-services` | Accounting snapshot and history-window payload types move out; constructors become functions | none |
@@ -93,13 +95,13 @@ The wire types the reducer needs (`AgentEvent`, `AgentEventKind`, the load-snaps
 
 **Typeshare:** the set of declarations for existing types is unchanged. New declarations cover the session event, view and change-report types and the state-update notification.
 
-**Workspace config:** `.config/hakari.toml` lists the three new crates under `[final-excludes]`; `cargo hakari verify` stays green.
+**Workspace config:** `.config/hakari.toml` lists the two new crates that exist (protocol-types and session-core) under `[final-excludes]`; `cargo hakari verify` stays green.
 
 **Coordination:**
 - `split-agent-crate` has landed (archived 2026-11-15), so moved modules re-export through the final facade paths.
 - `restructure-agent-turn-state` and `unify-model-call-path` (archived 2026-11-22) changed run start ordering, scheduled runs and the runtime phase channel; this change builds on them.
 - `adopt-acp-subagents-cursors-usage` supplies `subagent_update`, `subagentUpdates` and `cursor_update`. The reducer reads only those. The gpui pin needs that change's additive subagent support (tasks 1.1, 4.1, 4.2 and 4.5) on the agent it talks to; cursors are not needed for gpui, only this change's task 4.5b waits for that change's cursor helper (3.1).
 
-**querymt-desktop follow-up (UI, not planned here):** the desktop change `adopt-agent-session-core` vendors the WASM artifact, regenerates `src/lib/querymt/generated/types.ts`, and replaces its TypeScript reducer and conversation builder with this module. Its `history_page` mapping passes the raw older-history response.
+**Descoped: querymt-desktop follow-up (UI, not planned here):** the desktop change `adopt-agent-session-core` vendors the WASM artifact, regenerates `src/lib/querymt/generated/types.ts`, and replaces its TypeScript reducer and conversation builder with this module. Its `history_page` mapping passes the raw older-history response.
 
 **querymt-gpui follow-up (not planned here):** gpui depends on `querymt-agent-session-core` natively (git dependency on a pinned revision) and replaces the reducer in `src/session.rs`; diff synthesis, tool labels and notices stay in gpui.

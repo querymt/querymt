@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Turns the agent's session output (load snapshot, ACP session updates, older-history pages) and client observations into one deterministic conversation view with change reports, so every QueryMT client renders sessions the same way, as a native Rust library or as WebAssembly.
+Turns the agent's session output (load snapshot, ACP session updates, older-history pages) and client observations into one deterministic conversation view with change reports, so every QueryMT client renders sessions the same way, as a native Rust library.
 
 ## ADDED Requirements
 
@@ -262,7 +262,7 @@ The view SHALL report context usage, the token breakdown (latest request and ses
 - **THEN** the view reports that context usage
 
 ### Requirement: Active time
-The view SHALL report the session's active time: the total time of its ended runs, and the start of the run that is active now, if any. After a load both SHALL come from the snapshot (summary and runtime status); live, each run's time from `running` to `idle` SHALL be added when it ends. Both ends of a run SHALL be measured on the host's clock (`atMs` of the state updates, the snapshot's run start), never one on the host's and one on the client's, and the added time SHALL NOT be negative. A run's start SHALL be set when the run begins and kept by every later `running` or `requires_action` for the same run. Live and after a reload, the total SHALL agree to within one second per run.
+The view SHALL report the session's active time: the total time of its ended runs, and the start of the run that is active now, if any. After a load both SHALL come from the snapshot (summary and runtime status); live, each run's time from `running` to `idle` SHALL be added when it ends. Live and after a reload, the total SHALL agree to within one second per run.
 
 #### Scenario: Reload keeps the total
 - **WHEN** a session whose summary carries `activeMs` 120000 is loaded with no run active
@@ -276,6 +276,9 @@ The view SHALL report the session's active time: the total time of its ended run
 - **WHEN** a snapshot with summary `activeMs` 120000 is loaded while its runtime status reports a run started at 50000 ms
 - **THEN** the view reports 120000 ms of active time and an active run start of 50000 ms
 
+### Requirement: One start per run
+A run's start SHALL be set when the run begins and kept by every later `running` or `requires_action` for the same run, including a start restored from a snapshot. An `idle` for a run other than the active one SHALL be ignored.
+
 #### Scenario: Permission wait keeps the run start
 - **WHEN** a view receives `running` (`atMs` 10000), `requires_action`, `running` again for the same run (`atMs` 12000) and `idle` (`atMs` 20000)
 - **THEN** it reports an active run start of 10000 ms throughout, and adds 10000 ms after `idle`
@@ -284,10 +287,16 @@ The view SHALL report the session's active time: the total time of its ended run
 - **WHEN** a snapshot reports a run started at 50000 ms and the current-state sync `running` for the same run follows without `atMs`
 - **THEN** the view's active run start stays 50000 ms
 
+### Requirement: Active time on the host's clock
+Both ends of a run SHALL be measured on the host's clock (`atMs` of the state updates, the snapshot's run start), never one on the host's and one on the client's, and the added time SHALL NOT be negative.
+
 #### Scenario: Client clock skew
 - **WHEN** a snapshot reports a run started at 50000 ms (host time), the client's clock is 10 minutes behind, and `idle` arrives with `atMs` 65000 and client `at_ms` 5000
 - **THEN** the view adds 15000 ms to the total
 - **AND** an `idle` without `atMs` for that run clears the start and adds nothing
+
+### Requirement: Older history leaves active time unchanged
+Applying an older-history page SHALL NOT change the session's active time.
 
 #### Scenario: Older history does not change active time
 - **WHEN** an older-history page is applied
@@ -406,14 +415,10 @@ Tool arguments or results marked as truncated in a windowed snapshot SHALL be re
 - **THEN** the tool call reports the full result and is no longer truncated, and only its turn is reported as updated
 
 ### Requirement: Deterministic output
-The same sequence of inputs SHALL produce the same view and change reports, byte for byte when serialized, natively and in WebAssembly. Times in the view SHALL come only from inputs.
+The same sequence of inputs SHALL produce the same view and change reports, byte for byte when serialized. Times in the view SHALL come only from inputs.
 
 #### Scenario: Repeated reduction is identical
 - **WHEN** one recorded input sequence is applied twice to new views
-- **THEN** the serialized views and change reports are identical
-
-#### Scenario: WebAssembly matches native
-- **WHEN** the conformance traces are applied by the native build and by the WebAssembly module
 - **THEN** the serialized views and change reports are identical
 
 ### Requirement: Tolerant input handling
@@ -442,7 +447,7 @@ The view SHALL keep a debug log of applied inputs (kind, short summary, message 
 The session view reducer SHALL be usable as a native Rust library by clients outside the QueryMT workspace. Its dependency tree SHALL contain no async runtime, no database driver and no workspace-internal helper crate, and a view SHALL be movable between threads.
 
 #### Scenario: Out-of-workspace client builds
-- **WHEN** a crate outside the workspace depends on the reducer through a git dependency pinned to a revision
+- **WHEN** a crate outside the workspace depends on the reducer through a path dependency
 - **THEN** it builds natively and for `wasm32-unknown-unknown`, and its dependency tree contains no tokio, rusqlite or `querymt-workspace-hack`
 
 #### Scenario: Snapshot hydrated on a background thread
@@ -459,14 +464,3 @@ A native client SHALL be able to read the turn order, a turn and its entries, an
 #### Scenario: Borrowed and owned reads agree
 - **WHEN** a turn is read by reference and through the owned accessor
 - **THEN** both have the same id, revision and entries
-
-### Requirement: Published WebAssembly module
-Each nightly and stable QueryMT release SHALL publish the session view reducer as a WebAssembly module with JavaScript bindings, TypeScript declarations and a schema version, as `agent-session-core-wasm-<version>.tar.gz` with a `.sha256` file, both listed in `release.json`.
-
-#### Scenario: Release lists the module
-- **WHEN** a nightly release is published
-- **THEN** `release.json` lists the module archive with its sha256 digest, and the archive contains the module, its bindings, its TypeScript declarations and metadata with the version, commit and schema version
-
-#### Scenario: Module keeps state between batches
-- **WHEN** a client creates a view in the module, applies a snapshot and then a chunk batch
-- **THEN** the second change report reflects the state left by the first batch without the client resending it
