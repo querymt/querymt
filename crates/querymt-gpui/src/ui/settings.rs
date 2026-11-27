@@ -1569,7 +1569,7 @@ impl QmtApp {
                     .when(!first, |el| el.border_t_1().border_color(subtle_border))
                     .child(
                         h_flex()
-                            .id(kit::keyed("prov-head", pkey.clone()))
+                            .id(kit::keyed("prov-head", pkey))
                             .relative()
                             .min_w_0()
                             .gap_3()
@@ -1738,7 +1738,7 @@ impl QmtApp {
                                     ),
                             )
                         })
-                        .when_some(pr.message.clone(), |el, msg| {
+                        .when_some(pr.message, |el, msg| {
                             el.child(div().text_color(p.muted).child(msg))
                         })
                 });

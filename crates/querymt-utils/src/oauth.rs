@@ -614,10 +614,10 @@ impl XaiProvider {
     }
 
     fn token_set(response: XaiTokenResponse, old_refresh_token: Option<&str>) -> Result<TokenSet> {
-        let access_token = response.access_token().secret().to_string();
+        let access_token = response.access_token().secret().clone();
         let refresh_token = response
             .refresh_token()
-            .map(|token| token.secret().to_string())
+            .map(|token| token.secret().clone())
             .or_else(|| old_refresh_token.map(str::to_string))
             .ok_or_else(|| anyhow!("xAI token response did not include refresh_token"))?;
         let expires_at = response
@@ -673,7 +673,7 @@ impl OAuthProvider for XaiProvider {
             &code_challenge,
         )?;
         let verifier = serde_json::to_string(&XaiFlowSnapshot {
-            code_verifier: code_verifier.secret().to_string(),
+            code_verifier: code_verifier.secret().clone(),
             code_challenge,
             token_endpoint: Self::DEFAULT_TOKEN_URL.to_string(),
             redirect_uri,
@@ -699,7 +699,7 @@ impl OAuthProvider for XaiProvider {
         )?
         .set_redirect_uri(Self::redirect_url(&snapshot.redirect_uri)?);
         let response = client
-            .exchange_code(AuthorizationCode::new(code.to_string()))
+            .exchange_code(AuthorizationCode::new(code.clone()))
             .set_pkce_verifier(PkceCodeVerifier::new(snapshot.code_verifier.clone()))
             .add_extra_param("code_challenge", snapshot.code_challenge.clone())
             .add_extra_param("code_challenge_method", "S256")

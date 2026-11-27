@@ -611,7 +611,7 @@ mod item_aware_tests {
             ],
             ..ChatOutput::default()
         };
-        let response = ProviderChatResponse::from(output.clone());
+        let response = ProviderChatResponse::from(output);
         let encoded = serde_json::to_vec(&response).expect("serialize response");
         let decoded: ProviderChatResponse =
             serde_json::from_slice(&encoded).expect("deserialize response");

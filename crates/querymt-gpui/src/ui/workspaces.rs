@@ -521,7 +521,7 @@ impl QmtApp {
                             // Flat square buttons the height of Use, on the same fill.
                             .child(if row.saved {
                                 kit::flat_icon_btn(
-                                    kit::keyed("workspace-remove", key.clone()),
+                                    kit::keyed("workspace-remove", key),
                                     IconName::Trash,
                                     "Remove from Workspaces",
                                     p,
@@ -533,7 +533,7 @@ impl QmtApp {
                                 .into_any_element()
                             } else {
                                 kit::flat_icon_btn(
-                                    kit::keyed("workspace-save", key.clone()),
+                                    kit::keyed("workspace-save", key),
                                     IconName::BookmarkPlus,
                                     "Save to Workspaces",
                                     p,

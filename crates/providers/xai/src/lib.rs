@@ -426,7 +426,7 @@ fn promote_xai_reasoning_item(item: ChatOutputItem) -> ChatOutputItem {
         return item;
     };
     if reasoning_has_plaintext(&reasoning.content)
-        || encrypted_present(&reasoning.encrypted_content)
+        || encrypted_present(reasoning.encrypted_content.as_deref())
         || !reasoning_has_plaintext(&reasoning.summary)
     {
         return ChatOutputItem::Reasoning(reasoning);
@@ -439,8 +439,8 @@ fn reasoning_has_plaintext(parts: &[ChatReasoningPart]) -> bool {
     parts.iter().any(|part| !part.text.is_empty())
 }
 
-fn encrypted_present(encrypted: &Option<String>) -> bool {
-    encrypted.as_deref().is_some_and(|text| !text.is_empty())
+fn encrypted_present(encrypted: Option<&str>) -> bool {
+    encrypted.is_some_and(|text| !text.is_empty())
 }
 
 fn retag_xai_stream_chunks(chunks: Vec<StreamChunk>) -> Vec<StreamChunk> {

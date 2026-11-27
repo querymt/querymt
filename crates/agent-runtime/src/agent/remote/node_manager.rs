@@ -609,6 +609,10 @@ mod remote_impl {
             self
         }
 
+        #[allow(
+            clippy::needless_pass_by_value,
+            reason = "callers pass `Arc<dyn QuotaStore>`; by-value is what upcasts it to `Arc<dyn GrantStore>`"
+        )]
         pub(crate) fn register_guarded_discovery(
             router: &InboundRouter,
             store: Arc<dyn querymt_remote::peer_access::GrantStore>,

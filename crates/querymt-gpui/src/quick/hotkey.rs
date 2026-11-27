@@ -658,7 +658,7 @@ mod tests {
     fn failed_register_keeps_previous_shortcut() {
         let fake = Fake::default();
         fake.taken.borrow_mut().insert("alt+KeyT".into());
-        let mut registry = Registry::new(fake.clone());
+        let mut registry = Registry::new(fake);
 
         registry.set("alt+Space").unwrap();
         assert_eq!(registry.active(), Some("alt+Space"));

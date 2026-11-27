@@ -22,11 +22,7 @@ fn add_protocol_members(
     for plan in merge.accepted.clone() {
         let spec = MemberBuildSpec::from_protocol_plan(&plan, None).unwrap();
         roster
-            .add(Member::pending(
-                plan.info.clone(),
-                MemberOrigin::Protocol,
-                spec,
-            ))
+            .add(Member::pending(plan.info, MemberOrigin::Protocol, spec))
             .unwrap();
     }
     merge

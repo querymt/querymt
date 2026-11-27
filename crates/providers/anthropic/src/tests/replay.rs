@@ -288,7 +288,7 @@ fn portable_projection_still_strips_signature_and_redacted_data() {
         ],
         ..ChatOutput::default()
     };
-    let portable = output.clone().into_portable();
+    let portable = output.into_portable();
     let dump = serde_json::to_string(&portable).unwrap();
     assert!(!dump.contains("\"S\""), "{dump}");
     assert!(!dump.contains("\"D\""), "{dump}");

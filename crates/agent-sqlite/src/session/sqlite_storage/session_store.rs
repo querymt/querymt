@@ -646,7 +646,7 @@ impl SessionStore for SqliteStorage {
                                     parent_internal_id.and_then(|pid| id_map.get(&pid).cloned());
 
                                 AgentMessage {
-                                    id: public_id.clone(),
+                                    id: public_id,
                                     session_id: session_id_str.clone(),
                                     role,
                                     parts: Vec::new(), // Will populate next
@@ -1013,7 +1013,7 @@ impl SessionStore for SqliteStorage {
             tx.execute(
                 "INSERT INTO sessions (public_id, name, cwd, created_at, updated_at, llm_config_id, parent_session_id, fork_origin, fork_point_type, fork_point_ref, peer_origin_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
-                    new_session_public_id.clone(),
+                    new_session_public_id,
                     "Fork of session", // Temporary name
                     cwd,
                     now.clone(),
@@ -1324,7 +1324,7 @@ impl SessionStore for SqliteStorage {
                     model,
                     params_str,
                     now.clone(),
-                    now.clone(),
+                    now,
                 ],
             )?;
 

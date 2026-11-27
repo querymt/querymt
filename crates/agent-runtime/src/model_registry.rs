@@ -378,21 +378,24 @@ async fn fetch_custom_models(config: &AgentConfig, provider: &str) -> Vec<ModelE
 
 /// Dedupe models with source-priority: custom > cached > catalog > preset.
 fn dedupe_models(models: Vec<ModelEntry>) -> Vec<ModelEntry> {
+    const SOURCE_PRIORITY: [&str; 4] = ["custom", "cached", "catalog", "preset"];
+
+    let rank = |model: &ModelEntry| SOURCE_PRIORITY.iter().position(|s| *s == model.source);
+
+    // Keep only known sources, ordered by priority (stable within a source),
+    // then keep the first entry per id. Entries are moved, never cloned.
+    let mut ranked: Vec<(usize, ModelEntry)> = models
+        .into_iter()
+        .filter_map(|model| rank(&model).map(|rank| (rank, model)))
+        .collect();
+    ranked.sort_by_key(|(rank, _)| *rank);
+
     let mut seen = HashSet::new();
-    let mut out = Vec::new();
-
-    for source in ["custom", "cached", "catalog", "preset"] {
-        for model in &models {
-            if model.source == source {
-                let key = model.id.clone();
-                if seen.insert(key) {
-                    out.push(model.clone());
-                }
-            }
-        }
-    }
-
-    out
+    ranked
+        .into_iter()
+        .filter(|(_, model)| seen.insert(model.id.clone()))
+        .map(|(_, model)| model)
+        .collect()
 }
 
 // ── Remote enumerator ─────────────────────────────────────────────────────────

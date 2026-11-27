@@ -522,7 +522,7 @@ mod tests {
         assert!(fixture_pricing("flat_tier").dimensions.is_empty());
 
         // Cache serialization keeps every recognized dimension and metadata.
-        let mut stamped = tiered.clone();
+        let mut stamped = tiered;
         stamped.source = Some(PricingSource::Catalog);
         let reloaded: ModelPricing =
             serde_json::from_str(&serde_json::to_string(&stamped).unwrap()).unwrap();
@@ -543,7 +543,7 @@ mod tests {
         assert_eq!(reloaded.cache_write_1h, None);
 
         // An explicit (manual) one-hour rate round-trips.
-        let mut manual = anthropic.clone();
+        let mut manual = anthropic;
         manual.cache_write_1h = Some(6.0);
         let reloaded: ModelPricing =
             serde_json::from_str(&serde_json::to_string(&manual).unwrap()).unwrap();

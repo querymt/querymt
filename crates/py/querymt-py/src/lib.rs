@@ -454,7 +454,7 @@ impl PyChatResponse {
     fn output<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         match &self.output {
             Some(value) => json_to_python(py, value),
-            None => Ok(py.None().into_bound(py).to_owned()),
+            None => Ok(py.None().into_bound(py).clone()),
         }
     }
 }

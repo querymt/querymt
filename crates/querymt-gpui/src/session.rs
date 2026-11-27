@@ -445,7 +445,7 @@ impl Thought {
     fn new(message: String, part: Option<String>, text: String) -> Self {
         let id = match &part {
             Some(part) => format!("{message}/{part}"),
-            None => message.clone(),
+            None => message,
         };
         Self { id, part, text }
     }

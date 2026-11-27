@@ -198,7 +198,7 @@ pub(super) async fn transition_before_llm_call(
         // Synchronous block: the guard never crosses an await.
         let _guard = collect_span.enter();
         let mut tools = config.collect_tools(
-            Arc::clone(&env.model.provider),
+            env.model.provider.as_ref(),
             Some(env.runtime.as_ref()),
             Some(&env.tool_config),
             env.tool_set(),
@@ -493,6 +493,10 @@ pub(super) fn provider_error(
 /// Map a failed LLM setup/call into either `Cancelled` or a contextualized error.
 ///
 /// Cancel must never bubble as `Err`; it is an execution state, not a provider failure.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "used as a `map_err` callback, so it must take the error by value"
+)]
 fn accounting_failure(error: querymt_agent_services::accounting::AccountingError) -> anyhow::Error {
     anyhow::anyhow!("accounting failure: {error}")
 }
@@ -606,6 +610,10 @@ async fn store_results_then_stop_on_length(
 }
 
 /// Wrap an accumulator violation as a transient provider stream failure.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "used as a `map_err` callback, so it must take the error by value"
+)]
 fn stream_accumulation_error(error: ChatStreamAccumulatorError) -> LLMError {
     LLMError::from(
         ProviderFailure::new(ProviderErrorKind::UnknownTransient, error.to_string())
@@ -4792,7 +4800,7 @@ mod tests {
             factory.binding.lock().unwrap()["reasoning_effort"] = serde_json::json!("high");
             let (exec, _turn) = fixture.turn().await;
 
-            let profile = exec.model.profile.clone();
+            let profile = exec.model.profile;
 
             // The binding's explicit max_tokens is its own ceiling.
             assert_eq!(
@@ -4828,7 +4836,7 @@ mod tests {
             factory.binding.lock().unwrap()["max_tokens"] = serde_json::json!(999);
             fixture.config.provider.clear_provider_cache().await;
             let (after, _turn) = fixture.turn().await;
-            let new = after.model.profile.clone();
+            let new = after.model.profile;
 
             assert!(!Arc::ptr_eq(&old, &new));
             assert_eq!(

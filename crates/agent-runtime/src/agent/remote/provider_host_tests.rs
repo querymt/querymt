@@ -52,7 +52,7 @@ mod provider_host_tests {
             .parameter("model", "hf:owner/repo:model.gguf")
             .parameter("n_ctx", 32768_u64);
 
-        let config = Arc::new(AgentConfigBuilder::new(registry, storage.clone(), llm).build());
+        let config = Arc::new(AgentConfigBuilder::new(registry, storage, llm).build());
 
         let params = config.provider.initial_params();
         assert_eq!(params.provider.as_deref(), Some("llama_cpp"));

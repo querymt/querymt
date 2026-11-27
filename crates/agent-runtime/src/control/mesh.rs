@@ -219,7 +219,7 @@ pub async fn join(
             peer_id: runtime.peer_id().to_string(),
             mesh_id,
             mesh_name: invite.grant.mesh_name,
-            inviter_peer_id: invite.grant.inviter_peer_id.to_string(),
+            inviter_peer_id: invite.grant.inviter_peer_id,
             already_joined,
         };
         let params = serde_json::value::RawValue::from_string(

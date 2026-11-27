@@ -54,6 +54,10 @@ pub(crate) fn normalize(mut value: Value) -> Value {
     value
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "passed to `unwrap_or_else` as a function, so it takes the error by value"
+)]
 pub(crate) fn failure(error: CliError) -> Value {
     json!({ "ok": false, "error": error.to_string(), "code": error.exit_code().as_i32() })
 }

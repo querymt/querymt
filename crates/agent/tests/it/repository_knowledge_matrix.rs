@@ -449,9 +449,9 @@ fn concurrent_refresh_and_readers_see_only_complete_generations() {
     let fx = Fx::new();
     fx.service.refresh().unwrap();
     let service = Arc::new(fx.service);
-    let repo = fx.repo.clone();
+    let repo = fx.repo;
     let writer = {
-        let repo = repo.clone();
+        let repo = repo;
         std::thread::spawn(move || {
             for i in 0..15 {
                 write(

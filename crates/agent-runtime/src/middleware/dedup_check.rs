@@ -219,7 +219,7 @@ impl DedupCheckMiddleware {
             let results = workspace
                 .actor
                 .ask(FindSimilarToCode {
-                    file_path: file_path.to_path_buf(),
+                    file_path: file_path.clone(),
                     source,
                 })
                 .await
@@ -578,7 +578,7 @@ impl DedupCheckMiddleware {
                 let _ = workspace
                     .actor
                     .tell(UpdateFile {
-                        file_path: path.to_path_buf(),
+                        file_path: path.clone(),
                         source,
                     })
                     .await;

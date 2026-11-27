@@ -84,8 +84,8 @@ impl HistorySource {
     }
 }
 
-fn coded_error(code: i32, name: &str, session_id: &str, message: String) -> Error {
-    Error::new(code, message.clone()).data(serde_json::json!({
+fn coded_error(code: i32, name: &str, session_id: &str, message: &str) -> Error {
+    Error::new(code, message).data(serde_json::json!({
         "code": name,
         "message": message,
         "sessionId": session_id,
@@ -97,7 +97,7 @@ fn session_not_found(session_id: &str) -> Error {
         -32002,
         "session_not_found",
         session_id,
-        format!("session {session_id} not found"),
+        &format!("session {session_id} not found"),
     )
 }
 
@@ -106,10 +106,14 @@ fn history_changed(session_id: &str) -> Error {
         -32602,
         "history_changed",
         session_id,
-        "the session history changed since this position was reported".into(),
+        "the session history changed since this position was reported",
     )
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "generic over `ToString`; callers pass errors by value from `map_err`"
+)]
 fn internal(session_id: &str, message: impl ToString) -> Error {
     Error::internal_error().data(serde_json::json!({
         "message": message.to_string(),
@@ -117,7 +121,7 @@ fn internal(session_id: &str, message: impl ToString) -> Error {
     }))
 }
 
-fn parse_request<T: serde::de::DeserializeOwned>(req: ExtRequest) -> Result<T, Error> {
+fn parse_request<T: serde::de::DeserializeOwned>(req: &ExtRequest) -> Result<T, Error> {
     serde_json::from_str(req.params.get())
         .map_err(|e| Error::invalid_params().data(serde_json::json!({ "error": e.to_string() })))
 }
@@ -178,7 +182,7 @@ impl LocalAgentHandle {
         &self,
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
-        let parsed: SessionHistoryRequest = parse_request(req)?;
+        let parsed: SessionHistoryRequest = parse_request(&req)?;
         let session_id = parsed.session_id.as_str();
         let Some((token_epoch, position)) = parse_history_token(&parsed.before) else {
             return Err(Error::invalid_params().data(serde_json::json!({
@@ -425,7 +429,7 @@ impl LocalAgentHandle {
         &self,
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
-        let parsed: SessionToolContentRequest = parse_request(req)?;
+        let parsed: SessionToolContentRequest = parse_request(&req)?;
         let session_id = parsed.session_id.as_str();
         let source = self.history_source(session_id).await?;
         #[cfg(feature = "remote")]
@@ -447,7 +451,7 @@ impl LocalAgentHandle {
                 -32002,
                 "tool_call_not_found",
                 session_id,
-                format!(
+                &format!(
                     "tool call {} not found in session {session_id}",
                     parsed.tool_call_id
                 ),

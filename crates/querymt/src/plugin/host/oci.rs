@@ -291,10 +291,10 @@ async fn verify_image_signature(
         let issuer = config
             .cert_issuer
             .as_ref()
-            .map(|i| StringVerifier::ExactMatch(i.to_string()));
+            .map(|i| StringVerifier::ExactMatch(i.clone()));
 
         verification_constraints.push(Box::new(CertSubjectEmailVerifier {
-            email: StringVerifier::ExactMatch(cert_email.to_string()),
+            email: StringVerifier::ExactMatch(cert_email.clone()),
             issuer,
         }));
     }
@@ -303,8 +303,8 @@ async fn verify_image_signature(
         match config.cert_issuer.as_ref() {
             Some(issuer) => {
                 verification_constraints.push(Box::new(CertSubjectUrlVerifier {
-                    url: cert_url.to_string(),
-                    issuer: issuer.to_string(),
+                    url: cert_url.clone(),
+                    issuer: issuer.clone(),
                 }));
             }
             None => {
@@ -975,7 +975,7 @@ impl OciDownloader {
                 .map_err(|error| format!("OCI plugin hashing task failed: {error}"))?
                 .map_err(|error| format!("Failed to hash OCI plugin: {error}"))?;
                 let new_metadata = CacheMetadata {
-                    manifest_digest: live_digest.to_string(),
+                    manifest_digest: live_digest.clone(),
                     filename: filename.clone(),
                     plugin_type_str: match discovered_type {
                         PluginType::Wasm => "extism".to_string(),
@@ -998,7 +998,7 @@ impl OciDownloader {
                 Ok(ProviderPlugin {
                     plugin_type: discovered_type,
                     file_path: blob_path,
-                    manifest_digest: Some(live_digest.to_string()),
+                    manifest_digest: Some(live_digest.clone()),
                     file_sha256: Some(file_sha256),
                     annotations: image_manifest.annotations.clone().unwrap_or_default(),
                 })

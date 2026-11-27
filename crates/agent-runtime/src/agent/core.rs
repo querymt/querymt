@@ -122,12 +122,12 @@ impl McpToolState {
     pub fn replace_server(
         &self,
         server: &str,
-        tools: Option<Vec<Arc<querymt::mcp::adapter::McpToolAdapter>>>,
-        skills: Option<Vec<Arc<crate::skills::mcp::McpSkill>>>,
+        tools: Option<&[Arc<querymt::mcp::adapter::McpToolAdapter>]>,
+        skills: Option<&[Arc<crate::skills::mcp::McpSkill>]>,
     ) {
         use querymt::tool_decorator::CallFunctionTool;
         self.rcu(|current| {
-            let (tools_map, tool_defs) = match &tools {
+            let (tools_map, tool_defs) = match tools {
                 None => (current.tools.clone(), current.tool_defs.clone()),
                 Some(new_tools) => {
                     let mut map = HashMap::new();
@@ -145,7 +145,7 @@ impl McpToolState {
                         }
                     }
                     for adapter in new_tools {
-                        let name = adapter.descriptor().function.name.clone();
+                        let name = adapter.descriptor().function.name;
                         if map.contains_key(&name) {
                             continue;
                         }
@@ -155,7 +155,7 @@ impl McpToolState {
                     (map, defs)
                 }
             };
-            let skills_vec = match &skills {
+            let skills_vec = match skills {
                 None => current.skills.clone(),
                 Some(new_skills) => current
                     .skills
@@ -417,8 +417,7 @@ mod tests {
             .provider("test")
             .model("test-model");
 
-        let builder =
-            AgentConfigBuilder::new(Arc::new(plugin_registry), storage.clone(), llm_config);
+        let builder = AgentConfigBuilder::new(Arc::new(plugin_registry), storage, llm_config);
         let config = builder.build();
 
         // Check that all tools are present

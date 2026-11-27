@@ -1382,7 +1382,10 @@ mod tests {
     use qmacp::session::delivery_from_runtime;
 
     fn args(value: Value) -> Map<String, Value> {
-        value.as_object().unwrap().clone()
+        match value {
+            Value::Object(map) => map,
+            other => panic!("expected a JSON object, got {other}"),
+        }
     }
 
     #[test]

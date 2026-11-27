@@ -69,7 +69,7 @@ mod mesh_provider_tests {
             "temperature": 0.3
         });
         let provider = MeshChatProvider::new(mesh, "any-node", "anthropic", "claude-3")
-            .with_params(Some(params.clone()));
+            .with_params(Some(params));
 
         // We can't directly inspect private fields, but we can verify it
         // compiles and the builder pattern works. The params are forwarded

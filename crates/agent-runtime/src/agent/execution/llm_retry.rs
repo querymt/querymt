@@ -607,7 +607,7 @@ mod tests {
         let config = Arc::new(
             AgentConfigBuilder::new(
                 Arc::new(plugin_registry),
-                storage.clone(),
+                storage,
                 LLMParams::new().provider("mock").model("mock-model"),
             )
             .with_tool_policy(ToolPolicy::ProviderOnly)

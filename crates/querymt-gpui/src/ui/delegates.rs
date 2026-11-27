@@ -598,7 +598,7 @@ impl QmtApp {
                                         .min_w_0()
                                         // A model served by a mesh peer: an icon
                                         // before its name, the peer on hover.
-                                        .children(peer.clone().map(|node| {
+                                        .children(peer.map(|node| {
                                             div()
                                                 .id(kit::keyed("delegate-node", a.agent_id.clone()))
                                                 .flex_none()

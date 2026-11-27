@@ -1028,7 +1028,7 @@ mod tests {
                 );
                 assert!(transport.peer_filter.is_none());
                 assert!(transport.dns_resolver.is_some());
-                let mut defaults = config.clone();
+                let mut defaults = config;
                 defaults.iroh_dns = None;
                 assert!(iroh_transport_config(&defaults).dns_resolver.is_none());
             }

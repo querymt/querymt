@@ -179,6 +179,10 @@ impl EventForwarder {
         Self::start_with_policy(fanout, relay_ref, source_label, filter_session_id, None)
     }
 
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "`start` and its callers hand the fanout over by value"
+    )]
     pub(crate) fn start_with_policy(
         fanout: Arc<querymt_agent_services::event_fanout::EventFanout>,
         relay_ref: RemoteActorRef<EventRelayActor>,

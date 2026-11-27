@@ -23,6 +23,10 @@ use tokio::sync::{Mutex, oneshot};
 ///
 /// These conversions live here, not on the type, because `ElicitationAction`
 /// belongs to the core layer, which must not depend on `rmcp`.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "fieldless enum that is matched by value; callers pass it by value"
+)]
 fn to_rmcp_action(action: ElicitationAction) -> rmcp::model::ElicitationAction {
     match action {
         ElicitationAction::Accept => rmcp::model::ElicitationAction::Accept,
@@ -1457,7 +1461,7 @@ impl ClientHandler for McpClientHandler {
                 // Replaces only this server's tools (its skills are kept) and
                 // clears the tools hash.
                 self.tool_state
-                    .replace_server(&self.server_name, Some(adapters), None);
+                    .replace_server(&self.server_name, Some(&adapters), None);
                 crate::agent::mcp::warn_unmatched_permissions(
                     &self.permissions,
                     &self.tool_state.load(),
@@ -1498,7 +1502,7 @@ impl ClientHandler for McpClientHandler {
         };
         let count = skills.len();
         self.tool_state
-            .replace_server(&self.server_name, None, Some(skills));
+            .replace_server(&self.server_name, None, Some(&skills));
         log::info!(
             "session={} server='{}': MCP skill list refreshed ({count} skills)",
             self.session_id,

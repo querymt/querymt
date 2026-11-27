@@ -1322,7 +1322,7 @@ impl QmtApp {
                             ));
                         }
                         let open_id = c.id.clone();
-                        let events_id = c.id.clone();
+                        let events_id = c.id;
                         let developer = self.store.read(cx).prefs.developer_mode;
                         h_flex()
                             .gap_3()

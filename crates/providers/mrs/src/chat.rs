@@ -82,7 +82,7 @@ impl From<MistralChatResponse> for ChatOutput {
             None,
             response.text.clone(),
             response.tool_calls.clone(),
-            response.usage.clone(),
+            response.usage,
             finish_reason,
         )
     }

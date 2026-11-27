@@ -2235,7 +2235,7 @@ mod unit_tests {
         let config = Arc::new(
             crate::agent::agent_config_builder::AgentConfigBuilder::new(
                 Arc::new(plugin_registry),
-                storage.clone(),
+                storage,
                 LLMParams::new().provider("mock").model("mock-model"),
             )
             .build(),

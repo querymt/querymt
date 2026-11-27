@@ -169,11 +169,13 @@ pub fn discover_from_source(source: &SkillSource, nested_depth: u8) -> SkillScan
         let file_name = entry.file_name().to_string_lossy();
         let matched =
             file_name == SKILL_FILENAME || (protocol && file_name == PROTOCOL_SKILL_FILENAME);
-        // A definition directly in the source folder is not a skill
-        // directory: skills live in directories below the source folder.
+        // A definition directly in a global or project source folder is not
+        // a skill directory: skills live in directories below it. A
+        // configured path may name a single skill folder, so its own
+        // definition counts.
         if matched
             && let Some(parent) = entry.path().parent()
-            && parent != base_path
+            && (parent != base_path || matches!(source, SkillSource::Configured(_)))
         {
             candidates
                 .entry(parent.to_path_buf())
@@ -1141,6 +1143,32 @@ Body
         }
         let shallow = SkillSource::Global(skills_root);
         assert_eq!(ids(&discover_one(&shallow).skills), vec!["review"]);
+    }
+
+    #[test]
+    fn configured_path_may_be_a_skill_folder() {
+        let dir = TempDir::new().unwrap();
+        let single = dir.path().join("scholarly-sources");
+        fs::create_dir_all(&single).unwrap();
+        fs::write(
+            single.join("SKILL.md"),
+            "---\nname: scholarly-sources\ndescription: Root skill\n---\nBody\n",
+        )
+        .unwrap();
+
+        // The folder is the skill, with only configured sources selected.
+        let source = SkillSource::Configured(single.clone());
+        let skills = discover_skills(std::slice::from_ref(&source), false);
+        assert_eq!(ids(&skills), vec!["scholarly-sources"]);
+        assert_eq!(skills[0].path, single);
+        assert!(discover_one(&source).problems.is_empty());
+
+        // Skill folders below it are still offered next to it.
+        create_skill(&single, "child", "1.0");
+        assert_eq!(
+            ids(&discover_one(&source).skills),
+            vec!["child", "scholarly-sources"]
+        );
     }
 
     #[cfg(unix)]

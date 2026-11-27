@@ -1030,7 +1030,7 @@ mod tests {
             ),
             (
                 None,
-                search.clone(),
+                search,
                 json!({"offset": "466, ", "exclude": "target/**"}),
             ),
         ];

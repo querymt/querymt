@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 description = "Services layer of the querymt agent: accounting, worktrees, snapshots, export and the built-in tools"
 
+# Not on [workspace.lints] yet: the clippy lints there still flag existing code in
+# this crate. An empty table records the opt-out; replace it with
+# `workspace = true` once the crate is clean.
+[lints]
+
 [lib]
 name = "querymt_agent_services"
 path = "src/lib.rs"

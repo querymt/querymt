@@ -115,12 +115,12 @@ pub(crate) async fn build_mcp_state(
         }
         // Publish the tools before the (slow) skills discovery, so a tool
         // refresh pushed meanwhile is not overwritten afterwards.
-        publish_server_tools(&tool_state, &server_name, &peer, adapters);
+        publish_server_tools(&tool_state, &server_name, &peer, &adapters);
         // Skills: only eligible servers are asked; a failed or timed-out
         // listing never fails the connection (it is logged inside) and leaves
         // the server registered so a later refresh can recover.
         let found = crate::skills::mcp::discover_server_skills(&server_name, &peer).await;
-        tool_state.replace_server(&server_name, None, found);
+        tool_state.replace_server(&server_name, None, found.as_deref());
         clients.insert(server_name, running);
     }
 
@@ -169,12 +169,12 @@ pub(crate) async fn merge_connected_mcp_peers(
             &tool_state,
             &connected.server_name,
             &connected.peer,
-            adapters,
+            &adapters,
         );
         let found =
             crate::skills::mcp::discover_server_skills(&connected.server_name, &connected.peer)
                 .await;
-        tool_state.replace_server(&connected.server_name, None, found);
+        tool_state.replace_server(&connected.server_name, None, found.as_deref());
     }
 
     Ok(())
@@ -210,11 +210,11 @@ fn publish_server_tools(
     tool_state: &McpToolState,
     server_name: &str,
     peer: &rmcp::service::Peer<RoleClient>,
-    adapters: Vec<Arc<querymt::mcp::adapter::McpToolAdapter>>,
+    adapters: &[Arc<querymt::mcp::adapter::McpToolAdapter>],
 ) {
     {
         let current = tool_state.load();
-        for adapter in &adapters {
+        for adapter in adapters {
             let name = &adapter.descriptor().function.name;
             if current
                 .tools
@@ -647,7 +647,7 @@ pub(crate) mod tests {
         assert!(!task.is_finished(), "discovery must still be running");
 
         // A tool refresh that lands during discovery (here: every tool gone).
-        state.replace_server("harness", Some(vec![]), None);
+        state.replace_server("harness", Some(&[]), None);
         task.await.unwrap().unwrap();
 
         let snapshot = state.load();

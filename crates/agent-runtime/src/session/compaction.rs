@@ -872,6 +872,10 @@ async fn unless_cancelled<T>(
     outcome.ok_or(polled)
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "used as a `map_err` callback, so it must take the error by value"
+)]
 fn accounting_failure(error: AccountingError) -> anyhow::Error {
     anyhow::anyhow!("Compaction accounting failure: {error}")
 }
@@ -2582,7 +2586,7 @@ mod tests {
         let mut notice = text.clone();
         notice.parts = vec![MessagePart::Notice {
             source: querymt_agent_core::model::NoticeSource::AgentMode,
-            content: content.clone(),
+            content,
         }];
 
         let notice_tokens = estimate_tokens(&[notice], None);

@@ -45,6 +45,18 @@ querymt-workspace-hack = { version = "0.1", path = "../workspace-hack" }
 [lints.cargo]
 unused_dependencies = "allow"
 
+# A copy of `[workspace.lints.clippy]` in the root Cargo.toml. This crate cannot use
+# `[lints] workspace = true` while it has its own `[lints.cargo]` table above, so
+# keep the two in sync by hand.
+[lints.clippy]
+needless_pass_by_value = "warn"
+ref_option = "warn"
+unnecessary_to_owned = "warn"
+implicit_clone = "warn"
+assigning_clones = "warn"
+trivially_copy_pass_by_ref = "warn"
+large_types_passed_by_value = "warn"
+
 [dev-dependencies]
 qmt-openai = { path = "../providers/openai", default-features = false, features = ["api"] }
 mockall = { workspace = true }

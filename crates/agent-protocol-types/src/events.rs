@@ -2312,7 +2312,7 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for sample in samples {
             let expected = sample["type"].as_str().unwrap().to_string();
-            let kind: AgentEventKind = serde_json::from_value(sample.clone())
+            let kind: AgentEventKind = serde_json::from_value(sample)
                 .unwrap_or_else(|err| panic!("sample for {expected} does not decode: {err}"));
             let serialized = serde_json::to_value(&kind).unwrap();
             assert_eq!(serialized["type"], expected.as_str());
@@ -2908,7 +2908,7 @@ mod tests {
             source_node: None,
             kind: AgentEventKind::SessionCreated,
         };
-        let cloned = original.clone();
+        let cloned = original;
         assert_eq!(cloned.seq, 1);
         assert_eq!(cloned.session_id, "sess-1");
     }
@@ -3478,9 +3478,10 @@ mod tests {
             "context_tokens": 0,
             "metrics": {"steps": 0, "turns": 0}
         });
-        data.as_object_mut()
-            .unwrap()
-            .extend(extra.as_object().unwrap().clone());
+        let serde_json::Value::Object(extra) = extra else {
+            panic!("request_end expects a JSON object");
+        };
+        data.as_object_mut().unwrap().extend(extra);
         serde_json::json!({"type": "llm_request_end", "data": data})
     }
 

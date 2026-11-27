@@ -575,9 +575,7 @@ impl MeshHandle {
             .write()
             .retain(|existing| existing != &scope);
 
-        let _ = self
-            .peer_events_tx
-            .send(MeshEvent::ScopeLeft(scope.clone()));
+        let _ = self.peer_events_tx.send(MeshEvent::ScopeLeft(scope));
         let _ = self.swarm_cmd_tx.send(SwarmCommand::LeaveIrohScope {
             mesh_id: mesh_id.to_string(),
         });
@@ -1088,7 +1086,7 @@ mod tests {
             .unwrap()
             .clone();
         assert_eq!(stored.name.as_deref(), Some("mesh-a"));
-        assert_eq!(stored.invite_ids, vec![invite.grant.invite_id.clone()]);
+        assert_eq!(stored.invite_ids, vec![invite.grant.invite_id]);
     }
 
     #[test]

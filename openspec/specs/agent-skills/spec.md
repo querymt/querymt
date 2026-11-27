@@ -227,10 +227,16 @@ Every skill refresh SHALL record the problems it found for the workspace, replac
 - **THEN** a problem of kind `invalid_definition` is recorded for it without reading it to the end
 - **AND** the other skills of the source are still offered
 
-#### Scenario: Definition directly in the source folder is not a skill
+#### Scenario: Definition directly in a global or project source folder is not a skill
 
-- **WHEN** a source folder contains `SKILL.md` next to its skill directories
+- **WHEN** a global or project source folder contains `SKILL.md` next to its skill directories
 - **THEN** that file is not offered as a skill and no problem is recorded for it
+
+#### Scenario: Configured path that is a skill folder offers that skill
+
+- **WHEN** an entry of `skills.paths` is a folder that itself contains `SKILL.md`
+- **THEN** that folder is offered as a skill, including when `include_external` is `false`
+- **AND** skill directories below it are still offered
 
 #### Scenario: Disabled skill is not a problem
 

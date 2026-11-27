@@ -56,7 +56,7 @@ struct ServerState {
     session_owners: SessionOwnerMap,
 }
 
-fn spawn_event_forwarders(state: ServerState, conn_id: String, tx: mpsc::Sender<String>) {
+fn spawn_event_forwarders(state: &ServerState, conn_id: String, tx: mpsc::Sender<String>) {
     let translator = Arc::new(StdMutex::new(AcpLiveEventTranslator::new()));
     let mut events = state.event_source.subscribe();
     let session_owners = state.session_owners.clone();
@@ -104,7 +104,7 @@ impl AcpServer {
         let conn_id = "stdio".to_string();
         let (tx, mut rx) = mpsc::channel::<String>(100);
 
-        spawn_event_forwarders(state.clone(), conn_id.clone(), tx.clone());
+        spawn_event_forwarders(&state, conn_id.clone(), tx.clone());
 
         let send_task = tokio::spawn(async move {
             let mut stdout = tokio::io::stdout();

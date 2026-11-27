@@ -631,10 +631,7 @@ impl McpHarness {
             let adapter = McpToolAdapter::try_new(t, peer.clone(), options.server_name.into())
                 .expect("adapter")
                 .with_router(router.clone());
-            adapters.insert(
-                adapter.descriptor().function.name.clone(),
-                Arc::new(adapter),
-            );
+            adapters.insert(adapter.descriptor().function.name, Arc::new(adapter));
         }
         let skills = crate::skills::mcp::discover_server_skills(options.server_name, &peer).await;
         // Publish the adapters like `build_mcp_state` does, so agent-level
@@ -1452,9 +1449,9 @@ mod tests {
             .count();
         assert!(tools_two > 0, "server two must own tools before the test");
 
-        state.replace_server("one", None, Some(vec![]));
+        state.replace_server("one", None, Some(&[]));
         assert_eq!(skill_names(&state), ["two.a"]);
-        state.replace_server("one", Some(vec![]), None);
+        state.replace_server("one", Some(&[]), None);
         assert_eq!(
             skill_names(&state),
             ["two.a"],
@@ -1481,11 +1478,11 @@ mod tests {
             .unwrap();
         let tools: Vec<_> = h.adapters.values().cloned().collect();
         for _ in 0..300 {
-            state.replace_server("harness", Some(vec![]), Some(vec![]));
+            state.replace_server("harness", Some(&[]), Some(&[]));
             let (s1, s2) = (state.clone(), state.clone());
             let (t, k) = (tools.clone(), skills.clone());
-            let a = tokio::spawn(async move { s1.replace_server("harness", Some(t), None) });
-            let b = tokio::spawn(async move { s2.replace_server("harness", None, Some(k)) });
+            let a = tokio::spawn(async move { s1.replace_server("harness", Some(&t), None) });
+            let b = tokio::spawn(async move { s2.replace_server("harness", None, Some(&k)) });
             a.await.unwrap();
             b.await.unwrap();
             let snap = state.load();

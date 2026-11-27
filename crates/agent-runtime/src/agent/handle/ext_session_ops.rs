@@ -99,7 +99,7 @@ impl LocalAgentHandle {
         &self,
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
-        let parsed: GetSessionLifecycleRequest = parse_session_op_request(req)?;
+        let parsed: GetSessionLifecycleRequest = parse_session_op_request(&req)?;
         let lifecycle = self
             .get_session_lifecycle_unloaded(&parsed.session_id)
             .await
@@ -111,7 +111,7 @@ impl LocalAgentHandle {
         &self,
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
-        let parsed: SetSessionLifecycleRequest = parse_session_op_request(req)?;
+        let parsed: SetSessionLifecycleRequest = parse_session_op_request(&req)?;
         let patch = crate::session::lifecycle::SessionLifecyclePatch {
             resolved: parsed.resolved,
             archived: parsed.archived,
@@ -130,7 +130,7 @@ impl LocalAgentHandle {
         &self,
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
-        let parsed: SetSessionPinnedRequest = parse_session_op_request(req)?;
+        let parsed: SetSessionPinnedRequest = parse_session_op_request(&req)?;
         let store = self.config.provider.history_store();
         if !store.supports_session_pins() {
             return Err(Error::method_not_found());
@@ -159,7 +159,7 @@ impl LocalAgentHandle {
         req: ExtRequest,
         delivery: crate::agent::messages::InputDelivery,
     ) -> Result<ExtResponse, Error> {
-        let parsed: SubmitInputRequest = parse_session_op_request(req)?;
+        let parsed: SubmitInputRequest = parse_session_op_request(&req)?;
         self.session_materializer
             .ensure_writable(&parsed.session_id)
             .await?;
@@ -199,7 +199,7 @@ impl LocalAgentHandle {
         &self,
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
-        let parsed: DiscardQueuedInputRequest = parse_session_op_request(req)?;
+        let parsed: DiscardQueuedInputRequest = parse_session_op_request(&req)?;
         let session_id = parsed.session_id;
         let input_id = parsed.input_id;
         #[cfg(feature = "remote")]
@@ -226,7 +226,7 @@ impl LocalAgentHandle {
         &self,
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
-        let parsed: SessionIdRequest = parse_session_op_request(req)?;
+        let parsed: SessionIdRequest = parse_session_op_request(&req)?;
         let mut observations = self
             .observe_session_runtimes(std::slice::from_ref(&parsed.session_id))
             .await;
@@ -258,7 +258,7 @@ impl LocalAgentHandle {
         &self,
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
-        let parsed: UndoSessionRequest = parse_session_op_request(req)?;
+        let parsed: UndoSessionRequest = parse_session_op_request(&req)?;
         self.session_materializer
             .ensure_writable(&parsed.session_id)
             .await?;
@@ -291,7 +291,7 @@ impl LocalAgentHandle {
         &self,
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
-        let parsed: SessionIdRequest = parse_session_op_request(req)?;
+        let parsed: SessionIdRequest = parse_session_op_request(&req)?;
         self.session_materializer
             .ensure_writable(&parsed.session_id)
             .await?;
@@ -318,7 +318,7 @@ impl LocalAgentHandle {
         &self,
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
-        let parsed: SessionIdRequest = parse_session_op_request(req)?;
+        let parsed: SessionIdRequest = parse_session_op_request(&req)?;
         let profile_handle = self.profile_session_op_handle(&parsed.session_id).await?;
         let session_handle = profile_handle.as_deref().unwrap_or(self);
         ext_json_response(&UndoStackResponse {
@@ -368,7 +368,7 @@ impl LocalAgentHandle {
     }
 }
 
-fn parse_session_op_request<T>(req: ExtRequest) -> Result<T, Error>
+fn parse_session_op_request<T>(req: &ExtRequest) -> Result<T, Error>
 where
     T: serde::de::DeserializeOwned,
 {

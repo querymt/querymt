@@ -1029,7 +1029,7 @@ mod tests {
         // The review is a stored notice; the rendered objective never carries it.
         let objective = crate::agent::objective::RunObjective::new(
             querymt_agent_core::model::TurnId::new(),
-            "Implement the fix".into(),
+            "Implement the fix",
             "interactive".into(),
             None,
             None,
@@ -1124,7 +1124,7 @@ mod tests {
     fn objective_for(prompt: &str) -> crate::agent::objective::RunObjective {
         crate::agent::objective::RunObjective::new(
             querymt_agent_core::model::TurnId::new(),
-            prompt.into(),
+            prompt,
             "interactive".into(),
             None,
             None,

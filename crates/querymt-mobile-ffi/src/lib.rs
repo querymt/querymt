@@ -1886,7 +1886,7 @@ mod tests {
             );
         }
 
-        let inner = state::with_agent_read(agent_handle, |record| Ok(record.agent.inner().clone()))
+        let inner = state::with_agent_read(agent_handle, |record| Ok(record.agent.inner()))
             .expect("agent remains attached");
         let pending = inner.pending_elicitations();
         let (permission_tx, permission_rx) = tokio::sync::oneshot::channel();

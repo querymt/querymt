@@ -1933,8 +1933,8 @@ fn complete_output_target(
         return target;
     }
     let mut target = OutputTarget::new(llm.provider.clone(), llm.model.clone());
-    target.protocol = llm.protocol.clone();
-    target.endpoint = llm.endpoint.clone();
+    target.protocol.clone_from(&llm.protocol);
+    target.endpoint.clone_from(&llm.endpoint);
     if target.endpoint.is_empty() {
         let own = history
             .iter()
@@ -1949,8 +1949,8 @@ fn complete_output_target(
                 _ => None,
             });
         if let Some(origin) = own {
-            target.protocol = origin.protocol.clone();
-            target.endpoint = origin.endpoint.clone();
+            target.protocol.clone_from(&origin.protocol);
+            target.endpoint.clone_from(&origin.endpoint);
         }
     }
     target
@@ -2185,7 +2185,7 @@ pub mod tests {
         let aliased = LLMConfig {
             provider: "work-openai".into(),
             model: "alias-of-m".into(),
-            ..llm.clone()
+            ..llm
         };
         let target = complete_output_target(&aliased, Some(&stated), &[]);
         assert_eq!(target.provider, "p");
@@ -2376,7 +2376,7 @@ pub mod tests {
         fn from(response: MockChatResponse) -> Self {
             ChatOutput::from_projections(
                 None,
-                Some(response.content.clone()),
+                Some(response.content),
                 None,
                 None,
                 Some(FinishReason::Stop),

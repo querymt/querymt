@@ -708,7 +708,7 @@ impl Transcript {
         if !old_mid.is_empty() || !new_mid.is_empty() {
             let fresh: Vec<Rc<Row>> = specs[new_mid.clone()].iter().map(&mut row).collect();
             items.splice(old_mid.clone(), fresh);
-            self.list.splice(old_mid.clone(), new_mid.len());
+            self.list.splice(old_mid, new_mid.len());
             if head == 0 && tail == old_len && old_len > 0 {
                 tracing::debug!(rows = new_mid.len(), "older history rows prepended");
             }
@@ -4370,7 +4370,7 @@ impl SessionPane {
                     .child(
                         div()
                             .whitespace_nowrap()
-                            .debug_selector(move || selector.clone())
+                            .debug_selector(move || selector)
                             .child(label),
                     )
                     .children(others.into_iter().map(|d| d.whitespace_nowrap())),
@@ -5749,7 +5749,7 @@ impl SessionPane {
                         .label("Retry")
                         .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
                 )
-                .when_some(error_details.clone(), |el, text| {
+                .when_some(error_details, |el, text| {
                     el.child(
                         kit::button("toggle-load-error-details")
                             .label(if details_open {
@@ -5804,7 +5804,7 @@ impl SessionPane {
                 .into_any_element()
         } else {
             let rc2 = rc.clone();
-            let render_items = items.clone();
+            let render_items = items;
             // Telemetry: time each row built and the transcript's frame.
             let timed = crate::telemetry::enabled();
             let row_probe = self.transcript.probe.clone();
@@ -6517,7 +6517,7 @@ mod tests {
                     let row = match ix {
                         1 => div()
                             .w_full()
-                            .child(kept.markdown(key.clone(), diagram.clone(), &p))
+                            .child(kept.markdown(key, diagram.clone(), &p))
                             .into_any_element(),
                         _ => div().h(px(120.)).w_full().into_any_element(),
                     };

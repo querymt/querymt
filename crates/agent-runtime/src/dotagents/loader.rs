@@ -468,10 +468,10 @@ fn read_agents(policy: &ConfinementPolicy, content: &mut DotagentsLayerContent) 
             let config_source = DotagentsSource::entry(
                 policy.layer(),
                 policy.allowed_root().join(&config_relative),
-                entry_id.clone(),
+                entry_id,
             );
             match result {
-                Ok(config_text) => match parse_agent_config(&config_text, config_source) {
+                Ok(config_text) => match parse_agent_config(&config_text, &config_source) {
                     Ok(config) => agent.config = config,
                     Err(error) => {
                         parsed.diagnostics.push(*error);

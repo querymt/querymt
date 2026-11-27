@@ -206,7 +206,7 @@ impl QmtApp {
                         .mb(px(12.))
                 });
                 v_flex()
-                    .id(kit::keyed("mcp-row", key.clone()))
+                    .id(kit::keyed("mcp-row", key))
                     .min_w_0()
                     .when(ix > 0, |el| el.border_t_1().border_color(subtle_border))
                     .child(

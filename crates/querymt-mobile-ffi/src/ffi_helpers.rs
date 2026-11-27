@@ -23,6 +23,12 @@ pub fn set_last_error(code: FfiErrorCode, msg: String) {
 }
 
 /// Store a thread-local error from an anyhow error.
+// TODO: used by the Android and iOS code. Consider taking `&anyhow::Error`, but only
+// after testing on a device.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "used by the mobile apps; signature kept until tested on a device"
+)]
 pub fn set_last_error_from_anyhow(code: FfiErrorCode, err: anyhow::Error) {
     set_last_error(code, format!("{:#}", err));
 }

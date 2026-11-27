@@ -79,7 +79,7 @@ impl LocalAgentHandle {
                 origin: existing.origin(),
             });
         }
-        let member = Self::build_runtime_member(roster, spec)?;
+        let member = Self::build_runtime_member(roster, &spec)?;
         let change = roster.add_change(member)?;
         self.after_roster_change(&change, None).await;
         Ok(change.generation)
@@ -87,16 +87,16 @@ impl LocalAgentHandle {
 
     fn build_runtime_member(
         roster: &Arc<AgentRoster>,
-        spec: MemberBuildSpec,
+        spec: &MemberBuildSpec,
     ) -> Result<Member, RosterError> {
-        let handle = build_local_member(&spec, roster.context()).map_err(|source| match source
-            .downcast::<RosterError>(
-        ) {
-            Ok(error) => error,
-            Err(source) => RosterError::Build {
-                id: spec.id.clone(),
-                source,
-            },
+        let handle = build_local_member(spec, roster.context()).map_err(|source| {
+            match source.downcast::<RosterError>() {
+                Ok(error) => error,
+                Err(source) => RosterError::Build {
+                    id: spec.id.clone(),
+                    source,
+                },
+            }
         })?;
         Ok(Member::built(
             spec.info(),
@@ -131,7 +131,7 @@ impl LocalAgentHandle {
         }
         spec.check_external(&id)?;
         let member = match spec {
-            MemberSpec::Local(delegate) => self.local_runtime_member(roster, id, *delegate)?,
+            MemberSpec::Local(delegate) => self.local_runtime_member(roster, &id, *delegate)?,
             MemberSpec::Remote(remote) => self.remote_runtime_member(id, remote)?,
         };
         roster.add_change(member)
@@ -150,7 +150,7 @@ impl LocalAgentHandle {
     fn local_runtime_member(
         &self,
         roster: &Arc<AgentRoster>,
-        id: AgentId,
+        id: &AgentId,
         delegate: DelegateConfig,
     ) -> Result<Member, RosterError> {
         if delegate.peer.is_some() {
@@ -175,7 +175,7 @@ impl LocalAgentHandle {
             &available_local_tool_names(),
         )
         .map_err(build_error)?;
-        Self::build_runtime_member(roster, spec)
+        Self::build_runtime_member(roster, &spec)
     }
 
     /// A remote member is listed without contacting its peer; the node is

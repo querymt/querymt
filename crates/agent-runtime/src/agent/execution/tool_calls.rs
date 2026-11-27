@@ -1169,7 +1169,7 @@ pub(super) fn restricted_mesh_tool(
             if ids.is_empty() {
                 return None;
             }
-            let tool = crate::agent::builtin_tools::DelegateTool::new(roster.clone());
+            let tool = crate::agent::builtin_tools::DelegateTool::new(roster);
             let mut definition = tool.definition();
             definition.function.description =
                 "Delegate a model task to another agent on this host without opening a workspace."
@@ -2114,9 +2114,7 @@ pub(super) async fn record_tool_side_effects(
                     cycle_id: Some(env.cycle_accounting.cycle_id().to_string()),
                 },
             );
-            return Ok(Some(WaitCondition::delegation(
-                delegation.public_id.clone(),
-            )));
+            return Ok(Some(WaitCondition::delegation(delegation.public_id)));
         }
     }
 
@@ -5261,7 +5259,7 @@ mod mcp_tool_tests {
         let roster = test_roster_on(plugins, agent.storage.clone());
         roster
             .add(Member::built(
-                plan.info.clone(),
+                plan.info,
                 MemberOrigin::Protocol,
                 MemberAgent::Local(target.clone()),
             ))

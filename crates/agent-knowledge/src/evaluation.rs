@@ -519,7 +519,7 @@ pub struct Checkout {
     pub files: usize,
 }
 
-fn io_error(path: &Path, error: std::io::Error) -> EvalError {
+fn io_error(path: &Path, error: &std::io::Error) -> EvalError {
     EvalError::Setup(format!("{}: {error}", path.display()))
 }
 
@@ -533,7 +533,7 @@ fn settle(path: &Path) -> Result<(), EvalError> {
         .write(true)
         .open(path)
         .and_then(|file| file.set_modified(old))
-        .map_err(|e| io_error(path, e))
+        .map_err(|e| io_error(path, &e))
 }
 
 /// Copy the files selected by `manifest_text` (evaluated against `source_root`)
@@ -544,7 +544,7 @@ pub fn materialize(
     manifest_text: Option<&str>,
     dest: &Path,
 ) -> Result<Checkout, EvalError> {
-    fs::create_dir_all(dest.join(".git")).map_err(|e| io_error(dest, e))?;
+    fs::create_dir_all(dest.join(".git")).map_err(|e| io_error(dest, &e))?;
     let mut hasher = Sha256::new();
     let Some(text) = manifest_text else {
         hasher.update(b"qmt-eval-corpus\0empty");
@@ -575,22 +575,22 @@ pub fn materialize(
     for file in &files {
         let target = dest.join(&file.relative_path);
         if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).map_err(|e| io_error(parent, e))?;
+            fs::create_dir_all(parent).map_err(|e| io_error(parent, &e))?;
         }
         let bytes =
-            fs::read(&file.canonical_path).map_err(|e| io_error(&file.canonical_path, e))?;
+            fs::read(&file.canonical_path).map_err(|e| io_error(&file.canonical_path, &e))?;
         hasher.update([0u8]);
         hasher.update(file.relative_path.as_bytes());
         hasher.update([0u8]);
         hasher.update(Sha256::digest(&bytes));
-        fs::write(&target, bytes).map_err(|e| io_error(&target, e))?;
+        fs::write(&target, bytes).map_err(|e| io_error(&target, &e))?;
         settle(&target)?;
     }
     let manifest_path = dest.join(MANIFEST_RELATIVE_PATH);
     if let Some(parent) = manifest_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| io_error(parent, e))?;
+        fs::create_dir_all(parent).map_err(|e| io_error(parent, &e))?;
     }
-    fs::write(&manifest_path, text).map_err(|e| io_error(&manifest_path, e))?;
+    fs::write(&manifest_path, text).map_err(|e| io_error(&manifest_path, &e))?;
     settle(&manifest_path)?;
     Ok(Checkout {
         root: dest.to_path_buf(),
@@ -703,7 +703,7 @@ pub fn run(
     })
     .map_err(|e| EvalError::Setup(e.to_string()))?;
     let cache = scratch.join("cache");
-    fs::create_dir_all(&cache).map_err(|e| io_error(&cache, e))?;
+    fs::create_dir_all(&cache).map_err(|e| io_error(&cache, &e))?;
     let service = RepositoryService::open(
         root,
         &cache.join("index.sqlite"),

@@ -310,6 +310,10 @@ impl AgentBuilder {
 
         let local_tools = available_local_tool_names();
         for delegate in delegates {
+            #[allow(
+                clippy::redundant_clone,
+                reason = "`delegate.peer` is read below when the `remote` feature is on"
+            )]
             let spec = MemberBuildSpec::from_delegate_config(
                 delegate.clone(),
                 top_level_mcp,

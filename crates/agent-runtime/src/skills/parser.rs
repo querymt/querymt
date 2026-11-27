@@ -443,7 +443,7 @@ Review instructions.
         )
         .unwrap();
 
-        let skill = parse_skill_file_ex(&path, SkillSource::Project(entry.clone()), true).unwrap();
+        let skill = parse_skill_file_ex(&path, SkillSource::Project(entry), true).unwrap();
         assert_eq!(skill.metadata.id.as_deref(), Some("review"));
         assert_eq!(skill.metadata.name, "review");
     }

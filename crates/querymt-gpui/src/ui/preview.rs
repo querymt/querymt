@@ -330,7 +330,7 @@ impl QmtApp {
                     canvas(
                         |_, _, _| (),
                         move |_, _, window, _| {
-                            let weak = weak.clone();
+                            let weak = weak;
                             let line = window.line_height();
                             window.on_mouse_event(move |ev: &ScrollEvent, phase, _, cx| {
                                 if phase != DispatchPhase::Capture

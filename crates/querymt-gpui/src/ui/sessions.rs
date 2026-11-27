@@ -1555,7 +1555,7 @@ impl QmtApp {
         };
 
         let expander = if expandable {
-            let (agent, id, key) = (s.agent_id.clone(), s.id.clone(), open_key.clone());
+            let (agent, id, key) = (s.agent_id.clone(), s.id.clone(), open_key);
             kit::icon_button(
                 kit::keyed("session-expand", row_key.clone()),
                 if expanded {
@@ -1878,7 +1878,7 @@ impl QmtApp {
                     PopupMenuItem::new("Copy session ID")
                         .icon(Icon::new(IconName::Copy))
                         .on_click({
-                            let sid = sid.clone();
+                            let sid = sid;
                             move |_, _, cx| {
                                 cx.write_to_clipboard(ClipboardItem::new_string(sid.clone()))
                             }

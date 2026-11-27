@@ -577,7 +577,7 @@ mod tests {
         let html = b"<html>Not found</html>".to_vec();
         let cases: Vec<(&str, Vec<u8>, DesktopAsset, &str)> = vec![
             ("wrong sha256", good.clone(), wrong_hash, "SHA-256"),
-            ("wrong size", good.clone(), wrong_size, "bytes"),
+            ("wrong size", good, wrong_size, "bytes"),
             (
                 "truncated gzip",
                 truncated.clone(),

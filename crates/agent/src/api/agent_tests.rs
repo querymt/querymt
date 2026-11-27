@@ -2637,7 +2637,7 @@ mod repository_knowledge_binding {
                 move |messages: &[querymt::chat::ChatMessage], _tools| {
                     let text = messages
                         .iter()
-                        .flat_map(|m| m.portable_input_parts().to_vec())
+                        .flat_map(|m| m.portable_input_parts())
                         .map(|part| match part {
                             querymt::chat::ChatInputPart::Text { text } => text,
                             other => format!("{other:?}"),

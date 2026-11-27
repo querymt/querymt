@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "Portable repository knowledge for the querymt agent: manifest, index, retrieval and delivery selection"
 
+[lints]
+workspace = true
+
 [lib]
 name = "querymt_agent_knowledge"
 path = "src/lib.rs"

@@ -56,7 +56,8 @@
   the skill's files. A source folder that is a dangling link is reported as a
   problem. A skill definition must be a regular file of at most 1 MiB (a link to
   a pipe or device no longer blocks a refresh), and a `SKILL.md` placed directly
-  in a source folder is no longer treated as a skill.
+  in a global or project source folder is no longer treated as a skill. A
+  configured `skills.paths` entry may still point at a single skill folder.
 - **`nested_depth` in every skills table** (`[agent.skills]`, a delegate's
   `skills` table, the deprecated `[planner.skills]`): how many directory levels
   below a project `.agents/skills` folder may hold a skill directory. Integer

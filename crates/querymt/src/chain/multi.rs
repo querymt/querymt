@@ -282,7 +282,7 @@ impl<'a> MultiPromptChain<'a> {
                     req.temperature = step.temperature;
                     req.max_tokens = step.max_tokens;
                     let c = llm.complete(&req).await?;
-                    c.text.to_string()
+                    c.text
                 }
             };
 
