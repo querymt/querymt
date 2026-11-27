@@ -515,9 +515,12 @@ impl UserAttachment {
 #[derive(Clone, Debug)]
 pub enum ItemKind {
     User {
+        /// What the user typed. For a prompt command: `/name arguments`.
         text: String,
         attachments: Vec<UserAttachment>,
         local: bool,
+        /// Set when the agent recorded this message as a slash command.
+        command: Option<UserCommand>,
     },
     Agent {
         text: String,
@@ -531,6 +534,18 @@ pub enum ItemKind {
     },
     /// Context-compaction boundary (desktop `SessionCompactionDivider`).
     Compaction(Box<Compaction>),
+}
+
+/// The slash command behind a user message: what the model received instead
+/// of what the user typed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserCommand {
+    /// Command name without the slash.
+    pub name: String,
+    /// What the user typed after the name; empty when there was nothing.
+    pub arguments: String,
+    /// The expanded prompt the model received.
+    pub expansion: String,
 }
 
 /// Lifecycle of a context compaction (ACP `compaction_update.status`).
@@ -555,17 +570,12 @@ pub struct Compaction {
     pub tokens_before: Option<u64>,
     /// Context tokens after it completed.
     pub tokens_after: Option<u64>,
+    /// `Some(instructions)` when the user started it with `/compact`; the
+    /// string is empty when there were none. `None` for automatic compactions.
+    pub requested: Option<String>,
 }
 
 pub const COMPACTING_LABEL: &str = "Compacting context…";
-
-/// True for the native `/compact [instructions]` command.
-pub fn is_compact_command(prompt: &str) -> bool {
-    let p = prompt.trim_start();
-    p.get(..8)
-        .is_some_and(|head| head.eq_ignore_ascii_case("/compact"))
-        && p[8..].chars().next().is_none_or(char::is_whitespace)
-}
 
 /// `12`, `950`, `12.5k`, `120k` (desktop `formatTokens`).
 fn format_tokens(value: u64) -> String {
@@ -1224,14 +1234,10 @@ pub(crate) mod undo_tests {
 
 #[cfg(test)]
 mod format_tests {
-    use super::{format_tokens, is_compact_command};
+    use super::format_tokens;
 
     #[test]
-    fn compact_command_and_token_format() {
-        assert!(is_compact_command("/compact"));
-        assert!(is_compact_command("  /COMPACT keep the plan"));
-        assert!(!is_compact_command("/compactly"));
-        assert!(!is_compact_command("compact"));
+    fn token_format() {
         assert_eq!(format_tokens(950), "950");
         assert_eq!(format_tokens(12500), "12.5k");
         assert_eq!(format_tokens(18000), "18k");

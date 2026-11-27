@@ -24,6 +24,14 @@ enum Row {
         text: String,
         local: bool,
     },
+    /// A user message the agent recorded as a slash command. (`Command` is
+    /// kept for the command rows `add-slash-command-replies` adds.)
+    UserCommand {
+        text: String,
+        local: bool,
+        name: String,
+        expansion: String,
+    },
     Agent(String),
     Thought(String),
     Tool {
@@ -44,9 +52,26 @@ fn rows(items: &[Item]) -> Vec<Row> {
     let mut out = Vec::new();
     for item in items {
         match &item.kind {
-            ItemKind::User { text, local, .. } => out.push(Row::User {
+            ItemKind::User {
+                text,
+                local,
+                command: None,
+                ..
+            } => out.push(Row::User {
                 text: text.clone(),
                 local: *local,
+            }),
+            // Its own row, so that cases without commands read as before.
+            ItemKind::User {
+                text,
+                local,
+                command: Some(command),
+                ..
+            } => out.push(Row::UserCommand {
+                text: text.clone(),
+                local: *local,
+                name: command.name.clone(),
+                expansion: command.expansion.clone(),
             }),
             ItemKind::Agent { text } => out.push(Row::Agent(text.clone())),
             ItemKind::Work(entries) => {

@@ -39,7 +39,8 @@ None.
   - `src/session.rs`: `ItemKind::User` gains the command, `Compaction` gains the instructions; `is_compact_command` is removed.
   - `src/session/projection.rs`: rows from `UserMessage.slash_command` and `CompactionEntry.slash_command`.
   - `src/ui/session_view.rs`: the user bubble's command form and toggle, the compaction row, the activity label.
-  - `src/session/golden.rs`: the user row's command.
+  - `src/session/golden.rs`: the user row's command, as `Row::UserCommand`.
+  - `src/ui/find.rs`: `views_of` indexes a command row's arguments.
   - Tests in `src/session/projection.rs`, `src/ui/session_view.rs`; golden files.
 - **Compatibility:** with no records, nothing changes on screen except the activity label of a `/compact` being sent, which reads "Sending prompt…" until the compaction starts. Until `add-slash-command-replies`, a `/compact` prompt bubble stays next to its compaction row, as today.
 - **Follow-up:** `add-slash-command-replies` adds the command row and extends the rows of this change.

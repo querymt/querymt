@@ -31,9 +31,9 @@ See proposal.md for the motivation. Paths are relative to `crates/querymt-gpui`,
 
 ### D1. A prompt command stays a user row; its text is what was typed
 
-- `ItemKind::User` gains `command: Option<UserCommand { name, expansion }>`.
-- For a user message with a record, the projection sets `text` to `/name` plus the arguments, and `expansion` to the text of the message's blocks.
-- Because `text` is what the user typed, `fork_target`, `find::views_of`, the golden rows and Copy need no change and get the better value.
+- `ItemKind::User` gains `command: Option<UserCommand { name, arguments, expansion }>`.
+- For a user message with a record, the projection sets `text` to `/name` plus the arguments, `arguments` to the record's arguments (empty when there are none), and `expansion` to the text of the message's blocks.
+- Because `text` is what the user typed, `fork_target` and Copy need no change and get the better value. `find::views_of` changes (D4), and the golden rows gain a row for commands (D4).
 - The optimistic prompt already holds the typed text, so the row reads the same before and after the agent's echo.
 - Alternative considered: a separate `ItemKind::Command` for prompt commands too. Rejected: a prompt command is a message to the model. It belongs with prompts for turn boundaries, forking and find, and the user asked to tell prompts from actions.
 
@@ -42,6 +42,7 @@ See proposal.md for the motivation. Paths are relative to `crates/querymt-gpui`,
 - `Compaction` gains `requested: Option<String>`: `Some(arguments)` when the entry has a record, with an empty string for no instructions.
 - `render_compaction` adds, after the status label, `/compact` in `MONO` and `p.muted`. Instructions follow on the same line, truncated to one line, with the full text in the expanded details above the summary.
 - The instructions are visible on the collapsed row, because they are the only record of what the user asked for.
+- A compaction with instructions and no summary gets the details toggle too, labelled "Show details" / "Hide details"; with a summary it keeps "Show summary" / "Hide summary". The details hold the instructions above the summary.
 
 ### D3. The user bubble's command form
 
@@ -52,8 +53,8 @@ See proposal.md for the motivation. Paths are relative to `crates/querymt-gpui`,
 ### D4. The app stops guessing
 
 - `src/ui/session_view.rs` `activity`: `is_compact_command` and its use are removed. A local `/compact` prompt reads "Sending prompt…" like any other until the compaction starts; an active compaction still gives "Compacting context…" through `active_compaction`.
-- `src/session/golden.rs`: the `command` of `Row::User`.
-- `src/ui/find.rs`: no change.
+- `src/session/golden.rs`: a user message with a record is its own row, `Row::UserCommand { text, local, name, expansion }`, so cases without commands print as before. The name leaves `Row::Command` free for the command rows `add-slash-command-replies` adds. No golden case is added by this change.
+- `src/ui/find.rs`: `views_of` for a command row returns the arguments, because the bubble draws `/name` as its own mono element and only the arguments as the Markdown view that find reads. A command without arguments has no view. `/name` and the expansion are not searchable.
 
 ## Risks / Trade-offs
 
