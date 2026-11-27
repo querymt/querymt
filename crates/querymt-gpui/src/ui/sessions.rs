@@ -1877,11 +1877,8 @@ impl QmtApp {
                 .item(
                     PopupMenuItem::new("Copy session ID")
                         .icon(Icon::new(IconName::Copy))
-                        .on_click({
-                            let sid = sid;
-                            move |_, _, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(sid.clone()))
-                            }
+                        .on_click(move |_, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(sid.clone()))
                         }),
                 )
                 .when(can_delete, |m| {
