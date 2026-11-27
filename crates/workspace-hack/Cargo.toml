@@ -68,6 +68,7 @@ generic-array = { version = "0.14", default-features = false, features = ["more_
 getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 gimli = { version = "0.33", default-features = false, features = ["read", "std", "write"] }
+gix-error = { version = "0.5", default-features = false, features = ["bstr"] }
 hashbrown-3575ec1268b04181 = { package = "hashbrown", version = "0.15" }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17", features = ["serde"] }
 hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16", features = ["serde"] }
@@ -85,7 +86,6 @@ indexmap = { version = "2", features = ["serde"] }
 iroh = { version = "1", default-features = false, features = ["metrics", "tls-ring"] }
 iroh-metrics = { version = "1", default-features = false, features = ["service"] }
 iroh-relay = { version = "1", default-features = false, features = ["server"] }
-jiff = { version = "0.2", features = ["serde"] }
 kameo = { version = "0.22", features = ["remote"] }
 lazy_static = { version = "1", default-features = false, features = ["spin_no_std"] }
 libp2p = { version = "0.56", default-features = false, features = ["cbor", "kad", "macros", "mdns", "noise", "quic", "request-response", "tcp", "tokio", "yamux"] }
@@ -208,6 +208,7 @@ foldhash = { version = "0.2" }
 generic-array = { version = "0.14", default-features = false, features = ["more_lengths", "zeroize"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 gimli = { version = "0.33", default-features = false, features = ["read", "std", "write"] }
+gix-error = { version = "0.5", default-features = false, features = ["bstr"] }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17", features = ["serde"] }
 hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16", features = ["serde"] }
 hybrid-array = { version = "0.4", default-features = false, features = ["alloc", "subtle", "zeroize"] }
@@ -258,7 +259,6 @@ zeroize = { version = "1", features = ["derive"] }
 
 [target.aarch64-apple-darwin.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
-byteorder = { version = "1" }
 errno = { version = "0.3" }
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "http2", "ring", "tls12", "webpki-tokio"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
@@ -288,7 +288,6 @@ siphasher = { version = "1" }
 
 [target.x86_64-unknown-linux-gnu.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
-byteorder = { version = "1" }
 cbc = { version = "0.2", features = ["alloc"] }
 cipher-d8f496e17d97b5cb = { package = "cipher", version = "0.5", default-features = false, features = ["alloc", "block-padding", "stream-wrapper"] }
 crossbeam-utils = { version = "0.8" }
