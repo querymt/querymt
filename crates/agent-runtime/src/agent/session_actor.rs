@@ -1928,11 +1928,23 @@ impl Message<crate::agent::messages::GetSessionSlashRegistry> for SessionActor {
         _msg: crate::agent::messages::GetSessionSlashRegistry,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        Ok(Arc::new(
-            self.runtime
-                .effective_slash_registry(&self.config.slash_command_registry)
-                .clone(),
-        ))
+        Ok(self
+            .runtime
+            .effective_slash_registry(&self.config.slash_command_registry))
+    }
+}
+
+impl Message<crate::agent::messages::ReloadSlashCommands> for SessionActor {
+    type Reply = Result<(), kameo::error::Infallible>;
+
+    async fn handle(
+        &mut self,
+        _msg: crate::agent::messages::ReloadSlashCommands,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        crate::agent::slash_reload::reload_session(&self.config, &self.runtime, &self.session_id)
+            .await;
+        Ok(())
     }
 }
 
@@ -3112,7 +3124,8 @@ impl Message<SubmitSessionInput> for SessionActor {
                 // new task, not a correction to the running one.
                 crate::slash_commands::expander::reject_steered_command(
                     &input.prompt,
-                    self.runtime
+                    &self
+                        .runtime
                         .effective_slash_registry(&self.config.slash_command_registry),
                 )?;
                 let llm_config = self
@@ -4335,16 +4348,17 @@ async fn execute_prompt_inner_unboxed(
 
     // 4. Slash command expansion (before storing user messages)
     let mut req = req;
-    // Managed sessions expand against the registry resolved from their
-    // bound checkout, matching the advertised catalog; legacy local
-    // sessions keep the agent-level registry built at startup.
+    // Sessions expand against the registry resolved from their own project
+    // root, matching the advertised catalog; a session without one uses the
+    // agent-level registry.
+    // Loaded once: this turn keeps the commands it started with.
     let slash_registry = runtime.effective_slash_registry(&config.slash_command_registry);
     // What the user typed, kept next to the expansion the model receives.
     let mut slash_record: Option<querymt_agent_core::events::SlashCommandRecord> = None;
     if !restricted
         && let Some(crate::acp::protocol::ContentBlock::Text(text_content)) = req.prompt.first()
         && let Some(expansion) =
-            crate::slash_commands::try_expand(&text_content.text, slash_registry)
+            crate::slash_commands::try_expand(&text_content.text, &slash_registry)
     {
         log::info!(
             "Session {}: expanding slash command '/{}'",

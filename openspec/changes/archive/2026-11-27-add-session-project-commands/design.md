@@ -87,7 +87,7 @@ See proposal.md for the motivation. Paths are under `crates/`.
 
 - `SessionRuntime.slash_registry` becomes `ArcSwapOption<SlashCommandRegistry>` (`arc-swap` is already a dependency of agent-runtime). `effective_slash_registry` returns an `Arc` instead of a reference. The prompt path and the steer check load it once at their start, so a turn never sees a half-updated set.
 - The agent-level registry becomes `ArcSwap<SlashCommandRegistry>` on `AgentConfig`, so sessions without a cwd follow global edits.
-- **Reload of a session:** rebuild through D1 (or `registry_for_workspace` for a managed checkout) from the stored project root, compare the command list with the current one (name, description, hint, source, template path), and store and announce (D8) only when it differs.
+- **Reload of a session:** rebuild through D1 (or `registry_for_workspace` for a managed checkout) from the stored project root, store the result (so an edited template body is used by the next prompt), compare the advertised command list with the one the session's clients last heard of, and announce (D8) only when it differs.
 - **Reload of the agent level:** rebuild the startup registry with the startup cwd, store it, then reload every live local session.
 
 ### D8. Pushing the new catalog

@@ -354,20 +354,49 @@ The filename determines the command name:
 
 ### Command Discovery
 
-Commands are discovered at startup:
+Commands are discovered when a session opens (new, load, resume or fork):
 
 1. **User commands**: `~/.qmt/commands/*.md`
-2. **Project commands**: `.qmt/commands/*.md`
+2. **Project commands**: `<project root>/.qmt/commands/*.md`
 3. **Merged**: Project commands override user commands with same name
 
+A session's **project root** is the root of the Git checkout that contains its
+working directory, or the working directory itself when it is not in a Git
+repository. A session started in `crates/api` of a repository reads the
+repository's `.qmt/commands`; a folder outside Git does not search the folders
+above it. The catalog shown to the client and the actual `/command` expansion
+both use that one set, so two sessions in different folders each see and expand
+the commands of their own folder. A session without a working directory, or
+an agent with command discovery switched off, uses the agent-level commands
+(or none).
+
 For sessions running in an isolated Git worktree (see
-[Git Worktree Workspaces](./worktrees.md)), project commands are
-re-discovered from the session's **bound checkout**: the catalog shown to
-the client and the actual `/command` expansion both use that checkout's
-files, so differently defined commands in different checkouts each expand
-their own version. Global and configured sources and the scripts policy
-follow the same configuration as a local session. Absolute paths inside
-command prompts are never rewritten.
+[Git Worktree Workspaces](./worktrees.md)), the project root is the session's
+**bound checkout**, so differently defined commands in different checkouts each
+expand their own version. Global and configured sources and the scripts policy
+follow the same configuration for every session. Absolute paths inside command
+prompts are never rewritten.
+
+### Changing Commands While Sessions Are Open
+
+Adding, editing or removing a `.md` file in `~/.qmt/commands` or in an open
+session's `<project root>/.qmt/commands` takes effect without a restart or
+reopening the session: the session's next prompt expands from the new files,
+and the agent sends its clients a fresh `available_commands_update` with the
+complete command list (built-ins included), so the palette and composer update.
+A running turn keeps the commands it started with.
+
+Limits:
+
+- Configured `slash_commands.paths` are read when a session opens, not watched.
+  A change there is listed the next time the session's commands are reloaded
+  or it is reopened.
+- A `.qmt/commands` folder that the repository's `.gitignore` covers is not
+  watched (the workspace index skips ignored paths); it is read when the
+  session next opens, loads or resumes.
+- `~/.qmt/commands` is watched only if it exists when the agent starts; a
+  folder created later is read at the next agent start.
+- Sessions hosted on another mesh node use that node's commands.
 
 ## Command Format
 
@@ -967,7 +996,9 @@ Proceed with deployment to ${1:-staging}? Ask for confirmation.
 1. Check file exists in `~/.qmt/commands/` or `.qmt/commands/`
 2. Verify filename ends with `.md`
 3. Check filename has no spaces
-4. Restart application to reload commands
+4. If the file lives in a `.gitignore`d `.qmt/commands`, a configured path, or a
+   global folder that did not exist when the agent started, reopen the session
+   (or restart the agent for the global folder)
 
 ### Tab Completion Not Working
 

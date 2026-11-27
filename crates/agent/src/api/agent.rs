@@ -920,19 +920,15 @@ impl AgentBuilder {
             builder = builder.with_hooks(hooks);
         }
 
+        // Set when the global command folder is read, so it is watched too.
+        let mut global_commands_watch: Option<crate::config::SlashCommandsConfig> = None;
         if let Some(slash_config) = self.slash_commands_config
             && slash_config.enabled
         {
-            let sources = crate::slash_commands::search_paths(
-                cwd.as_deref(),
-                slash_config.include_global,
-                slash_config.include_project,
-                &slash_config.paths,
-            );
-            let (registry, diagnostics) = crate::slash_commands::SlashCommandRegistry::from_sources(
-                &sources,
-                &slash_config.scripts,
-            );
+            let (registry, diagnostics) = startup_slash_registry(&slash_config, cwd.as_deref());
+            if slash_config.include_global {
+                global_commands_watch = Some(slash_config.clone());
+            }
             for diagnostic in &diagnostics {
                 log::warn!(
                     "Skipping invalid slash command {}: {}",
@@ -991,6 +987,28 @@ impl AgentBuilder {
             handle.set_mesh(mesh_handle);
         }
 
+        // Command files of the global folder are read again when they change.
+        // The folder is not created: one that appears later is read at the
+        // next start.
+        if let Some(slash_config) = global_commands_watch
+            && let Some(dir) =
+                crate::slash_commands::global_commands_dir(slash_config.global_dir.as_deref())
+                    .filter(|dir| dir.is_dir())
+        {
+            let startup_cwd = cwd.clone();
+            if let Err(error) =
+                crate::agent::slash_reload::watch_global_commands(&handle, dir.clone(), move || {
+                    startup_slash_registry(&slash_config, startup_cwd.as_deref()).0
+                })
+                .await
+            {
+                log::warn!(
+                    "Not watching global slash commands in {}: {error}",
+                    dir.display()
+                );
+            }
+        }
+
         // Protocol state is retained for post-construction activation. Task and
         // memory reconciliation is intentionally deferred: it needs sessions,
         // profiles, approvals, and a scheduler, some of which do not exist yet.
@@ -1029,6 +1047,26 @@ impl AgentBuilder {
 
         Ok(agent)
     }
+}
+
+/// The agent-level slash command registry: the global and configured sources
+/// plus the project commands of the agent's own working directory, with the
+/// diagnostics of files that were skipped.
+fn startup_slash_registry(
+    config: &crate::config::SlashCommandsConfig,
+    cwd: Option<&std::path::Path>,
+) -> (
+    crate::slash_commands::SlashCommandRegistry,
+    Vec<crate::slash_commands::SlashCommandDiagnostic>,
+) {
+    let sources = crate::slash_commands::search_paths_with_global(
+        config.global_dir.as_deref(),
+        cwd,
+        config.include_global,
+        config.include_project,
+        &config.paths,
+    );
+    crate::slash_commands::SlashCommandRegistry::from_sources(&sources, &config.scripts)
 }
 
 #[derive(Clone)]

@@ -198,6 +198,32 @@
 
 ### Behavior changes
 
+- **BREAKING (behaviour): a session reads the slash commands of its own
+  folder.** Fixes `/` not offering, and `/explain` not running, the
+  `.qmt/commands/*.md` of the folder a session was opened in (a `qmtcode`
+  started with its embedded config has no startup directory, so no ordinary
+  session saw any project command). A session outside a managed worktree now
+  uses the project commands of its project root, the Git root of its working
+  directory or the folder itself outside Git, for both the advertised catalog
+  and prompt expansion; an idle session re-resolves from its stored folder the
+  same way. It no longer uses the startup directory's project commands: a
+  command that exists only there is not offered in sessions started elsewhere,
+  and `/deploy` runs the session folder's `deploy.md`, not the startup
+  directory's. A session without a working directory, an agent with command
+  discovery off, and managed worktree sessions are unchanged. Folders above
+  the project root are never searched.
+- **BREAKING (ACP behaviour, additive): command files are read without a
+  restart, and `available_commands_update` can arrive mid-session.** Adding,
+  editing or removing a `.md` file in `~/.qmt/commands` or in an open
+  session's `<project root>/.qmt/commands` updates the session's next prompt
+  and sends its clients an `available_commands_update` with the complete
+  command list, built-ins included. New ephemeral event
+  `AgentEventKind::SlashCommandsChanged { commands }` (never journaled, not
+  replayed); `AgentEventKind` is `#[typeshare]`, so generated types change.
+  Configured `slash_commands.paths`, a `.gitignore`d `.qmt/commands` and a
+  `~/.qmt/commands` created after the agent started are read at the next open
+  or start. querymt-desktop follow-up: regenerate the typeshare types and
+  accept `available_commands_update` at any time.
 - **QueryMT Desktop: button label on light accent presets.** On QueryMT Light
   the label on the Teal, Green and Amber accent presets is now black (it was
   white, 1.9 to 2.5:1 contrast with those fills). A preset's label keeps the

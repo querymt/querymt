@@ -73,6 +73,34 @@ pub fn registry_to_acp_update(registry: &SlashCommandRegistry) -> AvailableComma
     AvailableCommandsUpdate::new(commands)
 }
 
+/// Append the built-ins `host` can run to `update`.
+pub fn append_builtins(
+    update: &mut AvailableCommandsUpdate,
+    host: crate::slash_commands::builtin::BuiltinHost,
+) {
+    use crate::slash_commands::builtin::Builtin;
+    update.available_commands.extend(
+        Builtin::ALL
+            .into_iter()
+            .filter(|builtin| builtin.available(host))
+            .map(Builtin::entry),
+    );
+}
+
+/// The complete catalog a local session advertises: its user commands
+/// (never a reserved built-in name) followed by the built-ins `host` can run.
+pub fn catalog_update(
+    registry: &SlashCommandRegistry,
+    host: crate::slash_commands::builtin::BuiltinHost,
+) -> AvailableCommandsUpdate {
+    let mut update = registry_to_acp_update(registry);
+    update.available_commands.retain(|cmd| {
+        !crate::slash_commands::builtin::Builtin::is_reserved(cmd.name.trim_start_matches('/'))
+    });
+    append_builtins(&mut update, host);
+    update
+}
+
 /// Build a `SessionNotification` that advertises available commands.
 pub fn build_commands_notification(
     session_id: &str,

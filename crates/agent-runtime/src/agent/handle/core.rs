@@ -129,6 +129,7 @@ impl LocalAgentHandle {
             delegation_service: parking_lot::Mutex::new(None),
             admin_cancels: Default::default(),
             shutdown_done: AtomicBool::new(false),
+            slash_global_watch: ParkingMutex::new(None),
         }
     }
 
@@ -214,16 +215,33 @@ impl LocalAgentHandle {
         mut update: crate::acp::protocol::AvailableCommandsUpdate,
         host: crate::slash_commands::builtin::BuiltinHost,
     ) -> crate::acp::protocol::SessionNotification {
-        update.available_commands.extend(
-            crate::slash_commands::builtin::Builtin::ALL
-                .into_iter()
-                .filter(|builtin| builtin.available(host))
-                .map(crate::slash_commands::builtin::Builtin::entry),
-        );
+        crate::slash_commands::acp::append_builtins(&mut update, host);
         crate::acp::protocol::SessionNotification::new(
             session_id.to_owned(),
             crate::acp::protocol::SessionUpdate::AvailableCommandsUpdate(update),
         )
+    }
+
+    /// Read the command files again for every live local session of this
+    /// handle: each rebuilds its registry, expands its next prompt from it,
+    /// and announces the new command list when it changed.
+    pub async fn reload_slash_commands(&self) {
+        let actors: Vec<_> = {
+            let registry = self.registry_lock().await;
+            registry
+                .session_ids()
+                .iter()
+                .filter_map(|id| registry.local_actor_ref(id).cloned())
+                .collect()
+        };
+        for actor in actors {
+            let _ = actor
+                .ask(crate::agent::messages::ReloadSlashCommands)
+                .mailbox_timeout(std::time::Duration::from_secs(5))
+                .reply_timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await;
+        }
     }
 
     /// The user commands a locally hosted session on this handle runs.
@@ -231,7 +249,7 @@ impl LocalAgentHandle {
     /// A live session reports exactly the registry it expands prompts with
     /// ([`SessionRuntime::effective_slash_registry`]), so catalog and
     /// invocation cannot diverge. A session without a live actor re-resolves
-    /// from its bound checkout, falling back to this handle's registry.
+    /// from its project root, falling back to this handle's registry.
     async fn session_user_registry(
         &self,
         session_id: &str,
@@ -239,9 +257,9 @@ impl LocalAgentHandle {
         if let Some(live) = self.live_session_slash_registry(session_id).await {
             return (*live).clone();
         }
-        match self.workspace_catalog_registry(session_id).await {
+        match self.session_catalog_registry(session_id).await {
             Some(registry) => registry,
-            None => self.config.slash_command_registry.clone(),
+            None => (*self.config.slash_command_registry.load_full()).clone(),
         }
     }
 
@@ -264,55 +282,51 @@ impl LocalAgentHandle {
             .ok()
     }
 
-    /// Prompt catalog re-resolved from the session's bound workspace
-    /// checkout, when applicable.
+    /// Prompt catalog re-resolved for a session without a live actor.
     ///
-    /// Returns `None` — keeping the agent-level registry — for local
-    /// sessions, absent workspace service, or disabled/absent discovery
-    /// config.
-    async fn workspace_catalog_registry(
+    /// Uses the same rule the materializer applies: the managed binding's
+    /// effective cwd when the session is bound to a managed checkout (the
+    /// owner, or a shared child such as a non-isolated delegate), otherwise
+    /// the session's stored cwd; both go through
+    /// [`SlashCommandRegistry::registry_for_session_cwd`], so catalog and
+    /// execution agree. No workspace service is required.
+    ///
+    /// Returns `None` — keeping the agent-level registry — for disabled or
+    /// absent discovery config, or a session without a cwd.
+    ///
+    /// [`SlashCommandRegistry::registry_for_session_cwd`]: crate::slash_commands::SlashCommandRegistry::registry_for_session_cwd
+    async fn session_catalog_registry(
         &self,
         session_id: &str,
     ) -> Option<crate::slash_commands::SlashCommandRegistry> {
-        let service = self.config.workspace_service()?;
         let slash_config = self.config.slash_commands_config.as_ref()?;
         if !slash_config.enabled {
             return None;
         }
-        // Same rule the session actor uses to expand prompts: any session
-        // executing inside a managed checkout (the owner, or a shared child
-        // such as a non-isolated delegate) resolves sources from that
-        // checkout's root, so the advertised catalog and execution agree.
-        let root = match service
-            .resolve_existing_session(session_id, None)
-            .await
-            .ok()?
-        {
-            Some(binding) => crate::worktree::resolve_repository(&binding.effective_cwd)
-                .map(|repo| repo.checkout.root)
-                .unwrap_or(binding.effective_cwd),
+        let bound_cwd = match self.config.workspace_service() {
+            Some(service) => service
+                .resolve_existing_session(session_id, None)
+                .await
+                .ok()?
+                .map(|binding| binding.effective_cwd),
+            None => None,
+        };
+        let cwd = match bound_cwd {
+            Some(cwd) => cwd,
             None => {
-                let cwd = self
-                    .config
+                self.config
                     .provider
                     .history_store()
                     .get_session(session_id)
                     .await
                     .ok()??
-                    .cwd?;
-                let repo = crate::worktree::resolve_repository(&cwd).ok()?;
-                service
-                    .registry()
-                    .get_workspace_by_checkout(&repo.checkout.root)
-                    .await
-                    .ok()??;
-                repo.checkout.root
+                    .cwd?
             }
         };
         Some(
-            crate::slash_commands::SlashCommandRegistry::registry_for_workspace(
+            crate::slash_commands::SlashCommandRegistry::registry_for_session_cwd(
                 slash_config,
-                &root,
+                &cwd,
             ),
         )
     }

@@ -40,9 +40,9 @@ pub mod registry;
 pub mod script;
 pub mod types;
 
-#[doc(hidden)]
-pub use discovery::search_paths;
 pub use discovery::{default_search_paths, discover_all, discover_from_source};
+#[doc(hidden)]
+pub use discovery::{global_commands_dir, search_paths, search_paths_with_global};
 pub use expander::{expand_invocation, try_expand, try_parse_invocation};
 pub use parser::parse_command_file;
 pub use registry::SlashCommandRegistry;

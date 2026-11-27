@@ -711,6 +711,14 @@ pub enum AgentEventKind {
     SkillProblemsChanged {
         problems: Vec<SkillProblemInfo>,
     },
+    /// The slash commands the session advertises changed because a command
+    /// file was added, edited or removed. `commands` is the complete current
+    /// `available_commands` array, built-ins included. Live-only: the
+    /// session's catalog is authoritative and is re-read on load and resume.
+    SlashCommandsChanged {
+        #[typeshare(serialized_as = "any")]
+        commands: serde_json::Value,
+    },
     HookNotice {
         event_name: String,
         message: String,
@@ -1261,6 +1269,7 @@ impl AgentEventKind {
             Self::McpServerAuthRequired { .. } => "mcp_server_auth_required",
             Self::TodoPlanRestored { .. } => "todo_plan_restored",
             Self::SkillProblemsChanged { .. } => "skill_problems_changed",
+            Self::SlashCommandsChanged { .. } => "slash_commands_changed",
             Self::HookNotice { .. } => "hook_notice",
             Self::SnapshotStart { .. } => "snapshot_start",
             Self::SnapshotEnd { .. } => "snapshot_end",
@@ -1577,6 +1586,11 @@ pub fn classify_durability(kind: &AgentEventKind) -> Durability {
         // and a durable kind older journal loaders do not know would make
         // stored sessions unreadable there.
         AgentEventKind::SkillProblemsChanged { .. } => Durability::Ephemeral,
+        // Rationale: live hint that the session's command files changed. The
+        // catalog is authoritative (resolved again on load and resume), and a
+        // durable kind older journal loaders do not know would make stored
+        // sessions unreadable there.
+        AgentEventKind::SlashCommandsChanged { .. } => Durability::Ephemeral,
 
         // ── Durable: accounting ledger ──────────────────────────────
         // Rationale: the start must survive a crash to expose unresolved
@@ -2064,6 +2078,12 @@ mod tests {
                 }
             }),
             serde_json::json!({
+                "type": "slash_commands_changed",
+                "data": {
+                    "commands": [{"name": "explain", "description": "Explain"}]
+                }
+            }),
+            serde_json::json!({
                 "type": "worktree_command_output",
                 "data": {
                     "text": "x"
@@ -2386,7 +2406,7 @@ mod tests {
         let samples = one_value_per_variant();
         // Update when a variant is added: `tag()`'s exhaustive match forces
         // the new tag, and this count forces a sample for it.
-        assert_eq!(samples.len(), 106, "one sample per AgentEventKind variant");
+        assert_eq!(samples.len(), 107, "one sample per AgentEventKind variant");
         let mut seen = std::collections::HashSet::new();
         for sample in samples {
             let expected = sample["type"].as_str().unwrap().to_string();
@@ -2577,6 +2597,21 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&kind).unwrap(),
             serde_json::json!({"type": "skill_problems_changed", "data": {"problems": []}})
+        );
+    }
+
+    #[test]
+    fn slash_commands_changed_is_ephemeral() {
+        let kind = AgentEventKind::SlashCommandsChanged {
+            commands: serde_json::json!([{"name": "compact"}]),
+        };
+        assert_eq!(classify_durability(&kind), Durability::Ephemeral);
+        assert_eq!(
+            serde_json::to_value(&kind).unwrap(),
+            serde_json::json!({
+                "type": "slash_commands_changed",
+                "data": {"commands": [{"name": "compact"}]}
+            })
         );
     }
 

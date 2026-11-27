@@ -1754,6 +1754,8 @@ impl SessionMaterializer {
 
         let mut mutation_gate = mutation_gate;
         let mut slash_registry: Option<Arc<crate::slash_commands::SlashCommandRegistry>> = None;
+        // The project root the registry above was resolved from.
+        let mut slash_root: Option<PathBuf> = None;
         let mut activity = None;
         if let (Some(service), Some(cwd)) = (self.workspace_service(), cwd.as_deref())
             && let Ok(repo) = crate::worktree::identity::resolve_repository(cwd)
@@ -1813,6 +1815,7 @@ impl SessionMaterializer {
                         &repo.checkout.root,
                     ),
                 ));
+                slash_root = Some(repo.checkout.root.clone());
             }
             activity = Some(lease);
         }
@@ -1820,6 +1823,27 @@ impl SessionMaterializer {
             return Err(invalid_workspace_request(
                 "managed checkout identity is unavailable; refusing actor startup",
             ));
+        }
+        // Every other local session reads its project commands from its own
+        // project root (the Git root of its cwd, else the cwd itself), the
+        // same rule the idle catalog uses. A session without a cwd, or an
+        // agent with discovery off, keeps the agent-level registry.
+        if slash_registry.is_none()
+            && let (Some(slash_config), Some(cwd)) = (
+                self.config
+                    .slash_commands_config
+                    .as_ref()
+                    .filter(|config| config.enabled),
+                cwd.as_deref(),
+            )
+        {
+            let (root, registry) =
+                crate::slash_commands::SlashCommandRegistry::registry_with_root_for_session_cwd(
+                    slash_config,
+                    cwd,
+                );
+            slash_registry = Some(Arc::new(registry));
+            slash_root = Some(root);
         }
         let tool_state = crate::agent::core::McpToolState::empty();
         let connect_ctx =
@@ -1915,8 +1939,19 @@ impl SessionMaterializer {
         let runtime = SessionRuntime::new(cwd.clone(), mcp_services, tool_state);
         let _ = runtime.managed_checkout.set(mutation_gate.is_some());
         if let Some(registry) = slash_registry {
+            runtime.slash_registry.store(Some(registry));
+        }
+        crate::agent::slash_reload::record_announced(&self.config, &runtime);
+        if let Some(root) = slash_root {
             // Freshly created runtime, so this cannot already be initialized.
-            let _ = runtime.slash_registry.set(registry);
+            let _ = runtime.slash_project_root.set(root);
+            // Command files of the project root are read again when they
+            // change; the watcher ends with the runtime.
+            crate::agent::slash_reload::spawn_session_watch(
+                self.config.clone(),
+                &runtime,
+                session_id.clone(),
+            );
         }
         if let Some(activity) = activity {
             let _ = runtime.workspace_activity.set(activity);

@@ -1652,11 +1652,13 @@ fn materialize_replay_state(
             AgentEventKind::CompactionSummaryChunk { .. }
             | AgentEventKind::HookNotice { .. }
             | AgentEventKind::SkillProblemsChanged { .. }
+            | AgentEventKind::SlashCommandsChanged { .. }
             | AgentEventKind::MiddlewareStopped { .. }
             | AgentEventKind::OutputLimitRecovery { .. } => {
                 // Live-only content: notices (hook, skill problem, stop and recovery) are never
-                // replayed and summary chunks would duplicate the materialized
-                // terminal summary.
+                // replayed, a command list change is superseded by the catalog
+                // the load response carries, and summary chunks would duplicate
+                // the materialized terminal summary.
             }
             AgentEventKind::ToolCallStart { .. } => {
                 if let Some(entries) = todo_plan_of(&event.kind) {
@@ -3245,6 +3247,19 @@ impl AcpLiveEventTranslator {
                     return Vec::new();
                 }
                 vec![SessionUpdate::Notice(skill_problems_notice(problems))]
+            }
+            AgentEventKind::SlashCommandsChanged { commands } => {
+                match serde_json::from_value::<Vec<crate::acp::protocol::AvailableCommand>>(
+                    commands.clone(),
+                ) {
+                    Ok(commands) => vec![SessionUpdate::AvailableCommandsUpdate(
+                        crate::acp::protocol::AvailableCommandsUpdate::new(commands),
+                    )],
+                    Err(error) => {
+                        log::warn!("ignoring malformed slash command list: {error}");
+                        Vec::new()
+                    }
+                }
             }
             AgentEventKind::MiddlewareStopped {
                 stop_type, reason, ..
@@ -8973,6 +8988,30 @@ mod session_update_tests {
             [] => None,
             [update @ SessionUpdate::Notice(_)] => Some(serde_json::to_value(update).unwrap()),
             other => panic!("expected at most one notice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_commands_changed_becomes_available_commands_update() {
+        let mut translator = AcpLiveEventTranslator::new();
+        let commands = serde_json::json!([
+            {"name": "standup", "description": "Daily standup"},
+            {"name": "compact", "description": "Compact the conversation"},
+        ]);
+        let updates = translator.translate_updates(&envelope(
+            1,
+            AgentEventKind::SlashCommandsChanged { commands },
+        ));
+        match updates.as_slice() {
+            [SessionUpdate::AvailableCommandsUpdate(update)] => {
+                let names: Vec<&str> = update
+                    .available_commands
+                    .iter()
+                    .map(|command| command.name.as_str())
+                    .collect();
+                assert_eq!(names, ["standup", "compact"]);
+            }
+            other => panic!("expected one available_commands_update, got {other:?}"),
         }
     }
 

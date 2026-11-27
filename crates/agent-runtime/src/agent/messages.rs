@@ -305,6 +305,10 @@ pub struct GetLlmConfig;
 /// authority. Not serializable: it never crosses the mesh.
 pub struct GetSessionSlashRegistry;
 
+/// Local-only: read the slash command files again (a global command file
+/// changed). Not serializable: it never crosses the mesh.
+pub struct ReloadSlashCommands;
+
 // ══════════════════════════════════════════════════════════════════════════
 //  Undo / Redo
 // ══════════════════════════════════════════════════════════════════════════

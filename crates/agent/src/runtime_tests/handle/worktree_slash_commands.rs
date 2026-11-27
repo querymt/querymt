@@ -2,11 +2,12 @@
 //!
 //! Managed sessions advertise and expand slash commands from their own
 //! bound checkout — including commands that exist only in the isolated
-//! checkout — while global command policy, scripts-disabled behavior,
-//! native `/worktree` interception, and legacy local sessions keep their
-//! existing behavior. Expansion is exercised through real handle/actor
-//! prompt execution, before and after load/resume, not just registry
-//! discovery.
+//! checkout — while global command policy, scripts-disabled behavior and
+//! native `/worktree` interception keep their existing behavior. Other
+//! local sessions read the commands of their own folder (see
+//! `session_project_commands`). Expansion is exercised through real
+//! handle/actor prompt execution, before and after load/resume, not just
+//! registry discovery.
 
 use super::*;
 
@@ -29,7 +30,7 @@ fn workspace_slash_config() -> crate::config::SlashCommandsConfig {
     }
 }
 
-fn test_command(name: &str, template: &str) -> crate::slash_commands::SlashCommand {
+pub(super) fn test_command(name: &str, template: &str) -> crate::slash_commands::SlashCommand {
     crate::slash_commands::SlashCommand {
         arguments: None,
         name: name.to_string(),
@@ -48,16 +49,23 @@ fn test_command(name: &str, template: &str) -> crate::slash_commands::SlashComma
 
 /// Agent-level registry whose definitions deliberately differ from the
 /// checkout's, so a passing test proves the workspace copy was used.
-fn agent_level_registry() -> crate::slash_commands::SlashCommandRegistry {
+pub(super) fn agent_level_registry() -> crate::slash_commands::SlashCommandRegistry {
     let mut registry = crate::slash_commands::SlashCommandRegistry::new();
     registry.register(test_command("deploy", "AGENTLEVEL-DEPLOY: $ARGUMENTS"));
     registry.register(test_command("agent-only", "AGENTLEVEL-ONLY: $ARGUMENTS"));
     registry
 }
 
-async fn slash_worktree_fixture(
+/// Builder, storage and plugin dir shared by the slash-command fixtures:
+/// a mock provider and the given agent-level registry and discovery config.
+pub(super) async fn slash_builder(
     agent_registry: crate::slash_commands::SlashCommandRegistry,
-) -> SlashWorktreeFixture {
+    slash_config: Option<crate::config::SlashCommandsConfig>,
+) -> (
+    AgentConfigBuilder,
+    std::sync::Arc<crate::session::sqlite_storage::SqliteStorage>,
+    tempfile::TempDir,
+) {
     let provider = Arc::new(Mutex::new(MockLlmProvider::new()));
     provider
         .lock()
@@ -84,8 +92,15 @@ async fn slash_worktree_fixture(
     )
     .with_tool_policy(ToolPolicy::ProviderOnly)
     .with_slash_command_registry(agent_registry)
-    .with_slash_commands_config(Some(workspace_slash_config()));
+    .with_slash_commands_config(slash_config);
+    (builder, storage, plugin_dir)
+}
 
+async fn slash_worktree_fixture(
+    agent_registry: crate::slash_commands::SlashCommandRegistry,
+) -> SlashWorktreeFixture {
+    let (builder, storage, plugin_dir) =
+        slash_builder(agent_registry, Some(workspace_slash_config())).await;
     let repo = crate::worktree::test_support::init_repo();
     let storage_root = tempfile::TempDir::new().unwrap();
     let service = Arc::new(crate::worktree::WorkspaceService::new(
@@ -107,7 +122,7 @@ async fn slash_worktree_fixture(
     }
 }
 
-async fn prompt(
+pub(super) async fn prompt(
     handle: &LocalAgentHandle,
     session_id: &str,
     text: &str,
@@ -128,9 +143,16 @@ async fn prompt(
 /// after slash-command expansion, so this reflects what the actor actually
 /// executed — not merely what a registry contains.
 async fn stored_user_text(f: &SlashWorktreeFixture, session_id: &str) -> String {
+    stored_user_text_in(&f.storage, session_id).await
+}
+
+pub(super) async fn stored_user_text_in(
+    storage: &crate::session::sqlite_storage::SqliteStorage,
+    session_id: &str,
+) -> String {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        match f.storage.session_store().get_history(session_id).await {
+        match storage.session_store().get_history(session_id).await {
             Ok(messages) => {
                 if let Some(text) = messages.iter().rev().find_map(|message| {
                     if !matches!(message.role, querymt::chat::ChatRole::User) {
@@ -159,8 +181,7 @@ async fn stored_user_text(f: &SlashWorktreeFixture, session_id: &str) -> String 
             Err(err) => panic!("history lookup failed for {session_id}: {err}"),
         }
         if tokio::time::Instant::now() >= deadline {
-            let all = f
-                .storage
+            let all = storage
                 .session_store()
                 .get_history(session_id)
                 .await
@@ -182,7 +203,9 @@ async fn native_command(
     Ok(response.meta.unwrap()["querymt.worktree"].clone())
 }
 
-fn advertised_names(notification: &crate::acp::protocol::SessionNotification) -> Vec<String> {
+pub(super) fn advertised_names(
+    notification: &crate::acp::protocol::SessionNotification,
+) -> Vec<String> {
     serde_json::to_value(notification).expect("serialize catalog")["update"]["availableCommands"]
         .as_array()
         .expect("availableCommands")
@@ -251,7 +274,8 @@ async fn managed_sessions_expand_and_advertise_their_own_checkout_commands() {
         ],
     );
 
-    // Legacy local session: the agent-level registry still drives expansion.
+    // Unmanaged local session: its own folder's commands drive expansion,
+    // not the agent-level registry.
     let source = f
         .handle
         .new_session(crate::acp::protocol::NewSessionRequest::new(
@@ -266,8 +290,8 @@ async fn managed_sessions_expand_and_advertise_their_own_checkout_commands() {
     assert!(
         stored_user_text(&f, &source_id)
             .await
-            .contains("AGENTLEVEL-DEPLOY: from-source"),
-        "legacy local sessions keep the agent-level registry"
+            .contains("ROOT-DEPLOY: from-source"),
+        "an unmanaged local session expands its own folder's definition"
     );
 
     // Isolated child materializes with the workspace registry.

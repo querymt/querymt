@@ -341,7 +341,14 @@ async fn disabled_guard_config_yields_no_guard() -> Result<()> {
 #[tokio::test]
 async fn programmatic_builder_does_not_discover_slash_commands_by_default() -> Result<()> {
     let agent = test_agent().await?;
-    assert!(agent.handle().config.slash_command_registry.is_empty());
+    assert!(
+        agent
+            .handle()
+            .config
+            .slash_command_registry
+            .load()
+            .is_empty()
+    );
     Ok(())
 }
 
@@ -361,9 +368,17 @@ async fn slash_commands_config_disabled_does_not_scan_filesystem() -> Result<()>
         include_project: false,
         paths: vec![commands],
         scripts: Default::default(),
+        global_dir: None,
     })
     .await?;
-    assert!(agent.handle().config.slash_command_registry.is_empty());
+    assert!(
+        agent
+            .handle()
+            .config
+            .slash_command_registry
+            .load()
+            .is_empty()
+    );
     Ok(())
 }
 
@@ -383,6 +398,7 @@ async fn slash_commands_config_enabled_discovers_configured_paths() -> Result<()
         include_project: false,
         paths: vec![commands],
         scripts: Default::default(),
+        global_dir: None,
     })
     .await?;
     assert!(
@@ -390,6 +406,7 @@ async fn slash_commands_config_enabled_discovers_configured_paths() -> Result<()
             .handle()
             .config
             .slash_command_registry
+            .load()
             .get("docs")
             .is_some()
     );
@@ -451,6 +468,7 @@ paths = ["{extra}"]
             .handle()
             .config
             .slash_command_registry
+            .load()
             .get("docs")
             .is_some()
     );
@@ -459,6 +477,7 @@ paths = ["{extra}"]
             .handle()
             .config
             .slash_command_registry
+            .load()
             .get("project")
             .is_none(),
         "include_project=false must not scan <cwd>/.qmt/commands"
@@ -484,6 +503,7 @@ include_project = true
             .handle()
             .config
             .slash_command_registry
+            .load()
             .get("project")
             .is_some()
     );
@@ -492,6 +512,7 @@ include_project = true
             .handle()
             .config
             .slash_command_registry
+            .load()
             .get("docs")
             .is_none()
     );
@@ -5759,5 +5780,59 @@ async fn remote_list_entries_have_no_plans_key() -> Result<()> {
     let meta = page.sessions[0].meta.as_ref().unwrap();
     assert_eq!(meta["location"], "remote");
     assert!(!meta.contains_key("querymt/plans"));
+    Ok(())
+}
+
+/// A built agent watches its global command folder: a new file there reaches
+/// an open session as a command list update, and the agent-level registry.
+#[tokio::test]
+async fn built_agent_reads_global_command_files_without_a_restart() -> Result<()> {
+    let global = tempfile::TempDir::new()?;
+    let agent = agent_with_slash_config(SlashCommandsConfig {
+        enabled: true,
+        include_global: true,
+        include_project: false,
+        paths: vec![],
+        scripts: Default::default(),
+        global_dir: Some(global.path().to_path_buf()),
+    })
+    .await?;
+    let handle = agent.handle();
+    let session = handle
+        .new_session(crate::acp::protocol::NewSessionRequest::new(
+            std::path::PathBuf::new(),
+        ))
+        .await?
+        .session_id
+        .to_string();
+    let mut events = handle.subscribe_events();
+
+    std::fs::write(
+        global.path().join("standup.md"),
+        "---\ndescription: Daily standup\n---\nSTANDUP\n",
+    )?;
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("an update arrives")?;
+        if event.session_id() == session
+            && let crate::events::AgentEventKind::SlashCommandsChanged { commands } = event.kind()
+            && commands
+                .as_array()
+                .is_some_and(|list| list.iter().any(|command| command["name"] == "standup"))
+        {
+            break;
+        }
+    }
+    assert!(
+        handle
+            .config
+            .slash_command_registry
+            .load()
+            .get("standup")
+            .is_some()
+    );
     Ok(())
 }

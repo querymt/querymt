@@ -109,6 +109,14 @@ pub struct SlashCommandsConfig {
     /// Script execution configuration
     #[serde(default)]
     pub scripts: crate::slash_commands::SlashCommandScriptsConfig,
+
+    /// Replaces the global command folders (`~/.qmt/commands` and the
+    /// config directory's `commands`) when `include_global` is set. Not a
+    /// configuration key: it exists so tests can point the global folder at
+    /// a temporary directory.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub global_dir: Option<PathBuf>,
 }
 
 impl Default for SlashCommandsConfig {
@@ -119,6 +127,7 @@ impl Default for SlashCommandsConfig {
             include_project: true,
             paths: vec![],
             scripts: crate::slash_commands::SlashCommandScriptsConfig::default(),
+            global_dir: None,
         }
     }
 }
