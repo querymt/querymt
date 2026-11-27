@@ -33,7 +33,8 @@ Paths are relative to `crates/querymt-gpui`. Verification commands (from the wor
   - `palette_sends_a_command_without_input` and `palette_command_is_queued_while_running` pass unchanged (spec: Command without input, Palette command during a running turn).
 - [x] 3.2 Draw every slash row with the custom child: `…` for required input, the `Prompt` mark, and the reason in place of the description; add source and `prompt` keywords (design D5). Verify: tests `required_input_rows_end_with_an_ellipsis`, `prompt_commands_are_marked`, `palette_searches_the_source` (spec: Required and optional input side by side, Prompt command is marked, Palette searches the source); `palette_lists_session_commands` passes with the description still on the second line.
   - Done: `required_input_rows_end_with_an_ellipsis`, `prompt_commands_are_marked`, `palette_searches_the_source` pass; `palette_lists_session_commands` passes. A slash row without a description, mark or reason keeps the kit's default row (same look, same height).
-- [ ] 3.3 Check row layout by hand on macOS at the palette's 560 px width, light and dark themes, with the longest advertised name and a row that has both `…` and `Prompt`: the name truncates before the mark and the row height does not change. Verify: record the result here.
+- [x] 3.3 Check row layout by hand on macOS at the palette's 560 px width, light and dark themes, with the longest advertised name and a row that has both `…` and `Prompt`: the name truncates before the mark and the row height does not change. Verify: record the result here.
+  - Done by hand on macOS, command palette (Cmd-P) at 560 px, build of 5e0015330, with `explain` (user command, `…` and `Prompt`) and a command with a very long name. Light: pass. Dark: pass. The long name truncates before the `Prompt` mark, row heights match the `compact` row, and the mark is readable.
 - [x] 3.4 Handle Tab on the palette card and add the footer key hint with `Command::footer` (design D6). Verify: tests `tab_adds_arguments_to_an_optional_command`, `tab_on_a_command_without_input_does_nothing`, `key_hint_shows_for_an_optional_input_command` (spec: Adding arguments to an optional-input command, Tab on a command without input, Key hint for an optional-input command); a test that Tab on an Actions row changes nothing.
   - Done: tests `tab_adds_arguments_to_an_optional_command`, `tab_on_a_command_without_input_does_nothing` (includes an Actions row), `key_hint_shows_for_an_optional_input_command` pass. Tab is bound to the search field's `IndentInline` action, which runs before key-down listeners, so the palette card captures that action as well as the key-down. The footer reads the highlight from the `CommandState` it is given at render, so `Command::on_select` is not needed.
 - [x] 3.5 Keep the composer's draft when prefilling (design D7). Verify: test `composer_draft_becomes_the_arguments` in `src/ui/keys.rs` (spec scenario of the same name), and `completion_replaces_the_first_word_and_keeps_the_arguments` in `src/ui/slash.rs` passes unchanged.
@@ -46,13 +47,20 @@ Paths are relative to `crates/querymt-gpui`. Verification commands (from the wor
 
 - [x] 4.1 Run the four verification commands. Verify: all pass; record the counts here.
   - Done: `cargo nextest run --package querymt-gpui --bins --locked`: 854 passed, 7 skipped; 856 passed, 7 skipped after the path-draft fix. `cargo clippy --package querymt-gpui --all-targets --locked -- -D warnings`: clean. `cargo fmt -p querymt-gpui -- --check`: clean. wasm32 build: finished (one existing warning, `tip_with_key` unused, also present without this change).
-- [ ] 4.2 Against a querymt agent built with `add-slash-command-records`, by hand on macOS:
+- [x] 4.2 Against a querymt agent built with `add-slash-command-records`, by hand on macOS:
   - `compact` runs on Enter and Tab puts `/compact ` in the composer;
   - a user command shows `…` and `Prompt`. Put the file in `~/.qmt/commands` unless `add-session-project-commands` has landed: until then a session does not read its own folder's `.qmt/commands`;
   - `worktree…` is unavailable during a turn, in the palette and when typed. `/worktree` is only advertised when managed worktrees are on (`[agent.workspace]` in the agent config); the embedded `qmtcode` config has them off;
   - `/tmp/x is broken` can be steered into a running turn;
   - an agent without the descriptor behaves as before.
   Verify: each item noted here as pass or fail.
+  - Done by hand on macOS in the command palette (Cmd-P; the composer's inline `/` popup is a different control and has no marks), build of 5e0015330 against `qmtcode` built after `add-slash-command-records`:
+    - `compact`: pass. The footer shows `Enter to run` and `Tab to add arguments` on `compact` and not on `explain`. Enter runs it at once. Tab puts `/compact ` in the composer with the caret at the end and sends nothing.
+    - user command shows `…` and `Prompt`: pass (`explain` in `~/.qmt/commands`).
+    - `worktree…`: pass. Idle: Enter prefills `/worktree `. During a turn the row is dimmed with a reason, picking it sends nothing, and typing `/worktree list` is refused.
+    - `/tmp/x is broken` is steered into a running turn: pass.
+    - agent without the descriptor: not checked by hand, it needs an older agent build. Covered by the test `command_without_a_descriptor`.
+    - A user command stays available during a turn: it advertises `prompt` and `queue`, so only prompt-only commands such as `worktree` are blocked.
 - [x] 4.3 Run `openspec validate slash-command-actions --type change --strict --no-interactive`. Verify: it passes.
   - Done: `openspec validate slash-command-actions --type change --strict --no-interactive` passes.
 
