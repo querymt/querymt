@@ -34,9 +34,9 @@ The response SHALL be `{ "accounts": [ … ] }` with one entry per provider carr
 
 For each HTTP provider the agent SHALL resolve the configuration and credential exactly as it does when listing that provider's catalog (preferred auth method, then OAuth with refresh, stored API key, environment variable) and SHALL pass the resulting pruned configuration to the factory's account query.
 
-#### Scenario: OAuth token reaches the factory
-- **WHEN** a provider's preferred method is OAuth and valid tokens are stored
-- **THEN** the factory's account query receives a configuration whose `api_key` is the OAuth access token
+#### Scenario: Resolved credential reaches the factory
+- **WHEN** a provider's credential resolves through the model-listing chain
+- **THEN** the factory's account query receives a configuration whose `api_key` is that credential (an OAuth access token when OAuth is the active method)
 
 ### Requirement: Providers without a credential or an HTTP factory are reported, not queried
 
@@ -52,7 +52,7 @@ A provider with no usable credential SHALL be reported as `unauthenticated`; an 
 
 ### Requirement: Snapshot failures are reported per provider
 
-A factory error (HTTP failure, classified status, parse failure, timeout) SHALL make that provider's entry `error` with a message, and SHALL NOT fail the whole call or affect other providers' entries. Each provider's query SHALL be bounded by a 10-second timeout and providers SHALL be queried concurrently.
+A factory error (HTTP failure, classified status, parse failure, timeout) SHALL make that provider's entry `error` with a message, and SHALL NOT fail the whole call or affect other providers' entries. Each provider's credential resolution plus account request SHALL be bounded by a 10-second timeout (loading the provider plugin is not counted) and providers SHALL be queried concurrently.
 
 #### Scenario: One failing provider does not hide the others
 - **WHEN** two providers are queried and one endpoint answers 503 while the other returns a snapshot
@@ -74,6 +74,6 @@ The agent SHALL cache `ok` and `unsupported` entries per provider for 60 seconds
 - **WHEN** a client calls the method with `refresh: true` within the TTL
 - **THEN** the provider's endpoint is queried again and `fetched_at` advances
 
-#### Scenario: Logout invalidates the cache
-- **WHEN** a provider returned `ok` and the client then calls `querymt/auth/logout` for it and queries accounts again within the TTL
-- **THEN** the provider is re-evaluated and reported as `unauthenticated` or `unsupported` according to its remaining credentials
+#### Scenario: An auth mutation invalidates the cache
+- **WHEN** a provider returned `ok` and the client then changes its credentials through an auth method (for example `querymt/auth/setApiToken` or `logout`) and queries accounts again within the TTL
+- **THEN** the provider's account is fetched again instead of served from the cache

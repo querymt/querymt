@@ -290,3 +290,68 @@ async fn static_auth_extensions_filter_status_and_validate_without_credentials()
             .contains("unknown auth method")
     );
 }
+
+#[tokio::test]
+async fn account_method_rejects_unknown_provider() {
+    let f = HandleFixture::new().await;
+    let req = crate::acp::protocol::ExtRequest::new(
+        "querymt/auth/account",
+        raw_params(r#"{"provider":"nope"}"#),
+    );
+
+    let err = f
+        .handle
+        .ext_method(req)
+        .await
+        .expect_err("unknown provider must be rejected");
+
+    assert_eq!(err.code, agent_client_protocol::ErrorCode::INVALID_PARAMS);
+}
+
+#[tokio::test]
+async fn account_method_rejects_malformed_params() {
+    let f = HandleFixture::new().await;
+    let req = crate::acp::protocol::ExtRequest::new(
+        "querymt/auth/account",
+        raw_params(r#"{"refresh":"yes"}"#),
+    );
+
+    let err = f
+        .handle
+        .ext_method(req)
+        .await
+        .expect_err("malformed params must be rejected");
+
+    assert_eq!(err.code, agent_client_protocol::ErrorCode::INVALID_PARAMS);
+}
+
+#[tokio::test]
+async fn account_method_answers_for_a_local_provider() {
+    let fixture = crate::test_utils::TestAgent::new().await;
+    let shared = crate::test_utils::SharedLlmProvider::new(
+        crate::test_utils::MockLlmProvider::new(),
+        vec![],
+    );
+    // Without an API key name the mock factory is not HTTP-based.
+    fixture
+        .config
+        .provider
+        .plugin_registry()
+        .register_static(std::sync::Arc::new(
+            crate::test_utils::TestProviderFactory::new(shared),
+        ));
+
+    let result = ext_method_json(
+        &fixture.handle,
+        "querymt/auth/account",
+        serde_json::json!({ "provider": "mock" }),
+    )
+    .await;
+
+    let accounts = result["accounts"].as_array().expect("accounts array");
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0]["provider"], "mock");
+    assert_eq!(accounts[0]["status"], "unsupported");
+    assert!(accounts[0].get("account").is_none());
+    assert!(accounts[0]["fetched_at"].is_i64());
+}

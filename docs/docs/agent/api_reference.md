@@ -410,6 +410,41 @@ This repository defines the payload only. The desktop client must be updated tog
 - Existing sessions keep their history. Local generation recorded before accounting has no basis and is reported as `unaccountedGenerations`, so such a session never claims a complete total, and no historical rates are applied.
 - Rollback needs matching binaries and a database copy taken before the upgrade. Do not run an older event decoder against a journal containing the new events, and do not delete accounting events to make a rollback succeed.
 
+### Provider accounts (ACP)
+
+`querymt/auth/account` reports what each provider says about the credential QueryMT uses for it: an optional plan, usage limits and credits. This is provider-reported data (for example a subscription's weekly window), not QueryMT's own cost accounting. Servers that support it list the method under `methods` in `querymt/capabilities` and set `features.auth_account: true`.
+
+Request params are optional: `provider` limits the answer to one configured provider (an unknown name is an invalid-params error) and `refresh: true` ignores cached answers.
+
+```json
+{"method": "querymt/auth/account", "params": {"provider": "codex"}}
+```
+
+```json
+{
+  "accounts": [
+    {
+      "provider": "codex",
+      "status": "ok",
+      "fetched_at": 1795739430,
+      "account": {
+        "plan": "pro",
+        "limits": [
+          {"id": "primary", "used_percent": 99.0, "window_seconds": 604800, "resets_at": 1795798468, "reached": false}
+        ],
+        "credits": {"balance": "12701.63", "unlimited": false}
+      }
+    }
+  ]
+}
+```
+
+- `status` is `ok` (with `account`), `unsupported` (this provider or credential has no account data, for example most API keys and local models), `unauthenticated` (no usable credential; a failed OAuth refresh that needs a new login carries its message in `error`) or `error` (with `error`). `fetched_at` (Unix seconds) is present for `ok` and `unsupported`.
+- Credentials are resolved as for model listing. Providers are queried concurrently; each credential resolution plus account request is bounded by 10 seconds, and one failing provider never fails the call.
+- `ok` and `unsupported` answers are cached per provider for 60 seconds; login, logout and the other `querymt/auth/*` mutations clear the cache. A credential changed elsewhere (environment, config) is picked up when the entry expires or with `refresh`.
+- The method is pull-only. A client that shows usage should re-pull with `refresh: true` after a turn ends. Status messages never contain the credential, the request path or the response body.
+- The `account` shape is described in [Account snapshots](../plugins/interface_spec.md#3-account-snapshots).
+
 ## Delegation
 
 ### Delegation

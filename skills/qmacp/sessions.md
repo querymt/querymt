@@ -12,9 +12,14 @@ qmacp --quiet profiles
 qmacp --quiet models
 qmacp --quiet models --query '<term>' --provider '<provider>'
 qmacp --quiet models --refresh
+qmacp --quiet account                       # plan, usage limits, credits per provider
+qmacp --quiet account --provider codex --refresh
 ```
 
 Do not invent profile/model IDs. Refresh only when a fresh provider scan is needed.
+`account` answers are cached for 60 s on the server; `--refresh` asks the
+providers again. Each entry has `status` `ok`, `unsupported`, `unauthenticated`
+or `error`; only `ok` carries `account`.
 `caps.querymt == null` means ACP initialize succeeded but QueryMT extension
 capability discovery did not.
 

@@ -250,6 +250,36 @@ macro_rules! impl_extism_http_plugin {
             Ok(Json(models))
         }
 
+        // Account snapshot (request/parse split, like model listing). `None`
+        // means this provider or credential has no account data.
+        #[plugin_fn]
+        pub fn account_request(
+            Json(input): Json<querymt::plugin::extism_impl::ExtismAccountRequest>,
+        ) -> FnResult<Json<Option<querymt::plugin::extism_impl::SerializableHttpRequest>>> {
+            let cfg_str = serde_json::to_string(&input.cfg).map_err(PdkError::new)?;
+            let req = HTTPLLMProviderFactory::account_request(&$Factory, &cfg_str)
+                .map_err(llm_err_to_pdk)?;
+            Ok(Json(req.map(|req| {
+                querymt::plugin::extism_impl::SerializableHttpRequest { req }
+            })))
+        }
+
+        #[plugin_fn]
+        pub fn parse_account_response(
+            Json(input): Json<querymt::plugin::extism_impl::ExtismAccountParseRequest>,
+        ) -> FnResult<Json<querymt::plugin::ProviderAccount>> {
+            let account = HTTPLLMProviderFactory::parse_account(&$Factory, input.resp.resp)
+                .map_err(llm_err_to_pdk)?;
+            Ok(Json(account))
+        }
+
+        // Hosts the account request may target besides the base-URL host;
+        // the host reads this once at load.
+        #[plugin_fn]
+        pub fn account_hosts() -> FnResult<Json<Vec<String>>> {
+            Ok(Json(HTTPLLMProviderFactory::account_hosts(&$Factory)))
+        }
+
         // Hosts only send per-request options to plugins that advertise
         // support here, and only open streams when `streaming` is set.
         #[plugin_fn]

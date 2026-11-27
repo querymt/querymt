@@ -14,15 +14,16 @@ use crate::{
     embedding::{EmbeddingProvider, http::HTTPEmbeddingProvider},
     error::LLMError,
     plugin::{
-        Fut, HTTPLLMProviderFactory, LLMProviderFactory,
+        AccountReport, Fut, HTTPLLMProviderFactory, LLMProviderFactory, ProviderAccount,
         extism_impl::{
-            ExtismChatChunk, ExtismChatChunkParseRequest, ExtismChatParseRequest,
-            ExtismChatPrepareRequest, ExtismChatRequest, ExtismChatResponse,
-            ExtismChatStreamParserRequest, ExtismCompleteParseRequest, ExtismEmbedParseRequest,
-            ExtismEmbedRequest, ExtismListModelsParseRequest, ExtismListModelsRequest,
-            ExtismPreparedChatRequest, ExtismSttRequest, ExtismSttResponse, ExtismTtsRequest,
-            ExtismTtsResponse, ExtismVoiceConfig, ITEM_AWARE_CHAT_CONTRACT_VERSION,
-            PREPARED_CHAT_CONTRACT_VERSION, SerializableHttpRequest, SerializableHttpResponse,
+            ExtismAccountParseRequest, ExtismAccountRequest, ExtismChatChunk,
+            ExtismChatChunkParseRequest, ExtismChatParseRequest, ExtismChatPrepareRequest,
+            ExtismChatRequest, ExtismChatResponse, ExtismChatStreamParserRequest,
+            ExtismCompleteParseRequest, ExtismEmbedParseRequest, ExtismEmbedRequest,
+            ExtismListModelsParseRequest, ExtismListModelsRequest, ExtismPreparedChatRequest,
+            ExtismSttRequest, ExtismSttResponse, ExtismTtsRequest, ExtismTtsResponse,
+            ExtismVoiceConfig, ITEM_AWARE_CHAT_CONTRACT_VERSION, PREPARED_CHAT_CONTRACT_VERSION,
+            SerializableHttpRequest, SerializableHttpResponse,
             messages_require_item_aware_contract,
         },
     },
@@ -128,6 +129,31 @@ pub struct ExtismFactory {
     name: String,
     user_data: Option<extism::UserData<functions::HostState>>,
     allowed_hosts: Vec<String>,
+    /// Hosts the plugin declared for account requests through its optional
+    /// `account_hosts` export. Used only by the account host check; never part
+    /// of the plugin's own HTTP reach.
+    account_hosts: Vec<String>,
+}
+
+/// Reads the plugin's optional `account_hosts` export; a plugin without it, or
+/// one whose export fails, declares no hosts.
+fn read_account_hosts(plugin: &Mutex<Plugin>) -> Vec<String> {
+    let mut plug = plugin.lock().unwrap();
+    if !plug.function_exists("account_hosts") {
+        return Vec::new();
+    }
+    match plug.call::<_, Json<Vec<String>>>("account_hosts", ()) {
+        Ok(Json(hosts)) => hosts.into_iter().filter(|h| !h.is_empty()).collect(),
+        Err(error) => {
+            log::warn!("Ignoring plugin account_hosts export that failed: {error:#}");
+            Vec::new()
+        }
+    }
+}
+
+/// An empty allow-list allows every host, as for plugin-initiated HTTP.
+fn host_is_allowed(allowed_hosts: &[String], host: &str) -> bool {
+    allowed_hosts.is_empty() || allowed_hosts.iter().any(|h| h == host)
 }
 
 fn call_plugin_str(plugin: Arc<Mutex<Plugin>>, func: &str, arg: &Value) -> anyhow::Result<String> {
@@ -264,12 +290,14 @@ impl ExtismFactory {
         let plugin_default_base_url =
             call_plugin_str(init_plugin.clone(), "base_url", &Value::Null).ok();
         let allowed_hosts = build_allowed_hosts(config, plugin_default_base_url.as_deref())?;
+        let account_hosts = read_account_hosts(&init_plugin);
         drop(init_plugin);
 
         log::debug!(
-            "Extism provider '{}' allowed hosts: {}",
+            "Extism provider '{}' allowed hosts: {}; account hosts: {}",
             name,
-            allowed_hosts.join(", ")
+            allowed_hosts.join(", "),
+            account_hosts.join(", ")
         );
 
         let manifest = Manifest::new([Wasm::data(wasm_content)])
@@ -311,6 +339,7 @@ impl ExtismFactory {
             name,
             user_data: Some(user_data),
             allowed_hosts,
+            account_hosts,
         })
     }
 
@@ -320,6 +349,22 @@ impl ExtismFactory {
 
     fn validate_runtime_base_url(&self, cfg: &Value) -> Result<(), LLMError> {
         validate_runtime_base_url(&self.name, &self.allowed_hosts, cfg)
+    }
+
+    /// The host runs account requests itself, outside the plugin's HTTP host
+    /// functions, so it applies the allow-list here: a request goes only to an
+    /// allowed host or one the plugin declared at load.
+    fn check_account_host(&self, req: &http::Request<Vec<u8>>) -> Result<(), LLMError> {
+        let host = req.uri().host().unwrap_or_default();
+        if host_is_allowed(&self.allowed_hosts, host)
+            || self.account_hosts.iter().any(|h| h == host)
+        {
+            return Ok(());
+        }
+        Err(LLMError::InvalidRequest(format!(
+            "Provider '{}' account request host '{}' is not allowed by the loaded plugin manifest. Add it to [providers.config].allowed_hosts.",
+            self.name, host
+        )))
     }
 
     fn validate_plugin_config(&self, cfg: &Value) -> Result<(), LLMError> {
@@ -345,7 +390,7 @@ fn validate_runtime_base_url(
             provider_name, base_url
         )));
     };
-    if allowed_hosts.is_empty() || allowed_hosts.iter().any(|h| h == &host) {
+    if host_is_allowed(allowed_hosts, &host) {
         return Ok(());
     }
 
@@ -486,6 +531,44 @@ impl LLMProviderFactory for ExtismFactory {
         .boxed()
     }
 
+    fn account<'a>(&'a self, cfg: &str) -> Fut<'a, Result<AccountReport, LLMError>> {
+        if !self.supports_http_adapter_abi() {
+            return Box::pin(async { Ok(AccountReport::Unsupported) });
+        }
+
+        let factory = self.clone();
+        let cfg = cfg.to_owned();
+        let caller_span = tracing::Span::current();
+        async move {
+            // Plugin calls can invoke synchronous WASI, which blocks on Tokio.
+            let prepared = tokio::task::spawn_blocking(move || {
+                let _guard = caller_span.enter();
+                factory.account_request(&cfg)
+            })
+            .await
+            .map_err(|e| {
+                LLMError::PluginError(format!("Extism account preparation join error: {e:#}"))
+            })??;
+            let Some(req) = prepared else {
+                return Ok(AccountReport::Unsupported);
+            };
+
+            let resp = crate::outbound::call_outbound(req).await?;
+            let factory = self.clone();
+            let caller_span = tracing::Span::current();
+            tokio::task::spawn_blocking(move || {
+                let _guard = caller_span.enter();
+                factory.parse_account(resp)
+            })
+            .await
+            .map_err(|e| {
+                LLMError::PluginError(format!("Extism account parsing join error: {e:#}"))
+            })?
+            .map(AccountReport::Account)
+        }
+        .boxed()
+    }
+
     fn as_http(&self) -> Option<&dyn crate::plugin::http::HTTPLLMProviderFactory> {
         // Only return Some if the plugin is HTTP-based
         // Check if plugin exports the api_key_name function (exported by impl_extism_http_plugin!)
@@ -587,6 +670,48 @@ impl HTTPLLMProviderFactory for ExtismFactory {
         self.call("api_key_name", &Value::Null) // → Result<&'static str, _>
             .ok() // → Option<&'static str>
             .filter(|s| !s.is_empty())
+    }
+
+    /// Builds the plugin's account request and refuses one whose host is
+    /// neither allowed nor declared, so no caller can bypass the check.
+    fn account_request(&self, cfg: &str) -> Result<Option<http::Request<Vec<u8>>>, LLMError> {
+        let cfg_value = parse_config_json(cfg)?;
+        self.validate_runtime_base_url(&cfg_value)?;
+
+        let req = {
+            let mut plug = self.plugin.lock().unwrap();
+            if !plug.function_exists("account_request") {
+                return Ok(None);
+            }
+            let out: Json<Option<SerializableHttpRequest>> = plug
+                .call_get_error_code(
+                    "account_request",
+                    Json(ExtismAccountRequest { cfg: cfg_value }),
+                )
+                .map_err(|(e, code)| decode_plugin_error(e, code))?;
+            out.0.map(|wire| wire.req)
+        };
+        if let Some(req) = &req {
+            self.check_account_host(req)?;
+        }
+        Ok(req)
+    }
+
+    fn parse_account(&self, resp: http::Response<Vec<u8>>) -> Result<ProviderAccount, LLMError> {
+        let mut plug = self.plugin.lock().unwrap();
+        let out: Json<ProviderAccount> = plug
+            .call_get_error_code(
+                "parse_account_response",
+                Json(ExtismAccountParseRequest {
+                    resp: SerializableHttpResponse { resp },
+                }),
+            )
+            .map_err(|(e, code)| decode_plugin_error(e, code))?;
+        Ok(out.0)
+    }
+
+    fn account_hosts(&self) -> Vec<String> {
+        self.account_hosts.clone()
     }
 }
 
@@ -1512,6 +1637,7 @@ mod tests {
             name: "test".to_string(),
             user_data: None,
             allowed_hosts: vec!["127.0.0.1".to_string()],
+            account_hosts: Vec::new(),
         }
     }
 
@@ -1691,6 +1817,187 @@ mod tests {
                 assert_eq!(failure.retry_after_secs(), Some(2));
             }
             other => panic!("expected ProviderResponseError, got {other}"),
+        }
+    }
+
+    mod account {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const SNAPSHOT: &str =
+            r#"{"limits":[{"id":"weekly","used_percent":42.0,"reached":false}]}"#;
+
+        fn account_factory(
+            account_exports: &[(&str, &str)],
+            allowed_hosts: &[&str],
+            account_hosts: &[&str],
+        ) -> ExtismFactory {
+            let mut exports = vec![
+                ("prepare_chat_request", "{}"),
+                ("parse_chat_response", "{}"),
+                ("list_models_request", "{}"),
+                ("parse_list_models_response", r#"["parsed-model"]"#),
+                ("list_models_static", r#"["static-model"]"#),
+            ];
+            exports.extend_from_slice(account_exports);
+            ExtismFactory {
+                plugin: Arc::new(Mutex::new(wat_plugin(&exports))),
+                name: "test".to_string(),
+                user_data: None,
+                allowed_hosts: allowed_hosts.iter().map(|h| h.to_string()).collect(),
+                account_hosts: account_hosts.iter().map(|h| h.to_string()).collect(),
+            }
+        }
+
+        /// Serves one canned snapshot per request until dropped; returns the
+        /// request as plugin-export JSON and the number of requests received.
+        async fn snapshot_server() -> (String, Arc<AtomicUsize>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let hits = Arc::new(AtomicUsize::new(0));
+            let served = Arc::clone(&hits);
+            tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    let mut request = [0; 4096];
+                    let _ = socket.read(&mut request).await;
+                    served.fetch_add(1, Ordering::SeqCst);
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                        )
+                        .await;
+                }
+            });
+            let request = SerializableHttpRequest {
+                req: http::Request::builder()
+                    .uri(format!("http://{addr}/usage"))
+                    .body(Vec::new())
+                    .unwrap(),
+            };
+            (serde_json::to_string(&request).unwrap(), hits)
+        }
+
+        #[tokio::test]
+        async fn older_plugin_without_the_exports_still_works() {
+            let factory = account_factory(&[], &["127.0.0.1"], &[]);
+
+            let report = LLMProviderFactory::account(&factory, "{}")
+                .await
+                .expect("account");
+            let models = LLMProviderFactory::list_models(&factory, "{}")
+                .await
+                .expect("model listing is unaffected");
+
+            assert_eq!(report, AccountReport::Unsupported);
+            assert_eq!(models, ["static-model"]);
+        }
+
+        #[tokio::test]
+        async fn plugin_decline_crosses_the_boundary_as_unsupported() {
+            let factory = account_factory(
+                &[
+                    ("account_request", "null"),
+                    ("parse_account_response", SNAPSHOT),
+                ],
+                &["127.0.0.1"],
+                &[],
+            );
+
+            let report = LLMProviderFactory::account(&factory, "{}")
+                .await
+                .expect("account");
+
+            assert_eq!(report, AccountReport::Unsupported);
+        }
+
+        #[tokio::test]
+        async fn account_request_to_a_host_outside_the_allow_list_is_refused() {
+            let (request, hits) = snapshot_server().await;
+            let factory = account_factory(
+                &[
+                    ("account_request", &request),
+                    ("parse_account_response", SNAPSHOT),
+                ],
+                &["api.example.com"],
+                &[],
+            );
+
+            let error = LLMProviderFactory::account(&factory, "{}")
+                .await
+                .expect_err("an undeclared host must be refused");
+
+            let LLMError::InvalidRequest(message) = &error else {
+                panic!("expected InvalidRequest, got {error:?}");
+            };
+            assert!(message.contains("'127.0.0.1'"), "{message}");
+            assert!(message.contains("allowed_hosts"), "{message}");
+            assert_eq!(hits.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn configured_allowed_host_lets_the_account_request_through() {
+            let (request, hits) = snapshot_server().await;
+            let factory = account_factory(
+                &[
+                    ("account_request", &request),
+                    ("parse_account_response", SNAPSHOT),
+                ],
+                &["api.example.com", "127.0.0.1"],
+                &[],
+            );
+
+            let report = LLMProviderFactory::account(&factory, "{}")
+                .await
+                .expect("account");
+
+            let AccountReport::Account(account) = report else {
+                panic!("expected a snapshot, got {report:?}");
+            };
+            assert_eq!(account.limits[0].id, "weekly");
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn declared_account_host_needs_no_configuration() {
+            let (request, hits) = snapshot_server().await;
+            let factory = account_factory(
+                &[
+                    ("account_request", &request),
+                    ("parse_account_response", SNAPSHOT),
+                ],
+                &["api.x.ai"],
+                &["127.0.0.1"],
+            );
+
+            let report = LLMProviderFactory::account(&factory, "{}")
+                .await
+                .expect("account");
+
+            assert!(matches!(report, AccountReport::Account(_)), "{report:?}");
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+        }
+
+        #[test]
+        fn declared_account_host_stays_out_of_the_plugins_own_reach() {
+            let plugin = Mutex::new(wat_plugin(&[(
+                "account_hosts",
+                r#"["cli-chat-proxy.grok.com",""]"#,
+            )]));
+
+            let account_hosts = read_account_hosts(&plugin);
+            let allowed_hosts =
+                build_allowed_hosts(&None, Some("https://api.x.ai/v1/")).expect("allowed hosts");
+
+            assert_eq!(account_hosts, ["cli-chat-proxy.grok.com"]);
+            assert_eq!(allowed_hosts, ["api.x.ai"]);
+        }
+
+        #[test]
+        fn plugin_without_account_hosts_declares_none() {
+            let plugin = Mutex::new(wat_plugin(&[("name", "test")]));
+
+            assert!(read_account_hosts(&plugin).is_empty());
         }
     }
 }

@@ -26,7 +26,7 @@ use querymt::{
     embedding::http::HTTPEmbeddingProvider,
     error::LLMError,
     handle_http_error,
-    plugin::HTTPLLMProviderFactory,
+    plugin::{HTTPLLMProviderFactory, ProviderAccount},
 };
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
@@ -34,6 +34,8 @@ use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use url::Url;
+mod account;
+
 const XAI_ADDITIONAL_LIST_MODELS: &[&str] = &["grok-composer-2.5-fast", "grok-4.5"];
 
 #[derive(Debug, Clone, Deserialize, JsonSchema, Serialize)]
@@ -1235,6 +1237,18 @@ impl HTTPLLMProviderFactory for XaiFactory {
         let provider: Xai = serde_json::from_str(cfg)?;
 
         Ok(Box::new(provider))
+    }
+
+    fn account_request(&self, cfg: &str) -> Result<Option<Request<Vec<u8>>>, LLMError> {
+        account::account_request(cfg)
+    }
+
+    fn parse_account(&self, resp: Response<Vec<u8>>) -> Result<ProviderAccount, LLMError> {
+        account::parse_account(&resp)
+    }
+
+    fn account_hosts(&self) -> Vec<String> {
+        vec![account::ACCOUNT_HOST.to_string()]
     }
 }
 

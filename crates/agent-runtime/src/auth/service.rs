@@ -77,6 +77,8 @@ pub struct OAuthService {
     model_inventory: ModelInventory,
     flows: OAuthFlowMap,
     listener_slot: CallbackListenerSlot,
+    /// Recent `querymt/auth/account` answers; cleared by every auth mutation.
+    account_cache: account::AccountCache,
     /// Pending `mcp:<server>` logins, keyed like provider flows.
     #[cfg(feature = "oauth")]
     mcp_flows: mcp::McpFlowMap,
@@ -92,6 +94,9 @@ pub struct OAuthService {
 #[doc(hidden)]
 pub mod mcp;
 
+mod account;
+pub use account::{ProviderAccountState, ProviderAccountStatus};
+
 impl OAuthService {
     /// Construct a new `OAuthService` from the shared dependencies.
     pub fn new(
@@ -105,6 +110,7 @@ impl OAuthService {
             model_inventory,
             flows,
             listener_slot,
+            account_cache: Default::default(),
             #[cfg(feature = "oauth")]
             mcp_flows: Default::default(),
             #[cfg(feature = "oauth")]
@@ -664,6 +670,7 @@ impl OAuthService {
                     stop_listener_for_flow(&self.listener_slot, &self.flows, flow_id, false).await;
                     self.config.invalidate_provider_cache().await;
                     self.model_inventory.invalidate_all().await;
+                    self.account_cache.clear();
 
                     CompleteFlowResult {
                         provider: flow.provider.clone(),
@@ -776,6 +783,7 @@ impl OAuthService {
                         .await;
                     self.config.invalidate_provider_cache().await;
                     self.model_inventory.invalidate_all().await;
+                    self.account_cache.clear();
 
                     LogoutResult {
                         provider: provider_name,
@@ -1011,6 +1019,7 @@ impl OAuthService {
     async fn invalidate_auth_caches(&self) {
         self.config.invalidate_provider_cache().await;
         self.model_inventory.invalidate_all().await;
+        self.account_cache.clear();
     }
 
     // ── Callback listener lifecycle ───────────────────────────────────────
@@ -1454,6 +1463,7 @@ async fn run_callback_listener_task(
 
             svc.config.invalidate_provider_cache().await;
             svc.model_inventory.invalidate_all().await;
+            svc.account_cache.clear();
 
             log::info!(
                 "OAuth callback flow completed successfully for provider '{}' (flow '{}')",

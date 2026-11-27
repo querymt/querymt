@@ -1,4 +1,4 @@
-use crate::{HTTPLLMProvider, error::LLMError};
+use crate::{HTTPLLMProvider, error::LLMError, plugin::account::ProviderAccount};
 use http::{Request, Response};
 
 pub trait HTTPLLMProviderFactory: Send + Sync {
@@ -33,6 +33,35 @@ pub trait HTTPLLMProviderFactory: Send + Sync {
     // FIXME: refactor to follow rust standards
     #[allow(clippy::wrong_self_convention)]
     fn from_config(&self, cfg: &str) -> Result<Box<dyn HTTPLLMProvider>, LLMError>;
+
+    /// Build the request for the account snapshot of the credential in `cfg`,
+    /// or `None` when this provider or this credential has nothing to report
+    /// (most inference API keys, local providers).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `cfg` cannot be read or the credential is unusable.
+    fn account_request(&self, _cfg: &str) -> Result<Option<Request<Vec<u8>>>, LLMError> {
+        Ok(None)
+    }
+
+    /// Turn the account endpoint's success response into a snapshot.
+    ///
+    /// The host classifies non-success statuses before calling this.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LLMError::ResponseFormatError`] for a body this provider cannot read.
+    fn parse_account(&self, _resp: Response<Vec<u8>>) -> Result<ProviderAccount, LLMError> {
+        Err(LLMError::NotImplemented("account snapshot".into()))
+    }
+
+    /// Hosts other than the base-URL host that [`account_request`](Self::account_request)
+    /// may target. A Wasm host reads this once at load and allows these hosts for
+    /// account requests only.
+    fn account_hosts(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 #[allow(improper_ctypes_definitions)]

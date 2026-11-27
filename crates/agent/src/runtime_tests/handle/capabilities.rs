@@ -135,6 +135,7 @@ async fn test_querymt_capabilities_lists_control_surface() {
         "querymt/auth/setApiToken",
         "querymt/auth/clearApiToken",
         "querymt/auth/setMethod",
+        "querymt/auth/account",
     ] {
         assert!(
             result["methods"]
@@ -374,4 +375,33 @@ async fn test_querymt_capabilities_composite_mesh_reports_invites_and_multi_tran
             .iter()
             .any(|method| method == "querymt/schedules/changed")
     );
+}
+
+#[tokio::test]
+async fn capabilities_advertise_the_account_method() {
+    let f = HandleFixture::new().await;
+
+    let result = ext_method_json(&f.handle, "querymt/capabilities", serde_json::json!({})).await;
+
+    assert!(
+        result["methods"]
+            .as_array()
+            .expect("methods array")
+            .iter()
+            .any(|method| method == "querymt/auth/account")
+    );
+    assert_eq!(result["features"]["auth_account"], true);
+}
+
+#[test]
+fn legacy_capabilities_without_auth_account_deserialize_as_unsupported() {
+    let features: crate::control::capabilities::ControlFeatureInfo =
+        serde_json::from_value(serde_json::json!({
+            "mesh": false, "mesh_invites": false, "remote_sessions": false,
+            "schedules": true, "remote_schedules": false, "profiles": false,
+            "auth": true, "models": true, "steering": true
+        }))
+        .expect("legacy features");
+
+    assert!(!features.auth_account);
 }

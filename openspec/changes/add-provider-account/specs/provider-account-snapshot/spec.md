@@ -108,11 +108,11 @@ The `codex` provider SHALL build its account request against the ChatGPT backend
 
 ### Requirement: Codex parses the usage body
 
-Codex SHALL parse `plan_type` as the plan; `rate_limit.primary_window` and `rate_limit.secondary_window` as limits `primary` and `secondary` (`used_percent`, `window_seconds` from `limit_window_seconds`, `resets_at` from `reset_at`, `reached` from `rate_limit.limit_reached`); each `additional_rate_limits[]` entry as a limit with `id` = `metered_feature`, `label` = `limit_name`, `scope` = `normal_model_slug`; and `credits` as a balance with `balance` and `unlimited` and no currency.
+Codex SHALL parse `plan_type` as the plan; `rate_limit.primary_window` and `rate_limit.secondary_window` as limits `primary` and `secondary` (`window_seconds` from `limit_window_seconds`, `resets_at` from `reset_at`, `reached` from `limit_reached` for the primary window); each `additional_rate_limits[]` entry's windows as limits `<metered_feature>` and `<metered_feature>:secondary` scoped to `limit_name`; and `credits` as a balance without currency.
 
 #### Scenario: Codex usage body becomes a snapshot
-- **WHEN** the usage endpoint returns `plan_type: "pro"`, a primary window at 99 percent of a 604800-second window resetting at a given epoch second, no secondary window, one additional limit for `codex_other` scoped to a model slug, and credits with balance `"12701.63"`
-- **THEN** the snapshot has plan `pro`, limits `primary` (99, 604800, that epoch second, not reached) and `codex_other` (with the model slug as scope), no `secondary` limit, and credits balance `12701.63` not unlimited
+- **WHEN** the usage endpoint returns `plan_type: "pro"`, a primary window at 99 percent of a 604800-second window resetting at a given epoch second, no secondary window, one additional limit for `codex_other` named after a model with a primary window at 70 percent, and credits with balance `"12701.63"`
+- **THEN** the snapshot has plan `pro`, limits `primary` (99, 604800, that epoch second, not reached) and `codex_other` (70, scoped to that model name), no `secondary` limit, and credits balance `12701.63` not unlimited
 
 ### Requirement: xAI reports an account only for xAI OAuth tokens
 

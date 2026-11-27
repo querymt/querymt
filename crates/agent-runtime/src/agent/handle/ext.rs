@@ -78,6 +78,7 @@ fn ext_method_handler(method: &str) -> Option<ExtHandler> {
         "querymt/auth/setApiToken" => |h, req| Box::pin(h.handle_ext_auth_set_api_token(req)),
         "querymt/auth/clearApiToken" => |h, req| Box::pin(h.handle_ext_auth_clear_api_token(req)),
         "querymt/auth/setMethod" => |h, req| Box::pin(h.handle_ext_auth_set_method(req)),
+        "querymt/auth/account" => |h, req| Box::pin(h.handle_ext_auth_account(req)),
         "querymt/session/steer" => {
             |h, req| Box::pin(h.handle_ext_session_submit_input(req, InputDelivery::Steer))
         }

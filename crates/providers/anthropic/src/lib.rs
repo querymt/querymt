@@ -2,6 +2,7 @@
 //!
 //! This module provides integration with Anthropic's Claude models through their API.
 
+mod account;
 mod auth;
 mod cache_breakpoints;
 mod config;

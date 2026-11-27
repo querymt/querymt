@@ -45,9 +45,9 @@ None. No existing spec's requirements change; `provider-resolution`, `agent-conf
 - `querymt-agent-runtime` (`oauth` for OAuth credentials, no new feature): new ACP method, cache, capability entry. **Wire shape added**: `querymt/auth/account` response and the `auth_account` capability flag. No config keys, no DB schema change, no hook or middleware change.
 - `qmacp`: one `Command` variant and one `pub` gate+call helper. `qmcp`: one `Command` variant (tool schema derived), one `read_only` entry. READMEs and skill docs. No change to existing commands, tools or event shapes.
 - `querymt-agent`: facade re-exports only. `querymt-agent-py`, `querymt-mobile-ffi`: no change (ACP-level feature).
-- Native plugin ABI: HTTP providers are loaded as Wasm or linked statically; once `stabilize-native-plugin-abi` lands there is no native vtable for `HTTPLLMProviderFactory`. If this change ships first, the added trait methods change the `dyn HTTPLLMProviderFactory` vtable and `NATIVE_PLUGIN_API` must be bumped to 3.
+- Native plugin ABI: `stabilize-native-plugin-abi` has not landed, so the added trait methods change the `dyn LLMProviderFactory` and `dyn HTTPLLMProviderFactory` vtables and this change bumps `NATIVE_PLUGIN_API` to 3 (native plugins must be rebuilt; Wasm plugins are unaffected). That open change also plans its ABI as version 3 and must move to 4 if this lands first.
 - Typeshare: `ProviderAccount`, `UsageLimit` and `CreditBalance` are typeshared behind `querymt`'s `type-generation` feature; the runtime's `ProviderAccountStatus` is typeshared. `querymt-desktop` follow-up: render per-provider plan, limit bars with reset times and credits on the provider/auth settings view, using `querymt/auth/account`, and re-pull with `refresh: true` when a turn ends.
-- `CHANGELOG.md` Unreleased: "Added" entries for the plugin contract and the ACP method (no breaking entry unless the native ABI bump above applies).
+- `CHANGELOG.md` Unreleased: "Added" entries for the plugin contract and the ACP method plus a "Breaking" entry for the native ABI bump.
 
 ## Risks
 

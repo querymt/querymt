@@ -800,6 +800,64 @@ pub fn extension_payload(response: &Value) -> Value {
         .unwrap_or_else(|| response.clone())
 }
 
+/// The extension method that reports plan, usage limits and credits per provider.
+pub const PROVIDER_ACCOUNT_METHOD: &str = "querymt/auth/account";
+
+/// Provider account snapshots (`querymt/auth/account`) for every provider or
+/// one, after checking that the server advertises the method.
+///
+/// # Errors
+///
+/// Fails without calling the method when the server does not advertise
+/// `features.auth_account` and the method, and with the server's error when
+/// the call fails (for example an unknown provider).
+pub async fn provider_accounts(
+    client: &AcpClient,
+    provider: Option<String>,
+    refresh: bool,
+) -> Result<Value, CliError> {
+    client.initialize().await.map_err(CliError::from_request)?;
+    let capabilities = client
+        .extension("querymt/capabilities", json!({}))
+        .await
+        .map_err(|err| {
+            CliError::from_request(err.context("cannot verify provider account support"))
+        })?;
+    if !supports_provider_accounts(&extension_payload(&capabilities)) {
+        return Err(CliError::rpc(format!(
+            "server does not advertise support for {PROVIDER_ACCOUNT_METHOD}"
+        )));
+    }
+    let mut params = Map::new();
+    if let Some(provider) = provider {
+        params.insert("provider".to_string(), Value::String(provider));
+    }
+    if refresh {
+        params.insert("refresh".to_string(), Value::Bool(true));
+    }
+    let response = client
+        .extension(PROVIDER_ACCOUNT_METHOD, Value::Object(params))
+        .await
+        .map_err(CliError::from_request)?;
+    Ok(extension_payload(&response))
+}
+
+fn supports_provider_accounts(capabilities: &Value) -> bool {
+    let feature = capabilities
+        .pointer("/features/auth_account")
+        .and_then(Value::as_bool)
+        == Some(true);
+    let method = capabilities
+        .get("methods")
+        .and_then(Value::as_array)
+        .is_some_and(|methods| {
+            methods
+                .iter()
+                .any(|value| value.as_str() == Some(PROVIDER_ACCOUNT_METHOD))
+        });
+    feature && method
+}
+
 pub fn stop_reason_name(reason: &acp::StopReason) -> String {
     match reason {
         acp::StopReason::EndTurn => "endTurn".to_string(),

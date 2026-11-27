@@ -184,6 +184,7 @@ fn tool_catalog() -> Result<Vec<Tool>> {
             "caps"
                 | "profiles"
                 | "models"
+                | "account"
                 | "sessions"
                 | "find"
                 | "get_lifecycle"
@@ -511,7 +512,7 @@ mod tests {
     #[test]
     fn catalog_contains_self_contained_object_schemas_and_native_prompt_fields() {
         let tools = tool_catalog().unwrap();
-        assert_eq!(tools.len(), 25);
+        assert_eq!(tools.len(), 26);
         for tool in &tools {
             assert_eq!(tool.input_schema["type"], "object");
             assert!(

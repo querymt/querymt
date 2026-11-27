@@ -1,7 +1,8 @@
 mod interface;
 pub use interface::{
-    BinaryCodec, ExtismChatChunk, ExtismChatChunkParseRequest, ExtismChatParseRequest,
-    ExtismChatPrepareRequest, ExtismChatRequest, ExtismChatResponse, ExtismChatStreamParserRequest,
+    BinaryCodec, ExtismAccountParseRequest, ExtismAccountRequest, ExtismChatChunk,
+    ExtismChatChunkParseRequest, ExtismChatParseRequest, ExtismChatPrepareRequest,
+    ExtismChatRequest, ExtismChatResponse, ExtismChatStreamParserRequest,
     ExtismCompleteParseRequest, ExtismCompleteRequest, ExtismEmbedParseRequest, ExtismEmbedRequest,
     ExtismListModelsParseRequest, ExtismListModelsRequest, ExtismLogRecord,
     ExtismPreparedChatRequest, ExtismSttRequest, ExtismSttResponse, ExtismTtsRequest,
