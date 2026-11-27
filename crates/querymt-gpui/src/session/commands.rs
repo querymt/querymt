@@ -88,6 +88,7 @@ mod tests {
             effect: None,
             input: None,
             accepts: None,
+            subcommands: Vec::new(),
         }
     }
 

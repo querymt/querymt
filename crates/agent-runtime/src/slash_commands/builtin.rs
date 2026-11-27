@@ -9,9 +9,55 @@ use crate::acp::protocol::{
     AvailableCommand, AvailableCommandInput, ContentBlock, UnstructuredCommandInput,
 };
 use crate::agent::turn_control::InputDelivery;
-use crate::slash_commands::acp::{AcceptedSubmission, descriptor_meta};
+use crate::slash_commands::acp::{AcceptedSubmission, Subcommand, descriptor_meta};
 use crate::slash_commands::types::ArgumentsNeed;
 use querymt_agent_core::events::{SlashCommandEffect, SlashCommandSource};
+
+/// The operations `/worktree` advertises, in the order the palette lists
+/// them. A test in `agent::handle::ext_worktree_ops` checks that the parser
+/// accepts every name here and that none is missing.
+pub const WORKTREE_SUBCOMMANDS: &[Subcommand] = &[
+    Subcommand {
+        name: "create",
+        description: "Start an isolated session in a new worktree",
+    },
+    Subcommand {
+        name: "handoff",
+        description: "Hand this session's work to a new isolated session",
+    },
+    Subcommand {
+        name: "list",
+        description: "List the worktrees of this checkout",
+    },
+    Subcommand {
+        name: "status",
+        description: "Show a worktree's state",
+    },
+    Subcommand {
+        name: "result",
+        description: "Show a worktree's result",
+    },
+    Subcommand {
+        name: "publish",
+        description: "Pin a worktree's working state under a result ref",
+    },
+    Subcommand {
+        name: "merge",
+        description: "Merge a worktree into its source checkout",
+    },
+    Subcommand {
+        name: "archive",
+        description: "Archive a worktree session",
+    },
+    Subcommand {
+        name: "remove",
+        description: "Remove a worktree; refuses to drop unsaved work",
+    },
+    Subcommand {
+        name: "recover",
+        description: "Finish an interrupted create or remove",
+    },
+];
 
 /// A natively handled slash command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +158,15 @@ impl Builtin {
         }
     }
 
+    /// The operations advertised as the first argument. Empty for commands
+    /// without any.
+    pub const fn subcommands(self) -> &'static [Subcommand] {
+        match self {
+            Builtin::Compact => &[],
+            Builtin::Worktree => WORKTREE_SUBCOMMANDS,
+        }
+    }
+
     /// The submissions this command is advertised as running from, derived
     /// from [`Self::accepts`] so the catalog cannot drift from what runs.
     fn advertised_submissions(self) -> Vec<AcceptedSubmission> {
@@ -132,6 +187,7 @@ impl Builtin {
             SlashCommandEffect::Action,
             self.input(),
             &self.advertised_submissions(),
+            self.subcommands(),
         ))
     }
 
@@ -390,6 +446,31 @@ mod tests {
         assert!(!Builtin::Worktree.available(host(true, false)));
         assert!(!Builtin::Worktree.available(host(false, true)));
         assert!(!Builtin::Worktree.available(host(false, false)));
+    }
+
+    #[test]
+    fn worktree_subcommands_are_advertised() {
+        let value = serde_json::to_value(Builtin::Worktree.entry()).unwrap();
+        let advertised = value["_meta"]["querymt"]["subcommands"]
+            .as_array()
+            .expect("worktree advertises subcommands");
+        let names: Vec<&str> = advertised
+            .iter()
+            .map(|sub| sub["name"].as_str().expect("name"))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "create", "handoff", "list", "status", "result", "publish", "merge", "archive",
+                "remove", "recover"
+            ]
+        );
+        for sub in advertised {
+            assert!(
+                !sub["description"].as_str().expect("description").is_empty(),
+                "{sub} needs a description"
+            );
+        }
     }
 
     #[test]

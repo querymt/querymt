@@ -4,6 +4,17 @@
 
 ### Added
 
+- **Subcommands in the slash-command catalog.** An `available_commands_update`
+  entry may carry `_meta.querymt.subcommands`, a list of `{ "name",
+  "description" }` objects next to `source`, `effect`, `input` and `accepts`;
+  entries without subcommands omit it. `/worktree` advertises `create`,
+  `handoff`, `list`, `status`, `result`, `publish`, `merge`, `archive`,
+  `remove` and `recover`. QueryMT Desktop's command palette lists each as its
+  own row (`worktree list…`), searchable by name and description; picking one
+  only puts `/worktree list ` in the composer. Additive: clients that ignore
+  unknown `_meta` keys are unaffected. `SlashCommandView` in
+  `querymt-agent-session-core` gains `subcommands` (and the new
+  `SlashSubcommandView`), so the typeshare output changes.
 - **Colour themes in QueryMT Desktop.** Settings -> Appearance has a Dark theme
   and a Light theme select next to the System / Light / Dark cards; System
   switches between the two with the desktop. QueryMT Dark and Light stay the

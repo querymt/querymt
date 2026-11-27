@@ -108,6 +108,15 @@ enum PaletteTarget {
         input: CommandInput,
         blocked: Option<Blocked>,
     },
+    /// A subcommand of a slash command of the open session, such as
+    /// `worktree list` (design D4). Picking it only puts
+    /// `/<command> <subcommand> ` in the composer; nothing is sent.
+    /// `blocked` is the parent's: such a row does nothing.
+    SlashSubcommand {
+        command: String,
+        subcommand: String,
+        blocked: Option<Blocked>,
+    },
     /// "Select theme…": the palette lists the themes instead (design D12).
     SelectTheme,
     /// A row of the theme list.
@@ -526,6 +535,9 @@ impl QmtApp {
             // Unavailable: nothing is sent and the palette stays open.
             PaletteTarget::SlashCommand {
                 blocked: Some(_), ..
+            }
+            | PaletteTarget::SlashSubcommand {
+                blocked: Some(_), ..
             } => return,
             _ => {}
         }
@@ -550,6 +562,11 @@ impl QmtApp {
             PaletteTarget::SlashCommand { name, input, .. } => {
                 return self.run_slash_command(&name, input, window, cx);
             }
+            PaletteTarget::SlashSubcommand {
+                command,
+                subcommand,
+                ..
+            } => return self.prefill_slash_subcommand(&command, &subcommand, window, cx),
         }
         self.restore_focus(window, cx);
         cx.notify();
@@ -574,6 +591,24 @@ impl QmtApp {
         cx.notify();
     }
 
+    /// Picking a subcommand: the composer gets `/<command> <subcommand> `
+    /// and the focus. A draft is kept as the arguments, and a subcommand
+    /// already typed after the command is replaced. The cursor ends after the
+    /// subcommand when a typed word was replaced and at the end otherwise.
+    /// Nothing is sent, whatever the subcommand does.
+    fn prefill_slash_subcommand(
+        &mut self,
+        command: &str,
+        subcommand: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pane.update(cx, |pane, cx| {
+            pane.prefill_slash_subcommand(command, subcommand, window, cx)
+        });
+        cx.notify();
+    }
+
     /// The target of the highlighted palette row, if any.
     fn highlighted_target(&self, cx: &App) -> Option<PaletteTarget> {
         let ix = self.palette.read(cx).selected_index()?;
@@ -593,18 +628,28 @@ impl QmtApp {
     /// takes input does; on any other row Tab does nothing, and the key is
     /// spent either way so focus cannot leave the search field.
     fn palette_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(PaletteTarget::SlashCommand {
-            name,
-            input: CommandInput::Optional | CommandInput::Required,
-            blocked: None,
-        }) = self.highlighted_target(cx)
-        else {
-            return;
-        };
-        self.close_palette(cx);
-        self.pane
-            .update(cx, |pane, cx| pane.prefill_slash(&name, window, cx));
-        cx.notify();
+        match self.highlighted_target(cx) {
+            Some(PaletteTarget::SlashCommand {
+                name,
+                input: CommandInput::Optional | CommandInput::Required,
+                blocked: None,
+            }) => {
+                self.close_palette(cx);
+                self.pane
+                    .update(cx, |pane, cx| pane.prefill_slash(&name, window, cx));
+                cx.notify();
+            }
+            // Tab on an available subcommand does what picking it does.
+            Some(PaletteTarget::SlashSubcommand {
+                command,
+                subcommand,
+                blocked: None,
+            }) => {
+                self.close_palette(cx);
+                self.prefill_slash_subcommand(&command, &subcommand, window, cx);
+            }
+            _ => {}
+        }
     }
 
     /// The command palette overlay, when open.
@@ -908,7 +953,7 @@ impl QmtApp {
                 label: "Slash commands",
                 entries: commands
                     .iter()
-                    .map(|c| {
+                    .flat_map(|c| {
                         let traits = CommandTraits::of(c);
                         let blocked = pane.readiness(Some(c), cx).err();
                         // The bare name: the palette lists commands, it is
@@ -944,7 +989,31 @@ impl QmtApp {
                         if traits.is_prompt() {
                             entry = entry.mark("Prompt");
                         }
-                        entry
+                        // Each subcommand follows its command, in the
+                        // agent's order, with the parent's readiness and
+                        // source (design D4).
+                        let subcommands = c.subcommands.iter().map(move |sub| {
+                            PaletteEntry::new(
+                                format!("{} {}…", c.name, sub.name),
+                                IconName::SquareSlash,
+                                PaletteTarget::SlashSubcommand {
+                                    command: c.name.clone(),
+                                    subcommand: sub.name.clone(),
+                                    blocked,
+                                },
+                            )
+                            .description(blocked.map_or_else(
+                                || sub.description.clone(),
+                                |reason| reason.reason().to_owned(),
+                            ))
+                            .dim(blocked.is_some())
+                            .keywords(
+                                std::iter::once(sub.description.clone())
+                                    .chain(traits.source.map(source_word).map(str::to_owned))
+                                    .chain(traits.is_prompt().then(|| "prompt".to_owned())),
+                            )
+                        });
+                        std::iter::once(entry).chain(subcommands)
                     })
                     .collect(),
             });
@@ -1818,6 +1887,233 @@ mod tests {
         assert!(!key_hint_shown(cx, &rig), "not for a row of another group");
         highlight_row(cx, &rig, "worktree");
         assert!(!key_hint_shown(cx, &rig), "not for a command without input");
+    }
+
+    const WORKTREE_SUBS: [(&str, &str); 10] = [
+        ("create", "Start an isolated session in a new worktree"),
+        (
+            "handoff",
+            "Hand this session's work to a new isolated session",
+        ),
+        ("list", "List the worktrees of this checkout"),
+        ("status", "Show a worktree's state"),
+        ("result", "Show a worktree's result"),
+        (
+            "publish",
+            "Pin a worktree's working state under a result ref",
+        ),
+        ("merge", "Merge a worktree into its source checkout"),
+        ("archive", "Archive a worktree session"),
+        ("remove", "Remove a worktree; refuses to drop unsaved work"),
+        ("recover", "Finish an interrupted create or remove"),
+    ];
+
+    /// `compact`, and `worktree` advertising its ten subcommands.
+    fn worktree_commands() -> Value {
+        let subcommands: Vec<Value> = WORKTREE_SUBS
+            .iter()
+            .map(|(name, description)| json!({ "name": name, "description": description }))
+            .collect();
+        json!([
+            { "name": "compact", "description": COMPACT,
+              "input": { "hint": "[optional instructions]" },
+              "_meta": { "querymt": { "source": "builtin", "effect": "action",
+                  "input": "optional", "accepts": ["prompt", "queue"] } } },
+            { "name": "worktree", "description": "Work in a git worktree",
+              "input": { "hint": "[subcommand]" },
+              "_meta": { "querymt": { "source": "builtin", "effect": "action",
+                  "input": "required", "accepts": ["prompt"],
+                  "subcommands": subcommands } } },
+        ])
+    }
+
+    fn prompt_value(cx: &mut TestAppContext, rig: &Rig) -> (String, (u32, u32)) {
+        rig.app.read_with(cx, |app, cx| {
+            let state = app.pane.read(cx).prompt.clone();
+            let state = state.read(cx);
+            let cursor = state.cursor_position();
+            (state.value().to_string(), (cursor.line, cursor.character))
+        })
+    }
+
+    #[gpui_kit::test]
+    fn palette_lists_worktree_subcommands(cx: &mut TestAppContext) {
+        let rig = rig(
+            cx,
+            Page::Session,
+            Some(session_with(worktree_commands())),
+            |_| {},
+        );
+        let all = groups(cx, &rig);
+        let mut expected = vec!["compact".to_owned(), "worktree…".to_owned()];
+        expected.extend(
+            WORKTREE_SUBS
+                .iter()
+                .map(|(name, _)| format!("worktree {name}…")),
+        );
+        assert_eq!(entry_labels(&all, "Slash commands"), expected);
+        // Each subcommand shows its description under it, not dimmed.
+        let rows = slash_rows(&all);
+        for (row, (_, description)) in rows[2..].iter().zip(WORKTREE_SUBS) {
+            assert_eq!(row.description.as_deref(), Some(description));
+            assert!(!row.dim);
+        }
+    }
+
+    #[gpui_kit::test]
+    fn searching_for_a_subcommand(cx: &mut TestAppContext) {
+        let rig = rig(
+            cx,
+            Page::Session,
+            Some(session_with(worktree_commands())),
+            |_| {},
+        );
+        let found = filter_palette(groups(cx, &rig), "worktree status");
+        assert_eq!(found[0].label, "Slash commands");
+        assert_eq!(found[0].entries[0].label.as_ref(), "worktree status…");
+    }
+
+    #[gpui_kit::test]
+    fn searching_a_subcommands_description(cx: &mut TestAppContext) {
+        let rig = rig(
+            cx,
+            Page::Session,
+            Some(session_with(worktree_commands())),
+            |_| {},
+        );
+        let found = filter_palette(groups(cx, &rig), "interrupted create");
+        assert!(
+            entry_labels(&found, "Slash commands").contains(&"worktree recover…".to_owned()),
+            "{:?}",
+            entry_labels(&found, "Slash commands")
+        );
+    }
+
+    #[gpui_kit::test]
+    fn agent_without_subcommands(cx: &mut TestAppContext) {
+        let rig = rig(
+            cx,
+            Page::Session,
+            Some(session_with(described_commands())),
+            |_| {},
+        );
+        // `worktree` advertises none: only its own row.
+        assert_eq!(
+            entry_labels(&groups(cx, &rig), "Slash commands"),
+            ["compact", "explain…", "worktree…"]
+        );
+    }
+
+    #[gpui_kit::test]
+    fn picking_a_subcommand_prefills_it(cx: &mut TestAppContext) {
+        let rig = rig(
+            cx,
+            Page::Session,
+            Some(session_with(worktree_commands())),
+            |_| {},
+        );
+        let target = target_of(&groups(cx, &rig), "worktree list…");
+        pick(cx, &rig, target);
+        assert!(sent(&rig).is_empty(), "nothing is sent");
+        rig.app.read_with(cx, |app, _| {
+            assert!(!app.palette_open, "the palette closes")
+        });
+        assert_eq!(prompt_value(cx, &rig), ("/worktree list ".into(), (0, 15)));
+        assert!(prompt_focused(cx, &rig));
+    }
+
+    #[gpui_kit::test]
+    fn tab_on_a_subcommand_prefills_it(cx: &mut TestAppContext) {
+        cx.update(super::bind_keys);
+        let rig = rig(
+            cx,
+            Page::Session,
+            Some(session_with(worktree_commands())),
+            |_| {},
+        );
+        highlight_row(cx, &rig, "worktree status…");
+        press_tab(cx, &rig);
+        assert!(sent(&rig).is_empty(), "nothing is sent");
+        rig.app.read_with(cx, |app, _| {
+            assert!(!app.palette_open, "the palette closes")
+        });
+        assert_eq!(prompt_value(cx, &rig).0, "/worktree status ");
+        assert!(prompt_focused(cx, &rig));
+    }
+
+    #[gpui_kit::test]
+    fn subcommand_keeps_the_composer_draft(cx: &mut TestAppContext) {
+        let rig = rig(
+            cx,
+            Page::Session,
+            Some(session_with(worktree_commands())),
+            |_| {},
+        );
+        cx.update_window(rig.handle, |_, window, cx| {
+            let prompt = rig.app.read(cx).pane.read(cx).prompt.clone();
+            prompt.update(cx, |s, cx| s.set_value("feature-x", window, cx));
+        })
+        .unwrap();
+        let target = target_of(&groups(cx, &rig), "worktree create…");
+        pick(cx, &rig, target);
+        assert!(sent(&rig).is_empty());
+        assert_eq!(
+            prompt_value(cx, &rig),
+            ("/worktree create feature-x".into(), (0, 26))
+        );
+    }
+
+    /// A subcommand already typed is replaced, not stacked.
+    #[gpui_kit::test]
+    fn subcommand_replaces_a_typed_subcommand(cx: &mut TestAppContext) {
+        let rig = rig(
+            cx,
+            Page::Session,
+            Some(session_with(worktree_commands())),
+            |_| {},
+        );
+        cx.update_window(rig.handle, |_, window, cx| {
+            let prompt = rig.app.read(cx).pane.read(cx).prompt.clone();
+            prompt.update(cx, |s, cx| s.set_value("/worktree status ws-1", window, cx));
+        })
+        .unwrap();
+        let target = target_of(&groups(cx, &rig), "worktree list…");
+        pick(cx, &rig, target);
+        assert!(sent(&rig).is_empty());
+        assert_eq!(
+            prompt_value(cx, &rig),
+            ("/worktree list ws-1".into(), (0, 15))
+        );
+    }
+
+    #[gpui_kit::test]
+    fn subcommand_during_a_turn(cx: &mut TestAppContext) {
+        let rig = rig(
+            cx,
+            Page::Session,
+            Some(running_session(worktree_commands())),
+            with_turn_control,
+        );
+        let all = groups(cx, &rig);
+        let rows: Vec<&PaletteEntry> = slash_rows(&all)
+            .into_iter()
+            .filter(|e| e.label.starts_with("worktree "))
+            .collect();
+        assert_eq!(rows.len(), 10);
+        for row in &rows {
+            assert!(row.dim, "{}", row.label);
+            assert_eq!(
+                row.description.as_deref(),
+                Some("Available when the turn ends")
+            );
+        }
+        let target = target_of(&all, "worktree list…");
+        pick(cx, &rig, target);
+        assert!(sent(&rig).is_empty(), "nothing is sent");
+        rig.app.read_with(cx, |app, _| {
+            assert!(app.palette_open, "the palette stays open")
+        });
+        assert_eq!(prompt_value(cx, &rig).0, "", "the composer is unchanged");
     }
 
     /// A read-only session (archived, handed off) has no composer: it lists

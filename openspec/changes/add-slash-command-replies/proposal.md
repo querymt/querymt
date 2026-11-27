@@ -22,7 +22,7 @@ This change finishes that work, from the agent to the app. It was split out of `
 ## Non-goals
 
 - Making transient replies durable (`/worktree list`, `status`, `result`, `create`). They stay live-only.
-- Structured subcommands in the catalog and palette. Not planned.
+- Structured subcommands in the catalog and palette. Planned separately in `add-palette-subcommands`.
 - Searching command rows with session find.
 
 ## Capabilities
