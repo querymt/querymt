@@ -1596,7 +1596,7 @@ impl ViewStore for SqliteStorage {
                     "SELECT COUNT(*) FROM sessions_fts f JOIN sessions s ON s.id = f.rowid WHERE sessions_fts MATCH ?1 AND {}",
                     scope_where
                 ),
-                params![fts_query.clone()],
+                params![fts_query],
                 |row| row.get::<_, i64>(0).map(|v| v as usize),
             ) {
                 Ok(v) => v,
@@ -1616,7 +1616,7 @@ impl ViewStore for SqliteStorage {
                 scope_where
             ))?;
             let group_counts = group_counts_stmt
-                .query_map(params![fts_query.clone()], |row| {
+                .query_map(params![fts_query], |row| {
                     Ok((
                         row.get::<_, Option<String>>(0)?,
                         row.get::<_, i64>(1)? as usize,

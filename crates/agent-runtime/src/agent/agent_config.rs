@@ -277,7 +277,8 @@ impl AgentConfig {
     /// Subscribes to agent events via the fanout (live stream).
     pub fn subscribe_events(
         &self,
-    ) -> tokio::sync::broadcast::Receiver<querymt_agent_core::events::EventEnvelope> {
+    ) -> tokio::sync::broadcast::Receiver<std::sync::Arc<querymt_agent_core::events::EventEnvelope>>
+    {
         self.event_sink.fanout().subscribe()
     }
 
@@ -386,7 +387,7 @@ impl AgentConfig {
     /// take effect. When `None`, falls back to the global config.
     pub fn collect_tools(
         &self,
-        provider: Arc<dyn querymt::LLMProvider>,
+        provider: &dyn querymt::LLMProvider,
         runtime: Option<&crate::agent::core::SessionRuntime>,
         tool_config_override: Option<&crate::agent::core::ToolConfig>,
         tool_set: &crate::tools::ToolSet,
@@ -480,8 +481,7 @@ mod tests {
         let (registry, temp_dir) = empty_plugin_registry().unwrap();
         let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
         let llm = LLMParams::new().provider("mock").model("mock-model");
-        let config =
-            Arc::new(AgentConfigBuilder::new(Arc::new(registry), storage.clone(), llm).build());
+        let config = Arc::new(AgentConfigBuilder::new(Arc::new(registry), storage, llm).build());
         (config, temp_dir)
     }
 
@@ -513,7 +513,7 @@ mod tests {
             Arc::clone(&config.tool_registry),
             crate::tools::ToolRegistry::new(),
         );
-        config.collect_tools(provider, Some(runtime), None, &tool_set)
+        config.collect_tools(provider.as_ref(), Some(runtime), None, &tool_set)
     }
 
     fn names_of(tools: &[querymt::chat::Tool]) -> Vec<&str> {
@@ -550,7 +550,7 @@ mod tests {
         let mut adapters: Vec<_> = harness.adapters.values().cloned().collect();
         let server_name = adapters[0].server_name().to_string();
 
-        state.replace_server(&server_name, Some(adapters.clone()), None);
+        state.replace_server(&server_name, Some(&adapters), None);
         let before = offered_tools(&config, &runtime, provider_tools());
         let before_names = names_of(&before);
         let mut sorted = before_names.clone();
@@ -563,7 +563,7 @@ mod tests {
         );
 
         adapters.reverse();
-        state.replace_server(&server_name, Some(adapters), None);
+        state.replace_server(&server_name, Some(&adapters), None);
         let after = offered_tools(&config, &runtime, provider_tools());
 
         assert_eq!(
@@ -642,7 +642,7 @@ mod tests {
         let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
         let llm = LLMParams::new().provider("mock").model("mock");
         let config = Arc::new(
-            AgentConfigBuilder::new(Arc::new(registry), storage.clone(), llm)
+            AgentConfigBuilder::new(Arc::new(registry), storage, llm)
                 .with_denied_tools(["shell".parse().unwrap()])
                 .build(),
         );
@@ -656,7 +656,7 @@ mod tests {
         let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
         let llm = LLMParams::new().provider("mock").model("mock");
         let config = Arc::new(
-            AgentConfigBuilder::new(Arc::new(registry), storage.clone(), llm)
+            AgentConfigBuilder::new(Arc::new(registry), storage, llm)
                 .with_allowed_tools(["read_tool".parse().unwrap(), "shell".parse().unwrap()])
                 .build(),
         );
@@ -719,7 +719,7 @@ mod tests {
         let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
         let llm = LLMParams::new().provider("mock").model("mock");
         let config = Arc::new(
-            AgentConfigBuilder::new(Arc::new(registry), storage.clone(), llm)
+            AgentConfigBuilder::new(Arc::new(registry), storage, llm)
                 .with_max_steps(100)
                 .build(),
         );

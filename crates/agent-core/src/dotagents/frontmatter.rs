@@ -45,7 +45,7 @@ pub fn parse_frontmatter_markdown(
 
     Ok(ParsedFrontmatter {
         fields,
-        body: body.to_string(),
+        body,
         had_frontmatter: true,
     })
 }

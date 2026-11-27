@@ -217,10 +217,11 @@ impl MemberBuildSpec {
         let mut spec = Self::new(plan.info.id.clone());
         spec.llm_config = Some(params);
         spec.description = Some(plan.info.description.clone());
-        spec.capabilities = plan.info.capabilities.clone();
-        spec.required_capabilities = plan.info.required_capabilities.clone();
+        spec.capabilities.clone_from(&plan.info.capabilities);
+        spec.required_capabilities
+            .clone_from(&plan.info.required_capabilities);
         spec.isolation = plan.info.isolation;
-        spec.mcp_servers = plan.mcp_servers.clone();
+        spec.mcp_servers.clone_from(&plan.mcp_servers);
         spec.skills = skills.cloned();
         spec.scope = RuntimeScope::Standalone;
         match plan.tools.as_ref().filter(|tools| !tools.is_empty()) {

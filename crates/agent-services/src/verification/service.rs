@@ -81,8 +81,8 @@ impl VerificationService {
         })
     }
 
-    fn tool_output_to_value(content: Vec<querymt::chat::ToolResultPart>) -> Value {
-        if let Some(text_only_value) = Self::parse_text_only_result(&content) {
+    fn tool_output_to_value(content: &[querymt::chat::ToolResultPart]) -> Value {
+        if let Some(text_only_value) = Self::parse_text_only_result(content) {
             return text_only_value;
         }
 
@@ -259,7 +259,7 @@ impl VerificationService {
         })?;
 
         // Convert the full mixed-content tool result into a verification value.
-        let result_value = Self::tool_output_to_value(result);
+        let result_value = Self::tool_output_to_value(&result);
 
         // Check expectation
         self.check_expectation(&result_value, expectation, tool_name)
@@ -867,7 +867,7 @@ mod tests {
 
     #[test]
     fn test_tool_output_to_value_preserves_text_only_json_parsing() {
-        let value = VerificationService::tool_output_to_value(vec![ToolResultPart::text(
+        let value = VerificationService::tool_output_to_value(&[ToolResultPart::text(
             r#"{"exit_code":0,"stdout":"ok"}"#,
         )]);
 

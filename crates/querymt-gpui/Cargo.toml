@@ -6,6 +6,11 @@ license.workspace = true
 description = "QueryMT Desktop: the GPUI desktop and web client for QueryMT agents"
 publish = false
 
+# Not on [workspace.lints] yet: the clippy lints there still flag existing code in
+# this crate. An empty table records the opt-out; replace it with
+# `workspace = true` once the crate is clean.
+[lints]
+
 [[bin]]
 name = "querymt-gpui"
 path = "src/main.rs"

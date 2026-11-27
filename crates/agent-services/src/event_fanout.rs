@@ -5,6 +5,7 @@
 
 use querymt_agent_core::events::{AgentEventKind, EventEnvelope};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::broadcast;
 
 const FANOUT_BUFFER: usize = 1024;
@@ -144,9 +145,14 @@ impl InflightAccumulator {
 ///
 /// Delivers `EventEnvelope` (durable or ephemeral) to live subscribers.
 /// No persistence behavior.
+///
+/// Envelopes travel as `Arc<EventEnvelope>`: a broadcast channel clones the
+/// value once per receiver on `recv`, and an event can carry a whole tool
+/// result. Sharing it makes that clone a reference-count bump, so a receiver
+/// that filters by session after receiving pays nothing for events it drops.
 pub struct EventFanout {
-    sender: broadcast::Sender<EventEnvelope>,
-    delegation_sender: broadcast::Sender<(EventEnvelope, Option<tracing::Span>)>,
+    sender: broadcast::Sender<Arc<EventEnvelope>>,
+    delegation_sender: broadcast::Sender<(Arc<EventEnvelope>, Option<tracing::Span>)>,
     delegation_activity:
         parking_lot::Mutex<crate::control::delegation_notifications::DelegationUpdateProjector>,
     inflight: parking_lot::Mutex<InflightAccumulator>,
@@ -174,7 +180,7 @@ impl EventFanout {
     }
 
     /// Subscribe to the live event stream.
-    pub fn subscribe(&self) -> broadcast::Receiver<EventEnvelope> {
+    pub fn subscribe(&self) -> broadcast::Receiver<Arc<EventEnvelope>> {
         self.sender.subscribe()
     }
 
@@ -195,7 +201,7 @@ impl EventFanout {
     #[doc(hidden)]
     pub fn subscribe_delegation(
         &self,
-    ) -> broadcast::Receiver<(EventEnvelope, Option<tracing::Span>)> {
+    ) -> broadcast::Receiver<(Arc<EventEnvelope>, Option<tracing::Span>)> {
         self.delegation_sender.subscribe()
     }
 
@@ -208,8 +214,9 @@ impl EventFanout {
         self.delegation_activity.lock().project_envelope(&envelope);
         // Folded before the send, under the same order subscribers see.
         self.inflight.lock().observe(&envelope);
+        let envelope = Arc::new(envelope);
         if Self::is_delegation_event(envelope.kind()) {
-            let _ = self.delegation_sender.send((envelope.clone(), parent));
+            let _ = self.delegation_sender.send((Arc::clone(&envelope), parent));
         }
         let _ = self.sender.send(envelope);
     }

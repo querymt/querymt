@@ -165,6 +165,10 @@ impl super::LocalAgentHandle {
 }
 
 #[cfg(feature = "remote")]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "used as a `map_err` callback, so it must take the error by value"
+)]
 fn remote_lifecycle_error(error: agent_client_protocol::Error) -> SessionError {
     SessionError::InvalidOperation(format!(
         "Remote session lifecycle owner request failed: {error}"

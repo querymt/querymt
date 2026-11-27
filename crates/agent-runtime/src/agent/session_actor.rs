@@ -2015,7 +2015,7 @@ impl Message<Undo> for SessionActor {
             .cwd
             .as_ref()
             .ok_or(UndoError::NoWorkingDirectory)?
-            .to_path_buf();
+            .clone();
 
         // Delegate to free function using our owned state, under the
         // checkout mutation gate when one is configured so undo never
@@ -2052,7 +2052,7 @@ impl Message<Redo> for SessionActor {
             .cwd
             .as_ref()
             .ok_or(UndoError::NoWorkingDirectory)?
-            .to_path_buf();
+            .clone();
 
         // Restore under the checkout mutation gate when one is configured.
         let fut = crate::agent::undo::redo_impl(
@@ -4493,7 +4493,7 @@ async fn execute_prompt_inner_unboxed(
     };
     let objective = crate::agent::objective::RunObjective::new(
         run_id,
-        normalized_run_instruction(&req.prompt),
+        &normalized_run_instruction(&req.prompt),
         origin_label,
         objective_task,
         turn.state.current_intent.clone(),
@@ -4556,7 +4556,7 @@ async fn execute_prompt_inner_unboxed(
         // The start and change records of a run share the run's turn id.
         let pre_turn_id = turn_id;
         let backend = Arc::clone(backend);
-        let worktree = worktree.to_path_buf();
+        let worktree = worktree.clone();
         let worktree_display = worktree.display().to_string();
         let session_id_for_task = session_id.clone();
 
@@ -4672,7 +4672,7 @@ async fn execute_prompt_inner_unboxed(
                                     turn_id,
                                     snapshot_id: post_snapshot_id,
                                     base_snapshot_id: Some(pre_snapshot_id),
-                                    workspace_root: Some(worktree.to_path_buf()),
+                                    workspace_root: Some(worktree.clone()),
                                     inherited: false,
                                     changed_paths: changed
                                         .iter()
@@ -5414,13 +5414,9 @@ mod tests {
             ));
             let event_journal = Arc::new(FailNextAppendJournal::new(mock_storage.event_journal()));
             let config = Arc::new(
-                AgentConfigBuilder::from_provider(
-                    mock_storage.clone(),
-                    provider,
-                    event_journal.clone(),
-                )
-                .with_tool_policy(ToolPolicy::ProviderOnly)
-                .build(),
+                AgentConfigBuilder::from_provider(mock_storage, provider, event_journal.clone())
+                    .with_tool_policy(ToolPolicy::ProviderOnly)
+                    .build(),
             );
 
             let runtime = crate::agent::core::SessionRuntime::new(
@@ -6297,7 +6293,9 @@ mod tests {
         owner: ActorFixture,
         journal: Arc<dyn EventJournal>,
         sink: Arc<querymt_agent_services::event_sink::EventSink>,
-        rx: tokio::sync::broadcast::Receiver<querymt_agent_core::events::EventEnvelope>,
+        rx: tokio::sync::broadcast::Receiver<
+            std::sync::Arc<querymt_agent_core::events::EventEnvelope>,
+        >,
     }
 
     #[cfg(feature = "remote")]
@@ -8888,7 +8886,9 @@ mod tests {
     }
 
     fn drain_provider_changes(
-        rx: &mut tokio::sync::broadcast::Receiver<querymt_agent_core::events::EventEnvelope>,
+        rx: &mut tokio::sync::broadcast::Receiver<
+            std::sync::Arc<querymt_agent_core::events::EventEnvelope>,
+        >,
     ) -> usize {
         let mut changes = 0;
         while let Ok(envelope) = rx.try_recv() {

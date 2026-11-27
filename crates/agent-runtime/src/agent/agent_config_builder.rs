@@ -86,16 +86,18 @@ impl AgentConfigBuilder {
         initial_config: LLMParams,
     ) -> Self {
         let provider = Arc::new(SessionProvider::new(
-            Arc::clone(&plugin_registry),
+            plugin_registry,
             storage.session_store(),
             initial_config,
         ));
         let event_journal = storage.event_journal();
+        let schedule_repository = storage.schedule_repository();
+        let knowledge_store = storage.knowledge_store();
         let mut tool_registry = ToolRegistry::new();
         tool_registry.extend(crate::agent::builtin_tools::all_builtin_tools());
 
         Self {
-            storage: storage.clone(),
+            storage,
             provider,
             event_journal,
             event_fanout: Arc::new(EventFanout::new()),
@@ -125,8 +127,8 @@ impl AgentConfigBuilder {
             pending_elicitations: Arc::new(Mutex::new(std::collections::HashMap::new())),
             mcp_servers: Vec::new(),
             session_mcp_attachment_source: Arc::new(NoopSessionMcpAttachmentSource),
-            schedule_repository: storage.schedule_repository(),
-            knowledge_store: storage.knowledge_store(),
+            schedule_repository,
+            knowledge_store,
             slash_command_registry: crate::slash_commands::SlashCommandRegistry::empty(),
             slash_commands_config: None,
             hooks: Hooks::disabled(),
@@ -146,8 +148,10 @@ impl AgentConfigBuilder {
         provider: Arc<SessionProvider>,
         event_journal: Arc<dyn EventJournal>,
     ) -> Self {
+        let schedule_repository = storage.schedule_repository();
+        let knowledge_store = storage.knowledge_store();
         Self {
-            storage: storage.clone(),
+            storage,
             provider,
             event_journal,
             event_fanout: Arc::new(EventFanout::new()),
@@ -177,8 +181,8 @@ impl AgentConfigBuilder {
             pending_elicitations: Arc::new(Mutex::new(std::collections::HashMap::new())),
             mcp_servers: Vec::new(),
             session_mcp_attachment_source: Arc::new(NoopSessionMcpAttachmentSource),
-            schedule_repository: storage.schedule_repository(),
-            knowledge_store: storage.knowledge_store(),
+            schedule_repository,
+            knowledge_store,
             slash_command_registry: crate::slash_commands::SlashCommandRegistry::empty(),
             slash_commands_config: None,
             hooks: Hooks::disabled(),
@@ -699,7 +703,7 @@ mod tests {
         let (registry, temp_dir) = empty_plugin_registry().unwrap();
         let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
         let llm = LLMParams::new().provider("mock").model("mock-model");
-        let builder = AgentConfigBuilder::new(Arc::new(registry), storage.clone(), llm);
+        let builder = AgentConfigBuilder::new(Arc::new(registry), storage, llm);
         (builder, temp_dir)
     }
 

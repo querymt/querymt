@@ -221,7 +221,7 @@ mod tests {
             make_text_message("3", "s1", ChatRole::User, "How are you?"),
         ];
 
-        let filtered = filter_to_effective_history(messages.clone());
+        let filtered = filter_to_effective_history(messages);
         assert_eq!(filtered.len(), 3);
         assert_eq!(filtered[0].id, "1");
     }
@@ -357,7 +357,7 @@ mod tests {
         let kept_call_ids: std::collections::HashSet<String> = filtered
             .iter()
             .flat_map(|m| m.function_calls())
-            .map(|call| call.id.clone())
+            .map(|call| call.id)
             .collect();
         for msg in &filtered {
             for part in &msg.parts {
@@ -451,7 +451,7 @@ mod tests {
             MessageFixture::assistant_message("4", "s1", "ok"),
         ];
 
-        let merged = merge_consecutive_tool_result_messages(messages.clone());
+        let merged = merge_consecutive_tool_result_messages(messages);
         assert_eq!(merged.len(), 4);
         assert_eq!(merged[2].parts.len(), 1);
     }

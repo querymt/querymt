@@ -152,11 +152,11 @@ pub type PendingElicitationMap = crate::elicitation::PendingElicitationMap;
 
 #[doc(hidden)]
 pub fn create_elicitation_request(
-    elicitation_id: String,
+    elicitation_id: &str,
     session_id: String,
     message: String,
     requested_schema: serde_json::Value,
-    source: String,
+    source: &str,
 ) -> Result<CreateElicitationRequest, Error> {
     let schema = serde_json::from_value::<ElicitationSchema>(requested_schema).map_err(|err| {
         Error::invalid_params().data(format!("Invalid elicitation schema: {err}"))
@@ -788,6 +788,10 @@ pub const QMT_NOTIFICATION_AGENTS_CHANGED: &str = "querymt/agents/changed";
 pub const QMT_NOTIFICATION_SESSION_PINS_CHANGED: &str = "querymt/session/pinsChanged";
 pub const QMT_NOTIFICATION_SESSION_PLANS_CHANGED: &str = "querymt/session/plansChanged";
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "callers build `params` inline with `json!`; a reference would only add noise"
+)]
 fn ext_notification(method: &str, params: serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "jsonrpc": "2.0",
@@ -1285,7 +1289,7 @@ where
     I: IntoIterator<Item = AgentEvent>,
 {
     let events: Vec<AgentEvent> = events.into_iter().collect();
-    let materialized = materialize_replay_state(&events, capabilities);
+    let materialized = materialize_replay_state(&events, *capabilities);
     let mut notifications = Vec::new();
     let session = crate::acp::protocol::SessionId::from(session_id.to_string());
     let push = |update: SessionUpdate, notifications: &mut Vec<_>| {
@@ -1517,7 +1521,7 @@ struct ReplayCompactionTerminal {
 /// Folds durable events into the current session-update state for replay.
 fn materialize_replay_state(
     events: &[AgentEvent],
-    capabilities: &AcpSessionUpdateCapabilities,
+    capabilities: AcpSessionUpdateCapabilities,
 ) -> MaterializedReplayState {
     let _ = capabilities;
     let mut state = MaterializedReplayState::default();
@@ -1768,7 +1772,7 @@ const CURSOR_UPDATES_KEY: &str = "cursorUpdates";
 /// cursors (it was never sent the compactions they follow).
 pub(crate) fn scope_cursor_updates(
     holder: &mut serde_json::Map<String, serde_json::Value>,
-    capabilities: &AcpSessionUpdateCapabilities,
+    capabilities: AcpSessionUpdateCapabilities,
 ) {
     use querymt_agent_core::replay::CursorTarget;
     if !capabilities.cursors {
@@ -1797,7 +1801,7 @@ pub(crate) fn scope_cursor_updates(
 /// response's `_meta`.
 pub(crate) fn scope_load_cursor_updates(
     meta: Option<&mut serde_json::Map<String, serde_json::Value>>,
-    capabilities: &AcpSessionUpdateCapabilities,
+    capabilities: AcpSessionUpdateCapabilities,
 ) {
     if let Some(snapshot) = meta
         .and_then(|meta| meta.get_mut(SESSION_LOAD_SNAPSHOT_RESPONSE_KEY))
@@ -1812,7 +1816,7 @@ pub(crate) fn scope_load_cursor_updates(
 pub(crate) fn scope_ext_response_cursor_updates(
     method: &str,
     response: &mut serde_json::Value,
-    capabilities: &AcpSessionUpdateCapabilities,
+    capabilities: AcpSessionUpdateCapabilities,
 ) {
     if normalize_querymt_ext_method(method) != QUERYMT_SESSION_HISTORY_METHOD {
         return;
@@ -4191,7 +4195,7 @@ fn rpc_session_load<'a, S: SendAgent>(
                     value
                         .get_mut("_meta")
                         .and_then(serde_json::Value::as_object_mut),
-                    &capabilities,
+                    capabilities,
                 );
                 let local_agent = agent.as_any().downcast_ref::<AgentHandle>();
                 if let (Some(hooks), Some(local_agent)) =
@@ -4341,7 +4345,7 @@ fn rpc_querymt_ext_method<'a, S: SendAgent>(
                 scope_ext_response_cursor_updates(
                     ext_method,
                     &mut value,
-                    &context.session_update_capabilities(),
+                    context.session_update_capabilities(),
                 );
                 let session_id = session_id_for_owner
                     .clone()
@@ -4602,7 +4606,7 @@ mod cursor_scope_tests {
 
     fn scoped(method: &str, capabilities: AcpSessionUpdateCapabilities) -> Value {
         let mut response = page();
-        scope_ext_response_cursor_updates(method, &mut response, &capabilities);
+        scope_ext_response_cursor_updates(method, &mut response, capabilities);
         response
     }
 
@@ -4644,7 +4648,7 @@ mod cursor_scope_tests {
             cursors: true,
             ..Default::default()
         };
-        scope_ext_response_cursor_updates("_querymt/session/history", &mut response, &capabilities);
+        scope_ext_response_cursor_updates("_querymt/session/history", &mut response, capabilities);
         assert!(response.get("cursorUpdates").is_none(), "{response}");
     }
 
@@ -4661,14 +4665,14 @@ mod cursor_scope_tests {
     fn load_snapshot_is_scoped_inside_the_response_meta() {
         let mut meta = serde_json::Map::new();
         meta.insert(SESSION_LOAD_SNAPSHOT_RESPONSE_KEY.into(), page());
-        scope_load_cursor_updates(Some(&mut meta), &AcpSessionUpdateCapabilities::default());
+        scope_load_cursor_updates(Some(&mut meta), AcpSessionUpdateCapabilities::default());
         assert!(
             meta[SESSION_LOAD_SNAPSHOT_RESPONSE_KEY]
                 .get("cursorUpdates")
                 .is_none()
         );
         // A load without a snapshot has nothing to scope.
-        scope_load_cursor_updates(None, &AcpSessionUpdateCapabilities::default());
+        scope_load_cursor_updates(None, AcpSessionUpdateCapabilities::default());
     }
 }
 
@@ -4890,14 +4894,14 @@ mod tests {
     #[test]
     fn elicitation_request_rejects_unknown_property_types() {
         let result = create_elicitation_request(
-            "e-1".to_string(),
+            "e-1",
             "s-1".to_string(),
             "Invalid".to_string(),
             serde_json::json!({
                 "type": "object",
                 "properties": {"nested": {"type": "object"}}
             }),
-            "test".to_string(),
+            "test",
         );
 
         assert!(result.is_err());
@@ -4906,7 +4910,7 @@ mod tests {
     #[test]
     fn elicitation_request_accepts_supported_property_types() {
         let result = create_elicitation_request(
-            "e-1".to_string(),
+            "e-1",
             "s-1".to_string(),
             "Supported".to_string(),
             serde_json::json!({
@@ -4922,7 +4926,7 @@ mod tests {
                     }
                 }
             }),
-            "test".to_string(),
+            "test",
         );
 
         assert!(result.is_ok());
@@ -9551,7 +9555,7 @@ mod session_update_tests {
                     AgentEventKind::ToolCallStart {
                         tool_call_id: "tc-2".to_string(),
                         tool_name: "todowrite".to_string(),
-                        arguments: todo_args(&[]).to_string(),
+                        arguments: todo_args(&[]),
                     },
                 ))
                 .remove(0),
@@ -11274,7 +11278,7 @@ mod session_update_tests {
             ),
         ];
 
-        let updates = replay_updates(events.clone(), plan_ops());
+        let updates = replay_updates(events, plan_ops());
 
         let mode_updates: Vec<&SessionUpdate> = updates
             .iter()

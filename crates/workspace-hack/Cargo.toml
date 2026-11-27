@@ -13,6 +13,9 @@ publish = false
 # The parts of the file between the BEGIN HAKARI SECTION and END HAKARI SECTION comments
 # are managed by hakari.
 
+[lints]
+workspace = true
+
 ### BEGIN HAKARI SECTION
 [dependencies]
 aead = { version = "0.5", default-features = false, features = ["alloc"] }

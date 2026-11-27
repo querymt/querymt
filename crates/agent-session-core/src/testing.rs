@@ -205,7 +205,7 @@ fn model_call(
     );
     let accounting = RequestAccounting {
         operation_id: attempt.operation_id.clone(),
-        attempt_ids: vec![attempt.attempt_id.clone()],
+        attempt_ids: vec![attempt.attempt_id],
         known_subtotal_usd: settlement.valuation.known_subtotal_usd,
         complete: settlement.valuation.complete_total_usd.is_some(),
         reasons: Vec::new(),

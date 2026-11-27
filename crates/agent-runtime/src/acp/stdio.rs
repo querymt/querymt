@@ -278,7 +278,7 @@ async fn prepare_session_load(
         .await?;
     // The snapshot carries the session's cursors only for a client that
     // advertised them.
-    crate::acp::shared::scope_load_cursor_updates(response.meta.as_mut(), capabilities);
+    crate::acp::shared::scope_load_cursor_updates(response.meta.as_mut(), *capabilities);
     let snapshot = crate::acp::snapshot_view::LoadSnapshotView::from_meta(response.meta.as_ref());
     // Snapshot-capable clients hydrate history from the load-response snapshot.
     // Skipping replay here also avoids the redundant event-stream and message
@@ -533,11 +533,11 @@ async fn run_bridge_task(
                 let task_response_tx = response_tx.clone();
                 let spawn_result = connection.spawn(async move {
                     let result = match create_elicitation_request(
-                        elicitation_id,
+                        &elicitation_id,
                         session_id,
                         message,
                         requested_schema,
-                        source,
+                        &source,
                     ) {
                         Ok(request) => task_connection
                             .send_request(request)
@@ -1582,7 +1582,7 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
                                 crate::acp::shared::scope_ext_response_cursor_updates(
                                     &method,
                                     value,
-                                    &capabilities,
+                                    capabilities,
                                 );
                             }
                             // A remote attach binds a session to this connection
@@ -2751,7 +2751,7 @@ mod stdio_tests {
     #[test]
     fn native_elicitation_request_preserves_scope_schema_and_metadata() {
         let request = create_elicitation_request(
-            "e-1".to_string(),
+            "e-1",
             "s-1".to_string(),
             "Choose one".to_string(),
             serde_json::json!({
@@ -2764,7 +2764,7 @@ mod stdio_tests {
                 },
                 "required": ["selection"]
             }),
-            "builtin:question".to_string(),
+            "builtin:question",
         )
         .expect("native elicitation request");
 
@@ -2784,11 +2784,11 @@ mod stdio_tests {
     #[test]
     fn native_elicitation_rejects_invalid_schema() {
         let result = create_elicitation_request(
-            "e-1".to_string(),
+            "e-1",
             "s-1".to_string(),
             "Invalid".to_string(),
             serde_json::json!({"type": "object", "properties": {"nested": {"type": "object"}}}),
-            "test".to_string(),
+            "test",
         );
 
         assert!(result.is_err());

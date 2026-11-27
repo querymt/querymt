@@ -33,7 +33,13 @@ pub(crate) fn origin(provider: &str, model: &str) -> String {
 /// The tools the model can call after the baseline in effect and the tool
 /// changes stored after it, ordered by name: each change applied in order to
 /// the baseline's list. Without a baseline nothing is offered by the history.
+#[cfg(test)]
 pub(crate) fn offered(history: &[AgentMessage]) -> Vec<Tool> {
+    offered_refs(history).into_iter().cloned().collect()
+}
+
+/// [`offered`], borrowed from the history: no tool definition is copied.
+pub(crate) fn offered_refs(history: &[AgentMessage]) -> Vec<&Tool> {
     let Some(baseline) = tool_baseline(history) else {
         return Vec::new();
     };
@@ -55,15 +61,18 @@ pub(crate) fn offered(history: &[AgentMessage]) -> Vec<Tool> {
             }
         }
     }
-    offered.into_values().cloned().collect()
+    offered.into_values().collect()
 }
 
 /// What the tools offered now add, redefine and remove compared with
 /// `offered`; `None` when nothing differs. Both lists are in name order when
 /// `current` and `offered` are.
-pub(crate) fn diff(offered: &[Tool], current: &[Tool]) -> Option<ToolChange> {
+pub(crate) fn diff<'a>(
+    offered: impl IntoIterator<Item = &'a Tool>,
+    current: &[Tool],
+) -> Option<ToolChange> {
     let before: BTreeMap<&str, &Tool> = offered
-        .iter()
+        .into_iter()
         .map(|tool| (tool.function.name.as_str(), tool))
         .collect();
     let added: Vec<Tool> = current
@@ -143,7 +152,7 @@ pub(crate) async fn resolve(
             .map_err(TurnError::history("Failed to store tool baseline"))?;
     }
 
-    if change_allowed && let Some(change) = diff(&offered(turn.history.as_slice()), tools) {
+    if change_allowed && let Some(change) = diff(offered_refs(turn.history.as_slice()), tools) {
         let mut message = AgentMessage::new(env.session_id.clone(), querymt::chat::ChatRole::User);
         message.parts.push(MessagePart::ToolChange {
             added: change.added,

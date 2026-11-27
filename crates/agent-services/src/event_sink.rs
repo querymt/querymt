@@ -1075,7 +1075,6 @@ mod tests {
 
     #[tokio::test]
     async fn ephemeral_emitted_before_base_resolves_is_numbered_after_the_journal() {
-        use querymt_agent_core::events::EventEnvelope;
         use tokio::sync::broadcast::error::TryRecvError;
 
         let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
@@ -1121,7 +1120,7 @@ mod tests {
             .await
             .expect("event is published once the base resolves")
             .unwrap();
-        let EventEnvelope::Ephemeral(event) = envelope else {
+        let Some(event) = envelope.as_ephemeral() else {
             panic!("expected the ephemeral event");
         };
         assert_eq!(event.session_seq, 4);

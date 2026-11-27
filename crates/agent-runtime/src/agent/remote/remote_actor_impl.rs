@@ -303,6 +303,10 @@ fn selects_remote_node(
         .is_some_and(|node| node != origin.key().host)
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "callers pass `Arc<dyn QuotaStore>`; by-value is what upcasts it to `Arc<dyn GrantStore>`"
+)]
 fn register_session_interactions(
     router: &InboundRouter,
     store: Arc<dyn GrantStore>,
@@ -336,6 +340,10 @@ fn register_session_interactions(
     interaction::<messages::ResolveInteraction>(router, &store, actor);
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "callers pass `Arc<dyn QuotaStore>`; by-value is what upcasts it to `Arc<dyn GrantStore>`"
+)]
 pub(super) fn register_session_turns(
     router: &InboundRouter,
     store: Arc<dyn GrantStore>,

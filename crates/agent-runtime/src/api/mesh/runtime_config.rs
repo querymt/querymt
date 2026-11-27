@@ -6,6 +6,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 #[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "public constructor; `transport` and `discovery` are kept for the config shape"
+)]
 pub fn from_toml_config(
     enabled: bool,
     transport: crate::config::MeshTransportConfig,

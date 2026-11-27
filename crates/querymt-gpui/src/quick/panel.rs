@@ -1682,7 +1682,7 @@ impl QuickPanel {
             part("quick-run-effort", run.effort_pending)
                 .child(
                     v_flex()
-                        .child(div().whitespace_nowrap().child(effort.clone()))
+                        .child(div().whitespace_nowrap().child(effort))
                         .children(others),
                 )
                 .tooltip(move |window, cx| {
@@ -1805,7 +1805,7 @@ impl QuickPanel {
                 let h = f(f32::from(bounds.size.height));
                 if (cell.get() - h).abs() > 0.5 {
                     cell.set(h);
-                    let weak = weak.clone();
+                    let weak = weak;
                     window.on_next_frame(move |_, cx| {
                         let _ = weak.update(cx, |_, cx| cx.notify());
                     });
@@ -2327,7 +2327,7 @@ impl QuickPanel {
                             .flex()
                             .items_center()
                             .text_color(p.muted)
-                            .child(text(90., agent.clone()))
+                            .child(text(90., agent))
                             .into_any_element(),
                     );
                 }

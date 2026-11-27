@@ -326,6 +326,10 @@ mod access {
         Error::new(-32000, message.to_owned()).data(json!({"code": code}))
     }
 
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "used as a `map_err` callback, so it must take the error by value"
+    )]
     pub(super) fn grant_error(error: GrantStoreError) -> Error {
         match error {
             GrantStoreError::Invalid(_) => invalid(),

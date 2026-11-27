@@ -10,6 +10,11 @@ authors = [
 repository = "https://github.com/querymt/querymt"
 homepage = "https://query.mt"
 
+# Not on [workspace.lints] yet: the clippy lints there still flag existing code in
+# this crate. An empty table records the opt-out; replace it with
+# `workspace = true` once the crate is clean.
+[lints]
+
 [features]
 default = ["desktop"]
 # Compatibility/documentation feature for crates that depend on the core QueryMT API.

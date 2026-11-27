@@ -56,7 +56,7 @@ mod tests {
     #[test]
     fn binding_key_is_stable_and_distinguishes_scopes() {
         let base = workspace_identity(Path::new("/ws/one"));
-        assert_eq!(base.binding_key(), base.clone().binding_key());
+        assert_eq!(base.binding_key(), base.binding_key());
         assert!(
             base.binding_key()
                 .starts_with("dotagents:v1:automation:workspace:")

@@ -105,7 +105,7 @@ pub(super) async fn agent_snapshots_with_journal(
         let mut response = json!({ "_meta": { "querymt/sessionLoadSnapshot.v1": snapshot } });
         crate::acp::shared::scope_load_cursor_updates(
             response["_meta"].as_object_mut(),
-            &gpui_capabilities(),
+            gpui_capabilities(),
         );
         response
     };

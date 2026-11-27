@@ -340,7 +340,7 @@ impl SkillTool {
             return;
         };
         if let Some(skills) = crate::skills::mcp::discover_server_skills(server, &peer).await {
-            self.mcp_state.replace_server(server, None, Some(skills));
+            self.mcp_state.replace_server(server, None, Some(&skills));
         }
     }
 
@@ -2246,7 +2246,7 @@ Body
         // local registry refresh is pending): the MCP default `Ask` applies.
         let (h, _) = load_tool(vec![ScriptedSkill::new("a", "A")]).await;
         let state = crate::agent::core::McpToolState::empty();
-        state.replace_server("harness", None, Some(h.tool_state.load().skills.clone()));
+        state.replace_server("harness", None, Some(&h.tool_state.load().skills));
         assert!(state.load().skill_servers.is_empty());
         let tool = mcp_tool(catalog_with_perms(&[]), state, Default::default());
         let ctx = RecordingContext::new(Some("c"), "Deny");

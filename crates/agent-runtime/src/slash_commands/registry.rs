@@ -305,7 +305,7 @@ mod tests {
         assert!(registry.get("needs-script").is_none());
         assert!(registry.get("configured").is_some());
 
-        let mut scripts_enabled = config.clone();
+        let mut scripts_enabled = config;
         scripts_enabled.scripts.enabled = true;
         let registry =
             SlashCommandRegistry::registry_for_workspace(&scripts_enabled, workspace.path());

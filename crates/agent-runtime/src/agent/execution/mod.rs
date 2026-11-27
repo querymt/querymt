@@ -585,21 +585,23 @@ mod tests {
         }
 
         /// `price_limit` notices published so far.
-        async fn notices(rx: &mut tokio::sync::broadcast::Receiver<EventEnvelope>) -> Vec<String> {
+        async fn notices(
+            rx: &mut tokio::sync::broadcast::Receiver<std::sync::Arc<EventEnvelope>>,
+        ) -> Vec<String> {
             let mut out = Vec::new();
             while let Ok(Ok(envelope)) =
                 tokio::time::timeout(Duration::from_millis(150), rx.recv()).await
             {
-                if let EventEnvelope::Durable(event) = envelope
+                if let Some(event) = envelope.as_durable()
                     && let AgentEventKind::HookNotice {
                         event_name,
                         message,
                         is_error,
-                    } = event.kind
+                    } = &event.kind
                     && event_name == "price_limit"
                 {
-                    assert!(!is_error, "a best-effort warning is not an error");
-                    out.push(message);
+                    assert!(!*is_error, "a best-effort warning is not an error");
+                    out.push(message.clone());
                 }
             }
             out
@@ -794,7 +796,7 @@ mod tests {
                 .await
                 .expect("steering events should arrive")
                 .expect("event stream should remain open");
-            observed.push(event);
+            observed.push(std::sync::Arc::unwrap_or_clone(event));
         }
         for (index, block) in blocks.iter().enumerate() {
             assert!(matches!(
@@ -1027,7 +1029,7 @@ mod tests {
         // The review is a stored notice; the rendered objective never carries it.
         let objective = crate::agent::objective::RunObjective::new(
             querymt_agent_core::model::TurnId::new(),
-            "Implement the fix".into(),
+            "Implement the fix",
             "interactive".into(),
             None,
             None,
@@ -1122,7 +1124,7 @@ mod tests {
     fn objective_for(prompt: &str) -> crate::agent::objective::RunObjective {
         crate::agent::objective::RunObjective::new(
             querymt_agent_core::model::TurnId::new(),
-            prompt.into(),
+            prompt,
             "interactive".into(),
             None,
             None,

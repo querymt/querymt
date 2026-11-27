@@ -690,7 +690,7 @@ mod tests {
             },
             DiscoveryOptions {
                 allow_ignored: !base.allow_ignored,
-                ..base.clone()
+                ..base
             },
         ];
         for variant in &variants {

@@ -496,8 +496,12 @@ pub fn decide_task_reconciliation(
         let mut ownership =
             DotagentsTaskOwnership::pending(&activation.identity, fingerprint.clone());
         // Keep the existing record IDs: an update must not create duplicates.
-        ownership.task_public_id = existing.task_public_id.clone();
-        ownership.schedule_public_id = existing.schedule_public_id.clone();
+        ownership
+            .task_public_id
+            .clone_from(&existing.task_public_id);
+        ownership
+            .schedule_public_id
+            .clone_from(&existing.schedule_public_id);
         return DotagentsTaskReconcileOutcome {
             action: DotagentsTaskReconcileAction::Update,
             identity,
@@ -508,11 +512,11 @@ pub fn decide_task_reconciliation(
     }
 
     let mut ownership = existing.clone();
-    ownership.fingerprint = fingerprint.clone();
+    ownership.fingerprint.clone_from(&fingerprint);
     DotagentsTaskReconcileOutcome {
         action: DotagentsTaskReconcileAction::AwaitingApproval,
         identity,
-        fingerprint: fingerprint.clone(),
+        fingerprint,
         ownership: Some(ownership),
         diagnostic: Some(DotagentsDiagnostic::warning(
             DotagentsDiagnosticCode::UnsafePolicy,
@@ -1404,7 +1408,7 @@ mod tests {
                 .get_ownership(&activation.identity.source_key())
                 .await
                 .unwrap()
-                .map(|o| o.task_creation_key.clone()),
+                .map(|o| o.task_creation_key),
             Some(identity().task_creation_key()),
             "exactly one ownership row is keyed by the protocol source"
         );

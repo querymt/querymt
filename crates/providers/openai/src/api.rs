@@ -972,7 +972,7 @@ pub fn openai_parse_stt<C: OpenAIProviderConfig>(
         });
     }
 
-    let text = String::from_utf8(resp.body().to_vec())?;
+    let text = String::from_utf8(resp.body().clone())?;
     Ok(SttResponse { text })
 }
 
@@ -2363,7 +2363,7 @@ fn normalize_responses_response_with(
             provider: provider.name.to_string(),
             protocol: provider.protocol.to_string(),
             model: parsed.model.clone().unwrap_or_default(),
-            endpoint: provider.endpoint.to_string(),
+            endpoint: provider.endpoint,
         }),
         extensions: Extensions::new(),
     }
@@ -3645,7 +3645,7 @@ fn parse_openai_responses_sse_chunk_inner(
                                 provider: state.provider.name.to_string(),
                                 protocol: state.provider.protocol.to_string(),
                                 model: state.model.clone().unwrap_or_default(),
-                                endpoint: state.provider.endpoint.to_string(),
+                                endpoint: state.provider.endpoint.clone(),
                             }),
                         },
                     ));

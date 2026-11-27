@@ -601,11 +601,11 @@ pub(crate) async fn run_websocket_bridge_with_timeout(
                 response_tx,
             } => {
                 let request = match create_elicitation_request(
-                    elicitation_id,
+                    &elicitation_id,
                     session_id,
                     message,
                     requested_schema,
-                    source,
+                    &source,
                 ) {
                     Ok(request) => request,
                     Err(error) => {
@@ -933,11 +933,11 @@ pub(crate) async fn deliver_claimed_websocket_elicitation(
         ..
     } = connection;
     let request = match create_elicitation_request(
-        claim.elicitation_id.clone(),
+        &claim.elicitation_id,
         claim.session_id.clone(),
         claim.form.message.clone(),
         claim.form.requested_schema.clone(),
-        claim.form.source.clone(),
+        &claim.form.source,
     ) {
         Ok(request) => request,
         Err(error) => {
@@ -1055,11 +1055,11 @@ pub(crate) async fn deliver_claimed_websocket_elicitation(
                             return;
                         };
                         match create_elicitation_request(
-                            next_claim.elicitation_id.clone(),
+                            &next_claim.elicitation_id,
                             next_claim.session_id.clone(),
                             next_claim.form.message.clone(),
                             next_claim.form.requested_schema.clone(),
-                            next_claim.form.source.clone(),
+                            &next_claim.form.source,
                         ) {
                             Err(error) => {
                                 log::warn!(
@@ -1612,6 +1612,10 @@ fn spawn_global_notification_forwarders(state: WsServerState, connection: Connec
 
     let mut model_updates = state.agent.model_inventory.subscribe_updates();
     let tx = connection.tx.clone();
+    #[allow(
+        clippy::redundant_clone,
+        reason = "`connection` is read again by the `remote` block below"
+    )]
     let cancel = connection.connection_cancel.clone();
     tokio::spawn(async move {
         loop {
@@ -1882,7 +1886,7 @@ pub(super) async fn forward_session_event(
     state: &WsServerState,
     connection: &ConnectionEventState,
     translator: &Arc<StdMutex<AcpLiveEventTranslator>>,
-    event: crate::events::EventEnvelope,
+    event: Arc<crate::events::EventEnvelope>,
 ) -> bool {
     if matches!(
         event.kind(),

@@ -286,7 +286,7 @@ impl From<OllamaResponse> for ChatOutput {
             .as_ref()
             .or(response.response.as_ref())
             .or(response.message.as_ref().map(|m| &m.content))
-            .map(|s| s.to_string());
+            .map(|s| s.clone());
 
         let tool_calls = response.message.as_ref().and_then(|msg| {
             msg.tool_calls.as_ref().map(|calls| {

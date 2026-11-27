@@ -817,8 +817,8 @@ mod tests {
                 .unwrap()
         }
 
-        fn ask_with(&self, request: QueryRequest) -> Result<QueryResponse, QueryError> {
-            self.service.query(&request)
+        fn ask_with(&self, request: &QueryRequest) -> Result<QueryResponse, QueryError> {
+            self.service.query(request)
         }
     }
 
@@ -892,7 +892,7 @@ mod tests {
         fx.put("src/session/mod.rs", "");
         fx.put("src/tools/session.rs", "");
         let response = fx
-            .ask_with(QueryRequest {
+            .ask_with(&QueryRequest {
                 question: "session".into(),
                 lane: Lane::Navigation,
                 ..Default::default()
@@ -926,7 +926,7 @@ mod tests {
         let fx = Fx::new();
         fx.put("src/queue.rs", QUEUE);
         let hit = |question: &str| {
-            fx.ask_with(QueryRequest {
+            fx.ask_with(&QueryRequest {
                 question: question.into(),
                 lane: Lane::Navigation,
                 ..Default::default()
@@ -948,7 +948,7 @@ mod tests {
     fn symbols_are_navigation_records_not_documentation() {
         let fx = Fx::new();
         fx.put("src/queue.rs", QUEUE);
-        let docs = fx.ask_with(QueryRequest {
+        let docs = fx.ask_with(&QueryRequest {
             question: "helper".into(),
             lane: Lane::Documentation,
             ..Default::default()
@@ -961,7 +961,7 @@ mod tests {
         );
         // Path scope confines symbol hits like every other record.
         let scoped = fx
-            .ask_with(QueryRequest {
+            .ask_with(&QueryRequest {
                 question: "helper".into(),
                 path: Some("docs".into()),
                 ..Default::default()
@@ -1002,7 +1002,7 @@ mod tests {
             "docs/map.md",
             "# Map\n\n| File | Purpose |\n|--|--|\n| `../src/queue.rs` | Holds pending work for the scheduler. |\n",
         );
-        let response = fx.ask_with(QueryRequest {
+        let response = fx.ask_with(&QueryRequest {
             question: "pending work scheduler".into(),
             lane: Lane::Navigation,
             ..Default::default()
@@ -1036,7 +1036,7 @@ mod tests {
         fx.put("src/session/store.rs", "");
         fx.put("docs/session.md", "# Sessions\nsession store notes\n");
         let nav = fx
-            .ask_with(QueryRequest {
+            .ask_with(&QueryRequest {
                 question: "session store".into(),
                 lane: Lane::Navigation,
                 ..Default::default()
@@ -1044,7 +1044,7 @@ mod tests {
             .unwrap();
         assert!(!nav.hits.is_empty() && nav.hits.iter().all(|h| h.kind == HitKind::File));
         let docs = fx
-            .ask_with(QueryRequest {
+            .ask_with(&QueryRequest {
                 question: "session store".into(),
                 lane: Lane::Documentation,
                 ..Default::default()
@@ -1082,7 +1082,7 @@ mod tests {
         let fx = Fx::new();
         for blank in ["", "   ", "\n\t"] {
             let error = fx
-                .ask_with(QueryRequest {
+                .ask_with(&QueryRequest {
                     question: blank.into(),
                     ..Default::default()
                 })
@@ -1092,7 +1092,7 @@ mod tests {
         }
         for symbols in ["\"", "???", "()*^-", "a"] {
             let error = fx
-                .ask_with(QueryRequest {
+                .ask_with(&QueryRequest {
                     question: symbols.into(),
                     ..Default::default()
                 })
@@ -1130,7 +1130,7 @@ mod tests {
         // A saturated search reports a lower bound, never an overstated total.
         assert!(default.total_matches > DEFAULT_LIMIT && default.total_matches <= 60);
         let few = fx
-            .ask_with(QueryRequest {
+            .ask_with(&QueryRequest {
                 question: "widget".into(),
                 limit: Some(3),
                 ..Default::default()
@@ -1138,7 +1138,7 @@ mod tests {
             .unwrap();
         assert_eq!(few.hits.len(), 3);
         let huge = fx
-            .ask_with(QueryRequest {
+            .ask_with(&QueryRequest {
                 question: "widget".into(),
                 limit: Some(10_000),
                 ..Default::default()
@@ -1147,7 +1147,7 @@ mod tests {
         assert_eq!(huge.hits.len(), MAX_LIMIT);
         assert!(huge.truncated);
         let zero = fx
-            .ask_with(QueryRequest {
+            .ask_with(&QueryRequest {
                 question: "widget".into(),
                 limit: Some(0),
                 ..Default::default()
@@ -1164,7 +1164,7 @@ mod tests {
         fx.put("docs/a_b/y.md", "# Y\nwidget\n");
         fx.put("docs/axb/w.md", "# W\nwidget\n");
         let in_dir = |path: &str| -> Vec<String> {
-            fx.ask_with(QueryRequest {
+            fx.ask_with(&QueryRequest {
                 question: "widget".into(),
                 path: Some(path.into()),
                 ..Default::default()
@@ -1189,7 +1189,7 @@ mod tests {
             "../etc", "/abs", "a//b", "a/../b", "C:/x", "a\\b", " ", "a\0b",
         ] {
             let error = fx
-                .ask_with(QueryRequest {
+                .ask_with(&QueryRequest {
                     question: "widget".into(),
                     path: Some(path.into()),
                     ..Default::default()

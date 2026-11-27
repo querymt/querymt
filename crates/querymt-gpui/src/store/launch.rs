@@ -844,7 +844,7 @@ mod tests {
         let session = futures::FutureExt::now_or_never(launched)
             .expect("launch finished")
             .expect("session");
-        *shown.borrow_mut() = Some(session.clone());
+        *shown.borrow_mut() = Some(session);
         assert_eq!(first.len(), 1);
         let first_id = prompt_id(&first[0]);
         assert_eq!(prompting(cx), Some(true));

@@ -135,7 +135,7 @@ impl LocalAgentHandle {
     /// Subscribes to agent events via the fanout (live stream).
     pub fn subscribe_events(
         &self,
-    ) -> broadcast::Receiver<querymt_agent_core::events::EventEnvelope> {
+    ) -> broadcast::Receiver<std::sync::Arc<querymt_agent_core::events::EventEnvelope>> {
         self.config.event_sink.fanout().subscribe()
     }
 

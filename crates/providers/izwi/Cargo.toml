@@ -7,6 +7,9 @@ license.workspace = true
 [package.metadata.qmt]
 type = "native"
 
+[lints]
+workspace = true
+
 [features]
 default = ["native"]
 native = ["querymt", "querymt/tracing"]

@@ -538,7 +538,7 @@ pub(crate) fn checkout_status_sync(checkout: &Path) -> WorktreeResult<CheckoutSt
                 status.uncommitted.push(rela_path.to_string());
             }
             gix::status::index_worktree::Item::DirectoryContents { entry, .. } => {
-                match classify_dirwalk_entry(entry) {
+                match classify_dirwalk_entry(&entry) {
                     Some(DirwalkDisposition::Ignored(path)) => {
                         status.ignored.push(path);
                     }
@@ -549,7 +549,7 @@ pub(crate) fn checkout_status_sync(checkout: &Path) -> WorktreeResult<CheckoutSt
                 }
             }
             gix::status::index_worktree::Item::Rewrite { dirwalk_entry, .. } => {
-                match classify_dirwalk_entry(dirwalk_entry) {
+                match classify_dirwalk_entry(&dirwalk_entry) {
                     Some(DirwalkDisposition::Ignored(path)) => {
                         status.ignored.push(path);
                     }
@@ -567,7 +567,7 @@ pub(crate) fn checkout_status_sync(checkout: &Path) -> WorktreeResult<CheckoutSt
     // feeds the removal-safety dirty check).
     if let Some(head_tree) = head_tree_id(&repo)? {
         let mut head_entries = std::collections::HashMap::new();
-        flatten_tree(&repo, head_tree, &mut head_entries, String::new())?;
+        flatten_tree(&repo, head_tree, &mut head_entries, "")?;
         if repo.index_path().exists() {
             let index = repo.open_index().map_err(native_err)?;
             for entry in index.entries() {
@@ -1232,10 +1232,10 @@ impl RepositoryOps for GixRepoOps {
             }
             let mut head_entries = std::collections::HashMap::new();
             if let Some(head_tree) = head_tree_id(&repo)? {
-                flatten_tree(&repo, head_tree, &mut head_entries, String::new())?;
+                flatten_tree(&repo, head_tree, &mut head_entries, "")?;
             }
             let mut captured_entries = std::collections::HashMap::new();
-            flatten_tree(&repo, tree, &mut captured_entries, String::new())?;
+            flatten_tree(&repo, tree, &mut captured_entries, "")?;
 
             let index = repo.open_index().map_err(native_err)?;
             let mut unpreserved = Vec::new();
@@ -1397,7 +1397,7 @@ enum DirwalkDisposition {
     Untracked(String),
 }
 
-fn classify_dirwalk_entry(entry: gix::dir::Entry) -> Option<DirwalkDisposition> {
+fn classify_dirwalk_entry(entry: &gix::dir::Entry) -> Option<DirwalkDisposition> {
     if !matches!(
         entry.disk_kind,
         Some(gix::dir::entry::Kind::File | gix::dir::entry::Kind::Symlink)
@@ -1450,7 +1450,7 @@ pub(crate) fn flatten_tree(
     repo: &gix::Repository,
     tree_id: gix::hash::ObjectId,
     out: &mut FlatTree,
-    prefix: String,
+    prefix: &str,
 ) -> WorktreeResult<()> {
     let tree = repo.find_tree(tree_id).map_err(native_err)?;
     for entry in tree.iter() {
@@ -1461,7 +1461,7 @@ pub(crate) fn flatten_tree(
             format!("{}/{}", prefix, entry.filename()).into()
         };
         if entry.mode().kind() == gix::objs::tree::EntryKind::Tree {
-            flatten_tree(repo, entry.oid().into(), out, path.to_string())?;
+            flatten_tree(repo, entry.oid().into(), out, &path.to_string())?;
         } else {
             let mode = match entry.mode().kind() {
                 gix::objs::tree::EntryKind::Link => gix::index::entry::Mode::SYMLINK,
@@ -1502,9 +1502,9 @@ pub(crate) fn changed_paths_between_trees(
     tip_tree: gix::hash::ObjectId,
 ) -> WorktreeResult<Vec<ChangedPath>> {
     let mut base = FlatTree::new();
-    flatten_tree(repo, base_tree, &mut base, String::new())?;
+    flatten_tree(repo, base_tree, &mut base, "")?;
     let mut tip = FlatTree::new();
-    flatten_tree(repo, tip_tree, &mut tip, String::new())?;
+    flatten_tree(repo, tip_tree, &mut tip, "")?;
     Ok(diff_flattened(&base, &tip))
 }
 
@@ -1580,7 +1580,7 @@ fn classify_and_reconcile(
         let item = item.map_err(native_err)?;
         match item {
             gix::status::index_worktree::Item::DirectoryContents { entry, .. } => {
-                match classify_dirwalk_entry(entry) {
+                match classify_dirwalk_entry(&entry) {
                     Some(DirwalkDisposition::Ignored(path)) => {
                         ignored.push(path);
                     }
@@ -1591,7 +1591,7 @@ fn classify_and_reconcile(
                 }
             }
             gix::status::index_worktree::Item::Rewrite { dirwalk_entry, .. } => {
-                match classify_dirwalk_entry(dirwalk_entry) {
+                match classify_dirwalk_entry(&dirwalk_entry) {
                     Some(DirwalkDisposition::Ignored(path)) => {
                         ignored.push(path);
                     }

@@ -23,6 +23,10 @@ impl LocalAgentHandle {
     /// can route LLM calls through the mesh even though the mesh was bootstrapped
     /// after the config was built.
     #[cfg(feature = "remote")]
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "public API: the handle is a cheap bundle of `Arc`s that callers hand over"
+    )]
     pub fn set_mesh(&self, mesh: crate::agent::remote::MeshHandle) {
         self.set_mesh_local(mesh.clone());
         if let Some(roster) = self.config.roster() {
@@ -35,6 +39,10 @@ impl LocalAgentHandle {
     }
 
     #[cfg(feature = "remote")]
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "mirrors `set_mesh`; the handle is a cheap bundle of `Arc`s"
+    )]
     pub(crate) fn set_mesh_local(&self, mesh: crate::agent::remote::MeshHandle) {
         {
             let mut current = self.mesh.lock().unwrap_or_else(|e| e.into_inner());

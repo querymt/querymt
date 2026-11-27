@@ -202,14 +202,14 @@ impl SessionMaterializer {
     async fn resolve_mcp_inputs(
         &self,
         session_id: &str,
-        cwd: &Option<PathBuf>,
+        cwd: Option<&std::path::Path>,
         kind: SessionMaterializationKind,
         request_mcp_servers: &[McpServer],
     ) -> Result<ResolvedSessionMcpInputs, Error> {
         // Resolve attachments from the runtime attachment source.
         let ctx = SessionMcpAttachmentContext {
             session_id: session_id.to_string(),
-            cwd: cwd.clone(),
+            cwd: cwd.map(std::path::Path::to_path_buf),
             kind,
         };
         let attachments = self
@@ -274,7 +274,7 @@ impl SessionMaterializer {
                 .is_some();
             let in_managed_checkout = if owns_workspace {
                 true
-            } else if let Some(cwd) = cwd.as_deref()
+            } else if let Some(cwd) = cwd
                 && let Ok(repo) = crate::worktree::identity::resolve_repository(cwd)
             {
                 service
@@ -312,7 +312,7 @@ impl SessionMaterializer {
     /// honored; it never downgrades to shared execution.
     async fn resolve_new_session_workspace(
         &self,
-        requested_cwd: &Option<PathBuf>,
+        requested_cwd: Option<&std::path::Path>,
         meta: Option<&serde_json::Map<String, serde_json::Value>>,
     ) -> Result<Option<WorkspaceBinding>, Error> {
         let options = match crate::worktree::session_creation_options_from_meta(meta)
@@ -327,7 +327,7 @@ impl SessionMaterializer {
         // Lineage is validated before anything is allocated.
         if let Some(source) = options.source_session_id.as_deref() {
             self.ensure_lineage_source(source).await?;
-            self.ensure_lineage_same_repository(source, requested_cwd.as_deref())
+            self.ensure_lineage_same_repository(source, requested_cwd)
                 .await?;
         }
 
@@ -339,7 +339,7 @@ impl SessionMaterializer {
             })));
         };
 
-        let Some(source_cwd) = requested_cwd.as_deref() else {
+        let Some(source_cwd) = requested_cwd else {
             return Err(Error::invalid_params().data(serde_json::json!({
                 "message": "worktree isolation requires an absolute source cwd \
                             inside the target repository",
@@ -576,7 +576,7 @@ impl SessionMaterializer {
                 Some(binding)
             }
             None => {
-                self.resolve_new_session_workspace(&requested_cwd, req.meta.as_ref())
+                self.resolve_new_session_workspace(requested_cwd.as_deref(), req.meta.as_ref())
                     .await?
             }
         };
@@ -722,7 +722,7 @@ impl SessionMaterializer {
             let resolved = self
                 .resolve_mcp_inputs(
                     &session_id,
-                    &cwd,
+                    cwd.as_deref(),
                     SessionMaterializationKind::New,
                     &req.mcp_servers,
                 )
@@ -932,7 +932,7 @@ impl SessionMaterializer {
         let resolved = self
             .resolve_mcp_inputs(
                 &session_id,
-                &cwd,
+                cwd.as_deref(),
                 SessionMaterializationKind::Load,
                 &req.mcp_servers,
             )
@@ -1031,7 +1031,7 @@ impl SessionMaterializer {
         let resolved = self
             .resolve_mcp_inputs(
                 &session_id,
-                &cwd,
+                cwd.as_deref(),
                 SessionMaterializationKind::Resume,
                 &req.mcp_servers,
             )
@@ -2055,6 +2055,10 @@ pub(crate) fn fork_message_id_from_meta(
 /// Map worktree failures to ACP errors. A conflicting cwd request is the
 /// caller's mistake (invalid params); missing or failed workspaces and
 /// allocation failures are server-side diagnostics.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "used as a `map_err` callback, so it must take the error by value"
+)]
 fn worktree_error_to_acp(err: crate::worktree::WorktreeError) -> Error {
     let message = err.to_string();
     let code = err.code();
@@ -2670,7 +2674,7 @@ mod worktree_binding_tests {
             .await
             .expect("isolated session prepares");
 
-        let bound = prepared.cwd.clone().expect("bound cwd");
+        let bound = prepared.cwd.expect("bound cwd");
         assert_eq!(
             std::fs::read_to_string(bound.join("README.md")).unwrap(),
             "dirty\n",
@@ -2893,8 +2897,7 @@ mod worktree_binding_tests {
             .prepare_new_session(NewSessionRequest::new(stored.clone()))
             .await
             .expect("session prepares")
-            .session_id
-            .clone();
+            .session_id;
 
         let resume = ResumeSessionRequest::new(SessionId::from(session_id), PathBuf::new());
         let resumed = match fx
@@ -5024,10 +5027,8 @@ mod worktree_binding_tests {
             session_a.session_id.clone(),
             Some(cwd_a),
         );
-        let ctx_b = crate::tools::context_impl::AgentToolContext::basic(
-            session_b.session_id.clone(),
-            Some(cwd_b),
-        );
+        let ctx_b =
+            crate::tools::context_impl::AgentToolContext::basic(session_b.session_id, Some(cwd_b));
         let resolved_a = ctx_a.resolve_path("notes.txt").unwrap();
         let resolved_b = ctx_b.resolve_path("notes.txt").unwrap();
         assert_ne!(resolved_a, resolved_b);

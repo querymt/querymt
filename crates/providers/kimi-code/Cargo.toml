@@ -7,6 +7,9 @@ license.workspace = true
 [package.metadata.qmt]
 type = "wasm"
 
+[lints]
+workspace = true
+
 [features]
 default = ["extism"]
 api = ["querymt", "querymt/tracing"]

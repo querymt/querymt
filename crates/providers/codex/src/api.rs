@@ -2560,9 +2560,7 @@ mod tests {
                 querymt::chat::MediaPart::new(
                     querymt::chat::MediaKind::Image,
                     Some("image/png".parse().unwrap()),
-                    querymt::chat::MediaSource::Inline {
-                        data: png_bytes.clone(),
-                    },
+                    querymt::chat::MediaSource::Inline { data: png_bytes },
                 )
                 .expect("valid inline image"),
             ))],

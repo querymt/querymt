@@ -273,7 +273,7 @@ impl KimiCode {
                 // message, and any supplemental text becomes a following message.
                 let mut tool_results = ChatMessage::user();
                 if let Some(cache) = message.cache.clone() {
-                    tool_results = tool_results.cache(cache.clone());
+                    tool_results = tool_results.cache(cache);
                 }
                 let mut supplemental = ChatMessage::user();
                 if let Some(cache) = message.cache.clone() {

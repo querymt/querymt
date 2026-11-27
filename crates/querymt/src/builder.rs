@@ -341,7 +341,7 @@ impl<State> LLMBuilder<State> {
     where
         T: CallFunctionTool + 'static,
     {
-        let name = tool.descriptor().function.name.clone();
+        let name = tool.descriptor().function.name;
         self.tool_registry.insert(name, Box::new(tool));
         self
     }

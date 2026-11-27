@@ -839,6 +839,39 @@ mod tests {
     }
 
     #[test]
+    fn configured_skill_folder_is_offered_in_any_workspace() {
+        use crate::config::SkillsConfig;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let skill_dir = temp.path().join("scholarly-sources");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: scholarly-sources\ndescription: Find papers\n---\nBody\n",
+        )
+        .unwrap();
+        let config = SkillsConfig {
+            include_external: false,
+            paths: vec![skill_dir],
+            ..Default::default()
+        };
+        let project_root = temp.path().join("project");
+        let worktree = temp.path().join("worktree");
+
+        let catalog = SkillCatalog::from_config(&config, &project_root);
+        catalog.refresh_registry(&worktree).unwrap();
+
+        for workspace in [&project_root, &worktree] {
+            assert_eq!(
+                catalog.local_ids(workspace),
+                vec!["scholarly-sources"],
+                "{}",
+                workspace.display()
+            );
+        }
+    }
+
+    #[test]
     fn for_agent_applies_one_rule_for_the_skill_tool() {
         use crate::config::{SkillsConfig, ToolSpec};
 

@@ -90,9 +90,7 @@ impl QmtApp {
         let remote_peers = store.prefs.remote_session_peers.clone();
         let header = kit::page_header(
             "Mesh",
-            agent_name
-                .clone()
-                .map(|name| kit::chip(format!("via {name}"), &p).into_any_element()),
+            agent_name.map(|name| kit::chip(format!("via {name}"), &p).into_any_element()),
             Some("Manage remote nodes and invites."),
             agent
                 .clone()

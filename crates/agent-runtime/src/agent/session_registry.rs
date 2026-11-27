@@ -631,8 +631,7 @@ impl SessionRegistry {
         let actor_ref = SessionActor::spawn(actor);
         let session_ref = SessionActorRef::from(actor_ref.clone());
 
-        self.sessions
-            .insert(session_id.clone(), session_ref.clone());
+        self.sessions.insert(session_id.clone(), session_ref);
         self.local_actor_refs
             .insert(session_id.clone(), actor_ref.clone());
 
@@ -1368,7 +1367,7 @@ mod tests {
             let config = Arc::new(
                 AgentConfigBuilder::new(
                     Arc::new(plugin_registry),
-                    storage.clone(),
+                    storage,
                     LLMParams::new().provider("mock").model("mock-model"),
                 )
                 .with_tool_policy(ToolPolicy::ProviderOnly)

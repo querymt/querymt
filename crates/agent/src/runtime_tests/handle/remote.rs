@@ -211,7 +211,7 @@ fn find_node_manager_prefers_best_route_scope_for_direct_lookup() {
     routes.upsert_addrs(
         peer_id,
         crate::agent::remote::scope::MeshTransportKind::Iroh,
-        iroh_scope.clone(),
+        iroh_scope,
         [format!("/p2p/{peer_id}").parse().unwrap()],
         70,
     );

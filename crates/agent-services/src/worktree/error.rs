@@ -39,7 +39,7 @@ impl std::fmt::Display for PathSample {
 
 /// Trailing sentence of the `unpreserved_content` message when a published
 /// result exists but the working state has since diverged from it.
-fn stale_result_sentence(stale_result: &Option<String>) -> String {
+fn stale_result_sentence(stale_result: Option<&str>) -> String {
     match stale_result {
         Some(result) => format!(
             "; the working state differs from the last published result {result}; \
@@ -164,7 +164,7 @@ pub enum WorktreeError {
         "workspace {workspace_id} has unpreserved working state: uncommitted {uncommitted}, \
          untracked {untracked}, ignored {ignored}; commit, publish (`/worktree publish`), \
          or delete the listed files before removal{}",
-        stale_result_sentence(.stale_result)
+        stale_result_sentence(.stale_result.as_deref())
     )]
     UnpreservedContent {
         workspace_id: String,

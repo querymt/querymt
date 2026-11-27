@@ -40,7 +40,7 @@ async fn profile_service(
         Arc::new(arc_swap::ArcSwap::from_pointee(Some(manager)));
     let svc = OAuthService::new(
         fixture.config.clone(),
-        ModelInventory::new(fixture.config.clone()),
+        ModelInventory::new(fixture.config),
         Arc::new(Mutex::new(HashMap::new())),
         Arc::new(Mutex::new(None)),
     )

@@ -97,7 +97,9 @@ pub(super) async fn transition_waiting_for_event(
     wait: &WaitCondition,
     env: &TurnEnv,
     turn: &mut Turn,
-    event_rx: &mut tokio::sync::broadcast::Receiver<querymt_agent_core::events::EventEnvelope>,
+    event_rx: &mut tokio::sync::broadcast::Receiver<
+        std::sync::Arc<querymt_agent_core::events::EventEnvelope>,
+    >,
 ) -> Result<Step, TurnError> {
     debug!(
         "WaitingForEvent: session={}, reason={:?}",
@@ -318,13 +320,18 @@ pub(super) async fn reconcile_suspended_delegations(
     config: &AgentConfig,
     env: &TurnEnv,
     turn: &mut Turn,
-    event_rx: &mut tokio::sync::broadcast::Receiver<querymt_agent_core::events::EventEnvelope>,
+    event_rx: &mut tokio::sync::broadcast::Receiver<
+        std::sync::Arc<querymt_agent_core::events::EventEnvelope>,
+    >,
 ) -> Result<(), anyhow::Error> {
     if turn.suspended_delegations.is_empty() {
         turn.suspended_recovery = None;
         return Ok(());
     }
     let mut lagged = false;
+    // Only a consumed outcome changes the suspended set, so the condition is
+    // built once and rebuilt then, not for every event of the session.
+    let mut wait = suspended_wait(&turn.suspended_delegations);
     loop {
         let event = match event_rx.try_recv() {
             Ok(event) => event,
@@ -338,15 +345,10 @@ pub(super) async fn reconcile_suspended_delegations(
         if event.session_id() != env.session_id {
             continue;
         }
-        let suspended = turn.suspended_delegations.clone();
-        if suspended.is_empty() {
+        let Some(condition) = &wait else {
             break;
-        }
-        let wait = WaitCondition {
-            reason: WaitReason::Delegation,
-            correlation_ids: suspended.iter().cloned().collect(),
         };
-        let Some(outcome) = match_wait_event(&wait, &event) else {
+        let Some(outcome) = match_wait_event(condition, &event) else {
             continue;
         };
         let delegation_id = match &outcome {
@@ -355,6 +357,7 @@ pub(super) async fn reconcile_suspended_delegations(
             | WaitEventOutcome::Cancelled { delegation_id } => delegation_id,
         };
         turn.suspended_delegations.remove(delegation_id);
+        wait = suspended_wait(&turn.suspended_delegations);
         inject_wait_message(
             config,
             env,
@@ -364,6 +367,15 @@ pub(super) async fn reconcile_suspended_delegations(
         .await?;
     }
     recover_suspended(config, env, turn, lagged).await
+}
+
+/// The wait that matches any of `suspended`, or `None` when nothing is
+/// suspended (an empty condition would match every delegation).
+fn suspended_wait(suspended: &HashSet<String>) -> Option<WaitCondition> {
+    (!suspended.is_empty()).then(|| WaitCondition {
+        reason: WaitReason::Delegation,
+        correlation_ids: suspended.iter().cloned().collect(),
+    })
 }
 
 async fn recover_suspended(

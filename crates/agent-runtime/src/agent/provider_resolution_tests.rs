@@ -215,7 +215,9 @@ async fn prompt(
 /// all the events of a run waits for its end and does not drain what happens
 /// to have arrived.
 async fn events_until_run_completed(
-    events: &mut tokio::sync::broadcast::Receiver<querymt_agent_core::events::EventEnvelope>,
+    events: &mut tokio::sync::broadcast::Receiver<
+        std::sync::Arc<querymt_agent_core::events::EventEnvelope>,
+    >,
     session: &str,
 ) -> Vec<AgentEventKind> {
     let mut seen = Vec::new();

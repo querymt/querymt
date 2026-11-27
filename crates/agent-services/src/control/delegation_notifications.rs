@@ -284,7 +284,7 @@ impl DelegationUpdateProjector {
             } => {
                 if let Some(snapshot) = self.snapshots.get_mut(&delegation.public_id) {
                     if snapshot.tool_call_id.is_none() {
-                        snapshot.tool_call_id = tool_call_id.clone();
+                        snapshot.tool_call_id.clone_from(tool_call_id);
                     }
                     return Some(snapshot.clone());
                 }
@@ -312,7 +312,7 @@ impl DelegationUpdateProjector {
                     source_epoch: None,
                 };
                 self.snapshots
-                    .insert(delegation.public_id.clone(), snapshot.clone());
+                    .insert(delegation.public_id.clone(), snapshot);
                 if let Some(mut transitions) = self.pending.remove(&delegation.public_id) {
                     transitions.sort_by_key(PendingDelegationTransition::timestamp);
                     for transition in transitions {

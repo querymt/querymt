@@ -794,7 +794,7 @@ mod tests {
 
         // Explicit user values (including an empty list) win.
         for explicit in [json!([]), json!(["glob"])] {
-            let mut config = json!({"strict_tools": explicit.clone()});
+            let mut config = json!({"strict_tools": explicit});
             d.apply_to(&mut config, "sid");
             assert_eq!(config["strict_tools"], explicit);
         }
@@ -1172,7 +1172,7 @@ mod tests {
     #[test]
     fn explicit_middle_hint_is_kept() {
         let middle = json!({"text": "two", "cache": {"ephemeral": {"ttl_seconds": 1800}}});
-        let mut config = json!({"system": ["one", middle.clone(), "three"]});
+        let mut config = json!({"system": ["one", middle, "three"]});
         apply_system_cache_defaults(&mut config, &breakpoints(), 0);
         assert_eq!(config["system"][1], middle);
         assert_eq!(
@@ -1195,7 +1195,7 @@ mod tests {
     #[test]
     fn default_hints_preserve_portable_instruction_hints() {
         let instruction = json!({"text": "stable", "cache": {"ephemeral": {"ttl_seconds": 1800}}});
-        let mut config = json!({"system": [instruction.clone()]});
+        let mut config = json!({"system": [instruction]});
         apply_system_cache_defaults(&mut config, &breakpoints(), 0);
         assert_eq!(config["system"][0], instruction);
         assert!(config["system"][0].get("cache_control").is_none());

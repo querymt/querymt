@@ -375,7 +375,7 @@ mod tests {
         // A pass signed by another key but naming the issuer is refused.
         let forger = Keypair::generate_ed25519();
         let mut forged = ModelPass::issue(&forger, claim(&f), 1_000, 600).unwrap();
-        forged.issuer = issuer_id.clone();
+        forged.issuer = issuer_id;
         assert_eq!(
             forged.verify(1_100, &ModelPassExpectation::default()),
             Err(ModelPassError::BadSignature)
@@ -388,7 +388,7 @@ mod tests {
             bad.verify(1_100, &ModelPassExpectation::default()),
             Err(ModelPassError::BadSignature)
         );
-        let mut bad = pass.clone();
+        let mut bad = pass;
         bad.version = 2;
         assert_eq!(
             bad.verify(1_100, &ModelPassExpectation::default()),
@@ -417,8 +417,8 @@ mod tests {
         )
         .unwrap();
         // A token signature does not verify as a pass signature.
-        let mut forged = pass.clone();
-        forged.signature = token.signature.clone();
+        let mut forged = pass;
+        forged.signature = token.signature;
         assert_eq!(
             forged.verify(1_100, &ModelPassExpectation::default()),
             Err(ModelPassError::BadSignature)

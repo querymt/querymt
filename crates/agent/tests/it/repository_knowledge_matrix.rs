@@ -449,20 +449,17 @@ fn concurrent_refresh_and_readers_see_only_complete_generations() {
     let fx = Fx::new();
     fx.service.refresh().unwrap();
     let service = Arc::new(fx.service);
-    let repo = fx.repo.clone();
-    let writer = {
-        let repo = repo.clone();
-        std::thread::spawn(move || {
-            for i in 0..15 {
-                write(
-                    &repo,
-                    "docs/churn.md",
-                    &format!("# Churn\nversion marker v{i}\n\n## Part\nsecond v{i}\n"),
-                );
-                std::thread::sleep(std::time::Duration::from_millis(2));
-            }
-        })
-    };
+    let repo = fx.repo;
+    let writer = std::thread::spawn(move || {
+        for i in 0..15 {
+            write(
+                &repo,
+                "docs/churn.md",
+                &format!("# Churn\nversion marker v{i}\n\n## Part\nsecond v{i}\n"),
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    });
     let readers: Vec<_> = (0..4)
         .map(|_| {
             let service = service.clone();

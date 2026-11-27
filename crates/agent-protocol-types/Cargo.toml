@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "Plain wire types that QueryMT agents and clients exchange (events, load snapshot payloads); serde and typeshare only"
 
+[lints]
+workspace = true
+
 [lib]
 name = "querymt_agent_protocol_types"
 path = "src/lib.rs"

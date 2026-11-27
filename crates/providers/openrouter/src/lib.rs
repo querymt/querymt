@@ -447,7 +447,7 @@ mod tests {
         assert_eq!(body.get("stream"), Some(&Value::Bool(true)));
     }
 
-    fn parse_stream_error(error: Value) -> LLMError {
+    fn parse_stream_error(error: &Value) -> LLMError {
         let provider = test_provider();
         let mut parser = provider
             .chat_stream_parser(serde_json::Value::Null)
@@ -461,7 +461,7 @@ mod tests {
     #[test]
     fn upstream_idle_timeout_is_retryable() {
         for code in [serde_json::json!(504), serde_json::json!("504")] {
-            let error = parse_stream_error(serde_json::json!({
+            let error = parse_stream_error(&serde_json::json!({
                 "message": "Upstream idle timeout exceeded",
                 "code": code
             }));
@@ -477,7 +477,7 @@ mod tests {
 
     #[test]
     fn typed_error_takes_precedence_over_numeric_status() {
-        let error = parse_stream_error(serde_json::json!({
+        let error = parse_stream_error(&serde_json::json!({
             "message": "Request was rejected",
             "code": 504,
             "metadata": { "error_type": "invalid_request" }
@@ -496,7 +496,7 @@ mod tests {
     #[test]
     fn typed_generic_errors_are_retryable() {
         for error_type in ["timeout", "server", "unmapped"] {
-            let error = parse_stream_error(serde_json::json!({
+            let error = parse_stream_error(&serde_json::json!({
                 "message": "provider failed",
                 "code": 500,
                 "metadata": { "error_type": error_type }
@@ -513,7 +513,7 @@ mod tests {
 
     #[test]
     fn typed_rate_limit_preserves_retry_hint() {
-        let error = parse_stream_error(serde_json::json!({
+        let error = parse_stream_error(&serde_json::json!({
             "message": "slow down",
             "code": 429,
             "retry_after": "3s",

@@ -10,6 +10,9 @@ authors = [
 repository = "https://github.com/querymt/querymt"
 homepage = "https://query.mt"
 
+[lints]
+workspace = true
+
 [features]
 default = []
 zbus-secret-service = ["querymt-utils/zbus-secret-service", "querymt-service-client?/zbus-secret-service"]

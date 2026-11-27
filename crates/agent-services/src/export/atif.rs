@@ -374,8 +374,8 @@ impl ATIFBuilder {
     }
 
     /// Set tool definitions
-    pub fn with_tool_definitions(mut self, tools: Vec<querymt::chat::Tool>) -> Self {
-        self.tool_definitions = Some(tools_to_atif(&tools));
+    pub fn with_tool_definitions(mut self, tools: &[querymt::chat::Tool]) -> Self {
+        self.tool_definitions = Some(tools_to_atif(tools));
         self
     }
 
@@ -850,7 +850,7 @@ mod tests {
             },
         }];
 
-        let builder = builder.with_tool_definitions(tools);
+        let builder = builder.with_tool_definitions(&tools);
         let atif = builder.build();
 
         assert!(atif.agent.tool_definitions.is_some());

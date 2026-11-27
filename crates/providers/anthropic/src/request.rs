@@ -322,7 +322,7 @@ impl Anthropic {
         };
 
         let final_tool_choice = if anthropic_tools.is_some() {
-            tool_choice.clone()
+            tool_choice
         } else {
             None
         };

@@ -2396,7 +2396,7 @@ async fn native_command_output_is_a_session_update_covered_by_the_event_tip() {
 
     let mut output_seq = None;
     while let Ok(envelope) = events.try_recv() {
-        if let EventEnvelope::Ephemeral(event) = &envelope
+        if let Some(event) = envelope.as_ephemeral()
             && event.session_id == session
             && matches!(event.kind, AgentEventKind::WorktreeCommandOutput { .. })
         {

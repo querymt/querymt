@@ -179,6 +179,10 @@ impl EventForwarder {
         Self::start_with_policy(fanout, relay_ref, source_label, filter_session_id, None)
     }
 
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "`start` and its callers hand the fanout over by value"
+    )]
     pub(crate) fn start_with_policy(
         fanout: Arc<querymt_agent_services::event_fanout::EventFanout>,
         relay_ref: RemoteActorRef<EventRelayActor>,
@@ -214,9 +218,12 @@ impl EventForwarder {
                 }
                 match next {
                     Ok(envelope) => {
-                        let event: AgentEvent = match &envelope {
-                            EventEnvelope::Durable(de) => de.clone().into(),
-                            EventEnvelope::Ephemeral(ee) => ee.clone().into(),
+                        // The envelope is shared with the other subscribers; this
+                        // takes the single copy `AgentEvent` needs (and none at
+                        // all if this receiver holds the last reference).
+                        let event: AgentEvent = match Arc::unwrap_or_clone(envelope) {
+                            EventEnvelope::Durable(de) => de.into(),
+                            EventEnvelope::Ephemeral(ee) => ee.into(),
                         };
                         tracing::trace!(
                             target: "remote::event_forwarder",

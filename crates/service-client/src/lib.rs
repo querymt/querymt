@@ -708,9 +708,7 @@ pub async fn exchange_service_authorization_code(
 
     let token_response = client
         .exchange_code(AuthorizationCode::new(callback.code.clone()))
-        .set_pkce_verifier(PkceCodeVerifier::new(
-            flow.pkce_verifier.secret().to_string(),
-        ))
+        .set_pkce_verifier(PkceCodeVerifier::new(flow.pkce_verifier.secret().clone()))
         .request_async(&http_client)
         .await
         .map_err(map_request_token_exchange_error)?;
@@ -850,10 +848,10 @@ fn service_token_set_from_token_response(
     });
 
     ServiceTokenSet {
-        access_token: token_response.access_token().secret().to_string(),
+        access_token: token_response.access_token().secret().clone(),
         refresh_token: token_response
             .refresh_token()
-            .map(|token| token.secret().to_string()),
+            .map(|token| token.secret().clone()),
         token_type: Some(service_token_type_name(token_response.token_type())),
         scope,
         expires_at,
@@ -1210,9 +1208,9 @@ mod tests {
         let flow = build_service_authorization_flow(endpoint.clone()).unwrap();
         let callback = ServiceAuthorizationCallback {
             code: "auth-code".to_string(),
-            state: flow.state.secret().to_string(),
+            state: flow.state.secret().clone(),
         };
-        let verifier = flow.pkce_verifier.secret().to_string();
+        let verifier = flow.pkce_verifier.secret().clone();
 
         Mock::given(method("POST"))
             .and(path("/service/oauth/token"))
@@ -1260,7 +1258,7 @@ mod tests {
         let flow = build_service_authorization_flow(endpoint.clone()).unwrap();
         let callback = ServiceAuthorizationCallback {
             code: "bad-code".to_string(),
-            state: flow.state.secret().to_string(),
+            state: flow.state.secret().clone(),
         };
 
         Mock::given(method("POST"))

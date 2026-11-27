@@ -24,7 +24,7 @@ pub trait ChatRunner: Send + Sync {
     async fn chat_session(&self) -> Result<Box<dyn ChatSession>>;
 
     /// Subscribe to agent events (tool calls, messages, etc.)
-    fn subscribe(&self) -> broadcast::Receiver<EventEnvelope>;
+    fn subscribe(&self) -> broadcast::Receiver<std::sync::Arc<EventEnvelope>>;
 
     /// Register a callback for tool call events (boxed version)
     fn on_tool_call_boxed(&self, callback: Box<dyn Fn(String, Value) + Send + Sync>);
@@ -126,7 +126,7 @@ impl AgentRunner {
     }
 
     /// Subscribe to agent events (tool calls, messages, etc.)
-    pub fn subscribe(&self) -> broadcast::Receiver<EventEnvelope> {
+    pub fn subscribe(&self) -> broadcast::Receiver<std::sync::Arc<EventEnvelope>> {
         self.0.subscribe()
     }
 

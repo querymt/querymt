@@ -543,7 +543,7 @@ impl Hooks {
             {
                 result
                     .notices
-                    .push(invalid_notice(HookEventConfig::SessionEnd, error.into()));
+                    .push(invalid_notice(HookEventConfig::SessionEnd, &error.into()));
             }
         }
         Ok(result)
@@ -594,7 +594,7 @@ impl Hooks {
                 && let Err(error) =
                     serde_json::from_str::<SubagentChangeCommandOutputWire>(&outcome.stdout)
             {
-                result.notices.push(invalid_notice(event, error.into()));
+                result.notices.push(invalid_notice(event, &error.into()));
             }
         }
         Ok(result)
@@ -654,7 +654,7 @@ impl Hooks {
                 Ok(None) => {}
                 Err(err) => result
                     .notices
-                    .push(invalid_notice(HookEventConfig::SessionStart, err)),
+                    .push(invalid_notice(HookEventConfig::SessionStart, &err)),
             }
         }
         if let Some(reason) = result.stop_reason.clone() {
@@ -744,7 +744,7 @@ impl Hooks {
                 Ok(None) => {}
                 Err(err) => result
                     .notices
-                    .push(invalid_notice(HookEventConfig::UserPromptSubmit, err)),
+                    .push(invalid_notice(HookEventConfig::UserPromptSubmit, &err)),
             }
         }
         Ok(result)
@@ -872,7 +872,7 @@ impl Hooks {
                 Ok(None) => {}
                 Err(err) => result
                     .notices
-                    .push(invalid_notice(HookEventConfig::PreToolUse, err)),
+                    .push(invalid_notice(HookEventConfig::PreToolUse, &err)),
             }
         }
         Ok(result)
@@ -930,7 +930,7 @@ impl Hooks {
                 Err(err) => {
                     result
                         .notices
-                        .push(invalid_notice(HookEventConfig::PermissionRequest, err));
+                        .push(invalid_notice(HookEventConfig::PermissionRequest, &err));
                 }
             }
         }
@@ -1043,7 +1043,7 @@ impl Hooks {
                     }
                 }
                 Ok(None) => {}
-                Err(err) => notices.push(invalid_notice(HookEventConfig::Context, err)),
+                Err(err) => notices.push(invalid_notice(HookEventConfig::Context, &err)),
             }
         }
         let estimated_tokens = estimate_chat_tokens(&messages);
@@ -1195,7 +1195,7 @@ impl Hooks {
                 Ok(None) => {}
                 Err(err) => result
                     .notices
-                    .push(invalid_notice(HookEventConfig::PostToolUse, err)),
+                    .push(invalid_notice(HookEventConfig::PostToolUse, &err)),
             }
         }
         result.content = Some(current_content);
@@ -1258,7 +1258,7 @@ impl Hooks {
                 Ok(None) => {}
                 Err(err) => result
                     .notices
-                    .push(invalid_notice(HookEventConfig::Stop, err)),
+                    .push(invalid_notice(HookEventConfig::Stop, &err)),
             }
         }
         Ok(result)
@@ -1330,7 +1330,7 @@ impl Hooks {
                 Ok(None) => {}
                 Err(err) => result
                     .notices
-                    .push(invalid_notice(HookEventConfig::PreCompaction, err)),
+                    .push(invalid_notice(HookEventConfig::PreCompaction, &err)),
             }
         }
         Ok(result)
@@ -1391,7 +1391,7 @@ impl Hooks {
                 Err(err) => {
                     result
                         .notices
-                        .push(invalid_notice(HookEventConfig::PostCompaction, err));
+                        .push(invalid_notice(HookEventConfig::PostCompaction, &err));
                 }
             }
         }
@@ -1467,7 +1467,7 @@ impl Hooks {
                 Err(err) => {
                     result
                         .notices
-                        .push(invalid_notice(HookEventConfig::PreDelegation, err));
+                        .push(invalid_notice(HookEventConfig::PreDelegation, &err));
                 }
             }
         }
@@ -1629,7 +1629,7 @@ impl Hooks {
                     }
                 }
                 Ok(None) => {}
-                Err(err) => result.notices.push(invalid_notice(event, err)),
+                Err(err) => result.notices.push(invalid_notice(event, &err)),
             }
         }
         Ok(result)
@@ -1888,7 +1888,7 @@ fn cwd_string(cwd: Option<&Path>) -> String {
         .unwrap_or_else(|| ".".to_string())
 }
 
-fn invalid_notice(event: HookEventConfig, err: anyhow::Error) -> HookNotice {
+fn invalid_notice(event: HookEventConfig, err: &anyhow::Error) -> HookNotice {
     let message = format!("Ignoring invalid {} hook output: {}", event.label(), err);
     warn!("{}", message);
     HookNotice {

@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "Code index (file, symbol, outline and function indexes) for the querymt agent"
 
+[lints]
+workspace = true
+
 [lib]
 name = "querymt_agent_index"
 path = "src/lib.rs"

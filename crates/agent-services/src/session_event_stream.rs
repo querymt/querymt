@@ -421,15 +421,20 @@ async fn run_writer(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<WriterM
                         "journal returned fewer results than events".into(),
                     ))
                 });
-                match &result {
-                    Ok(persisted) => state.complete(
-                        seq,
-                        Slot::Publish(Box::new((
-                            EventEnvelope::Durable(persisted.clone()),
-                            parent,
-                        ))),
-                        &shared.fanout,
-                    ),
+                match result {
+                    Ok(persisted) => {
+                        // Only a caller awaiting the event needs its own copy;
+                        // a fire-and-forget emit hands the event to the fanout.
+                        let reply = reply.map(|reply| (reply, persisted.clone()));
+                        state.complete(
+                            seq,
+                            Slot::Publish(Box::new((EventEnvelope::Durable(persisted), parent))),
+                            &shared.fanout,
+                        );
+                        if let Some((reply, persisted)) = reply {
+                            outcomes.push((reply, Ok(persisted)));
+                        }
+                    }
                     Err(err) => {
                         log::warn!(
                             "failed to persist durable event for session {}: {}",
@@ -437,17 +442,17 @@ async fn run_writer(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<WriterM
                             err
                         );
                         state.complete(seq, Slot::Skip, &shared.fanout);
+                        if let Some(reply) = reply {
+                            outcomes.push((reply, Err(err)));
+                        }
                     }
                 }
-                outcomes.push((reply, result));
             }
         }
         // Reply only after publication, so an awaited emit observes its event
         // on the fanout.
         for (reply, result) in outcomes {
-            if let Some(reply) = reply {
-                let _ = reply.send(result);
-            }
+            let _ = reply.send(result);
         }
         for ack in flushes.drain(..) {
             let _ = ack.send(());

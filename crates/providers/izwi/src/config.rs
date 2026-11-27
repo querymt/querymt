@@ -108,7 +108,7 @@ impl IzwiConfig {
             cfg.chunk_size = chunk_size;
         }
         if let Some(ref kv_cache_dtype) = self.kv_cache_dtype {
-            cfg.kv_cache_dtype = kv_cache_dtype.clone();
+            cfg.kv_cache_dtype.clone_from(kv_cache_dtype);
         }
         if let Some(kv_page_size) = self.kv_page_size {
             cfg.kv_page_size = kv_page_size;

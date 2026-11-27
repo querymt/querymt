@@ -36,7 +36,7 @@ pub fn load_or_generate_keypair(
 
 #[cfg(feature = "kameo-mesh")]
 fn load_keypair(path: &std::path::Path) -> Result<libp2p::identity::Keypair> {
-    let bytes = std::fs::read(path)
+    let mut bytes = std::fs::read(path)
         .with_context(|| format!("failed to read mesh identity from {}", path.display()))?;
 
     if bytes.len() != 64 {
@@ -47,7 +47,7 @@ fn load_keypair(path: &std::path::Path) -> Result<libp2p::identity::Keypair> {
         );
     }
 
-    let ed25519_keypair = libp2p::identity::ed25519::Keypair::try_from_bytes(&mut bytes.clone())
+    let ed25519_keypair = libp2p::identity::ed25519::Keypair::try_from_bytes(&mut bytes)
         .with_context(|| format!("failed to parse ed25519 keypair from {}", path.display()))?;
 
     let keypair: libp2p::identity::Keypair = ed25519_keypair.into();

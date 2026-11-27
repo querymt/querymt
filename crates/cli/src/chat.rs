@@ -389,7 +389,7 @@ pub async fn handle_any_response(
                 };
                 tool_result_builder = tool_result_builder.tool_result(
                     call.id.clone(),
-                    Some(call.function.name.clone()),
+                    Some(call.function.name),
                     is_error,
                     result_parts,
                 );
@@ -629,7 +629,7 @@ mod tests {
             .push(&StreamChunk::Structured(
                 StructuredStreamEvent::ItemCompleted {
                     output_index: 0,
-                    item: call.clone(),
+                    item: call,
                 },
             ))
             .unwrap();

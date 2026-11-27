@@ -9,6 +9,9 @@ repository = "https://github.com/querymt/querymt"
 homepage = "https://query.mt"
 readme = "README.md"
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "qmcp"
 path = "src/main.rs"

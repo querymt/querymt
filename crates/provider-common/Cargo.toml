@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "Shared model reference parsing and HuggingFace GGUF resolution"
 
+[lints]
+workspace = true
+
 [dependencies]
 dirs.workspace = true
 hf-hub.workspace = true

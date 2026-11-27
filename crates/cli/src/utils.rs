@@ -90,7 +90,7 @@ pub fn detect_image_mime(data: &[u8]) -> Option<&'static str> {
 pub fn process_input(input: &[u8], prompt: String) -> Vec<ChatMessage> {
     let mut messages = Vec::new();
     if let Some(mime) = detect_image_mime(input) {
-        messages.push(ChatMessage::user().text(prompt.clone()).build());
+        messages.push(ChatMessage::user().text(prompt).build());
         messages.push(
             ChatMessage::user()
                 .try_image(mime, input.to_vec())

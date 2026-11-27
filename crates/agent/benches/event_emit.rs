@@ -719,7 +719,7 @@ struct RunResult {
 }
 
 async fn receive(
-    mut rx: broadcast::Receiver<EventEnvelope>,
+    mut rx: broadcast::Receiver<std::sync::Arc<EventEnvelope>>,
     sessions: usize,
     events_per_session: usize,
     expected_durable: usize,

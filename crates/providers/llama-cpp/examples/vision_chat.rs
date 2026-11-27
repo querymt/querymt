@@ -144,7 +144,7 @@ async fn run(
         println!("--- response ---");
         let response = provider.chat(&ChatCall::new(&messages)).await?;
         println!("{}", response.text().unwrap_or_default());
-        if let Some(u) = response.usage.clone() {
+        if let Some(u) = response.usage {
             println!("---\ninput={} output={}", u.input_tokens, u.output_tokens);
         }
     }

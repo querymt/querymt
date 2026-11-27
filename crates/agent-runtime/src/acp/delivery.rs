@@ -147,7 +147,7 @@ fn release(state: &SessionState, reason: ReleaseReason) {
 /// An event cleared for handling, with the guard that records its delivery.
 #[doc(hidden)]
 pub struct Admitted {
-    pub event: EventEnvelope,
+    pub event: std::sync::Arc<EventEnvelope>,
     pub guard: Option<DeliveredGuard>,
 }
 
@@ -518,7 +518,7 @@ impl ConnectionDelivery {
     /// the journal already supplied it); nothing for a lagged copy of an
     /// event that was already recovered.
     #[doc(hidden)]
-    pub async fn admit(&self, event: EventEnvelope) -> Vec<Admitted> {
+    pub async fn admit(&self, event: std::sync::Arc<EventEnvelope>) -> Vec<Admitted> {
         let seq = event.session_seq();
         if seq <= 0 {
             // Unsequenced events are not tracked, except that the loss of a
@@ -591,7 +591,10 @@ impl ConnectionDelivery {
             }
             highest = highest.max(durable.session_seq);
             supplied |= durable.session_seq == seq;
-            out.push(Self::admitted(&state, EventEnvelope::Durable(durable)));
+            out.push(Self::admitted(
+                &state,
+                std::sync::Arc::new(EventEnvelope::Durable(durable)),
+            ));
         }
         if !supplied {
             out.push(Self::admitted(&state, event));
@@ -644,7 +647,10 @@ impl ConnectionDelivery {
                             });
                         }
                         highest = highest.max(durable.session_seq);
-                        out.push(Self::admitted(&state, EventEnvelope::Durable(durable)));
+                        out.push(Self::admitted(
+                            &state,
+                            std::sync::Arc::new(EventEnvelope::Durable(durable)),
+                        ));
                     }
                     if highest > admitted {
                         state.send_modify(|p| {
@@ -708,7 +714,7 @@ impl ConnectionDelivery {
             })
     }
 
-    fn admitted(state: &SessionState, event: EventEnvelope) -> Admitted {
+    fn admitted(state: &SessionState, event: std::sync::Arc<EventEnvelope>) -> Admitted {
         let seq = event.session_seq();
         Admitted {
             guard: (seq > 0).then(|| DeliveredGuard {
@@ -784,7 +790,11 @@ mod tests {
         storage.event_journal()
     }
 
-    async fn persist(journal: &Arc<dyn EventJournal>, session: &str, seq: i64) -> EventEnvelope {
+    async fn persist(
+        journal: &Arc<dyn EventJournal>,
+        session: &str,
+        seq: i64,
+    ) -> Arc<EventEnvelope> {
         let stored = journal
             .append_durable(&NewDurableEvent {
                 session_id: session.to_string(),
@@ -797,7 +807,7 @@ mod tests {
             })
             .await
             .unwrap();
-        EventEnvelope::Durable(stored)
+        Arc::new(EventEnvelope::Durable(stored))
     }
 
     #[test]
@@ -828,8 +838,8 @@ mod tests {
         );
     }
 
-    fn delta(session: &str, seq: i64) -> EventEnvelope {
-        EventEnvelope::Ephemeral(EphemeralEvent {
+    fn delta(session: &str, seq: i64) -> Arc<EventEnvelope> {
+        Arc::new(EventEnvelope::Ephemeral(EphemeralEvent {
             session_id: session.to_string(),
             session_seq: seq,
             timestamp: 0,
@@ -839,28 +849,30 @@ mod tests {
                 content: "t".into(),
                 message_id: "m".into(),
             },
-        })
+        }))
     }
 
     fn seqs(batch: &[Admitted]) -> Vec<i64> {
         batch.iter().map(|a| a.event.session_seq()).collect()
     }
 
-    fn durable(session: &str, seq: i64) -> EventEnvelope {
-        EventEnvelope::Durable(querymt_agent_core::events::DurableEvent {
-            session_seq: seq,
-            event_id: format!("e{seq}"),
-            stream_seq: seq,
-            session_id: session.to_string(),
-            timestamp: 0,
-            origin: EventOrigin::Local,
-            source_node: None,
-            kind: AgentEventKind::Cancelled,
-        })
+    fn durable(session: &str, seq: i64) -> Arc<EventEnvelope> {
+        Arc::new(EventEnvelope::Durable(
+            querymt_agent_core::events::DurableEvent {
+                session_seq: seq,
+                event_id: format!("e{seq}"),
+                stream_seq: seq,
+                session_id: session.to_string(),
+                timestamp: 0,
+                origin: EventOrigin::Local,
+                source_node: None,
+                kind: AgentEventKind::Cancelled,
+            },
+        ))
     }
 
     /// Admit and route events the way a forwarder does; what passes is returned.
-    async fn route(delivery: &ConnectionDelivery, events: Vec<EventEnvelope>) -> Vec<i64> {
+    async fn route(delivery: &ConnectionDelivery, events: Vec<Arc<EventEnvelope>>) -> Vec<i64> {
         let mut passed = Vec::new();
         for event in events {
             for admitted in delivery.admit(event).await {
@@ -1131,7 +1143,7 @@ mod tests {
                 node_id: None,
             },
         });
-        let batch = delivery.admit(disconnect).await;
+        let batch = delivery.admit(Arc::new(disconnect)).await;
         // Not released while the notification is still being handled.
         tokio::task::yield_now().await;
         assert!(!waiter.is_finished());

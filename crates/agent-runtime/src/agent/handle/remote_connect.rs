@@ -1137,7 +1137,7 @@ impl LocalAgentHandle {
                 RemoteSessionConnectError::NodeUnavailable {
                     node_id: node_id.clone(),
                     transport: None,
-                    message: e.message.clone(),
+                    message: e.message,
                 }
             })?;
             self.resume_remote_session(&node_manager, session_id.to_string())

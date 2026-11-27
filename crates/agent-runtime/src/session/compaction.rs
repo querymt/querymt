@@ -872,6 +872,10 @@ async fn unless_cancelled<T>(
     outcome.ok_or(polled)
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "used as a `map_err` callback, so it must take the error by value"
+)]
 fn accounting_failure(error: AccountingError) -> anyhow::Error {
     anyhow::anyhow!("Compaction accounting failure: {error}")
 }
@@ -2582,7 +2586,7 @@ mod tests {
         let mut notice = text.clone();
         notice.parts = vec![MessagePart::Notice {
             source: querymt_agent_core::model::NoticeSource::AgentMode,
-            content: content.clone(),
+            content,
         }];
 
         let notice_tokens = estimate_tokens(&[notice], None);
@@ -3586,7 +3590,7 @@ mod tests {
         /// initiated it (the ledger's), whatever session the history names.
         #[tokio::test]
         async fn retry_events_go_to_the_initiating_session_not_the_histories() {
-            use querymt_agent_core::events::{AgentEventKind, EventEnvelope};
+            use querymt_agent_core::events::AgentEventKind;
             let config = config_with(|_| {}).await;
             let mut events = config.subscribe_events();
             let provider = ScriptedProvider::new(true, vec![overloaded(0), summary("a summary")]);
@@ -3616,7 +3620,7 @@ mod tests {
 
             let mut sessions = Vec::new();
             while let Ok(envelope) = events.try_recv() {
-                if let EventEnvelope::Durable(event) = envelope
+                if let Some(event) = envelope.as_durable()
                     && matches!(
                         event.kind,
                         AgentEventKind::LlmRetryWait { .. }
@@ -3625,7 +3629,7 @@ mod tests {
                             | AgentEventKind::RateLimitResume { .. }
                     )
                 {
-                    sessions.push(event.session_id);
+                    sessions.push(event.session_id.clone());
                 }
             }
             assert_eq!(

@@ -863,7 +863,7 @@ async fn observer_loaded_after_prompt_cannot_capture_the_question() {
                 &state,
                 connection,
                 &translator,
-                elicitation_event(&session_id, "question"),
+                std::sync::Arc::new(elicitation_event(&session_id, "question")),
             )
             .await
         );
@@ -997,7 +997,7 @@ async fn pending_question_follows_explicit_and_fallback_owner_changes() {
                 &state,
                 &connection,
                 &test_translator(),
-                elicitation_event(&session_id, "pending")
+                std::sync::Arc::new(elicitation_event(&session_id, "pending"))
             )
             .await
         );

@@ -1779,7 +1779,7 @@ mod tests {
         fs::write(&existing_file, "content").unwrap();
 
         let mut event = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Other)));
-        event.paths.push(existing_file.clone());
+        event.paths.push(existing_file);
 
         let change_set = process_events(&[event], root, &overrides, &gitignore);
 

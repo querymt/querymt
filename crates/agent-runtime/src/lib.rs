@@ -1,4 +1,6 @@
 #![recursion_limit = "256"]
+// Test helpers take owned arguments for ergonomic call sites.
+#![cfg_attr(test, allow(clippy::needless_pass_by_value))]
 //! Runtime layer of the querymt agent.
 //!
 //! The agent handle and session actors, ACP (except the WebSocket server),

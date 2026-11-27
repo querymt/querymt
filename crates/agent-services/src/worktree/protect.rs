@@ -199,7 +199,7 @@ pub(crate) fn scan_local_state(
     // HEAD tree vs real index: staged additions, modifications, deletions,
     // mode changes, and unmerged entries.
     let mut head_entries = FlatTree::new();
-    flatten_tree(repo, head_tree, &mut head_entries, String::new())?;
+    flatten_tree(repo, head_tree, &mut head_entries, "")?;
     if repo.index_path().exists() {
         let index = repo.open_index().map_err(native_err)?;
         for entry in index.entries() {

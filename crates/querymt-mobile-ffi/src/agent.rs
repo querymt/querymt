@@ -168,7 +168,7 @@ async fn init_agent_async(config: Config) -> Result<u64, FfiErrorCode> {
 
     let (handle, reused_runtime) = state::attach_or_insert_runtime_agent(agent, storage);
 
-    let inner = state::with_agent_read(handle, |record| Ok(record.agent.inner().clone()))?;
+    let inner = state::with_agent_read(handle, |record| Ok(record.agent.inner()))?;
     inner.set_profiles(profile_manager.clone());
     #[cfg(feature = "remote")]
     if let Some(mesh) = inner.mesh() {

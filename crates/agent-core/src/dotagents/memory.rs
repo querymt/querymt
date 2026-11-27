@@ -79,7 +79,7 @@ pub fn parse_memory_document(
         body,
         enabled,
         extensions,
-        source: source.clone(),
+        source,
         fingerprint: fingerprint(text),
     })
 }

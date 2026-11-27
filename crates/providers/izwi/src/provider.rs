@@ -165,7 +165,7 @@ impl IzwiProvider {
         let mut gen_req = GenerationRequest::new(req.text.clone()).with_config(gen_cfg);
 
         // Map language hint.
-        gen_req.language = req.language.clone();
+        gen_req.language.clone_from(&req.language);
 
         // Map structured voice configuration.
         match req.voice_config.as_ref() {

@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 description = "PyO3 bindings for QueryMT Agent"
 
+# Not on [workspace.lints] yet: the clippy lints there still flag existing code in
+# this crate. An empty table records the opt-out; replace it with
+# `workspace = true` once the crate is clean.
+[lints]
+
 [lib]
 name = "querymt_agent"
 crate-type = ["cdylib"]

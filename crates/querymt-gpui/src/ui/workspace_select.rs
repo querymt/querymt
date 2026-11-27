@@ -81,7 +81,7 @@ fn suggestions(
         &query,
         &candidates,
         |w| vec![workspace_name(w)],
-        |w| vec![w.to_string()],
+        |w| vec![(*w).clone()],
     )
     .into_iter()
     .map(|(i, _)| candidates[i])
@@ -106,7 +106,7 @@ fn suggestions(
             .filter(|n| n.starts_with('.') == hidden)
             .collect();
         let mut dirs: Vec<(u32, &String)> =
-            crate::search::rank(&partial, &candidates, |n| vec![n.to_string()])
+            crate::search::rank(&partial, &candidates, |n| vec![(*n).clone()])
                 .into_iter()
                 .map(|(i, score)| (score, candidates[i]))
                 .collect();

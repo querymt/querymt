@@ -681,7 +681,7 @@ impl OpenSession {
             input_id: input_id.clone(),
             delivery: wanted.input_state_name().unwrap_or_default().into(),
             state: "sending".into(),
-            text: text.clone(),
+            text,
             attachments: attachments.len(),
             discard_pending: false,
         });

@@ -61,6 +61,38 @@ version = "0.6.0"
 edition = "2024"
 license = "MIT"
 
+# Clippy lints for needless copies. A crate opts in with `[lints] workspace = true`
+# (a crate cannot mix that with its own `[lints.*]` tables).
+#
+# Deliberately NOT enabled:
+# - `needless_pass_by_ref_mut`: unreliable around `async fn`. Taking `&self`
+#   instead of `&mut self` can make the future non-`Send` (the type is not
+#   `Sync`), which it did in agent-runtime.
+# - `clone_on_ref_ptr`: `x.clone()` on an `Arc` is only a refcount bump, so it
+#   finds no real copies and flags ~1000 call sites in agent-runtime.
+# - `redundant_clone`: in clippy's experimental `nursery` group. CI installs
+#   the latest stable toolchain, so a new clippy release could change what it
+#   flags and fail unrelated PRs. Run it as an occasional sweep instead:
+#     cargo clippy --fix --allow-dirty -p <pkg> --all-targets -- \
+#       -A clippy::all -A unused -W clippy::redundant_clone
+#   (`-A unused` stops rustc's own unused-import/`mut` fixes from riding along.)
+# - `ptr_arg`, `needless_lifetimes`: already on by default (`clippy::style`).
+[workspace.lints.clippy]
+# Owned argument that the function only borrows. Allow it where the owned type
+# is needed so the function can be passed to `map_err`, or where the by-value
+# parameter performs an unsizing/upcast coercion (`Arc<dyn A>` -> `Arc<dyn B>`).
+needless_pass_by_value = "warn"
+# `&Option<T>` forces callers to own an `Option<T>`; `Option<&T>` does not.
+ref_option = "warn"
+unnecessary_to_owned = "warn"
+# `.to_path_buf()` / `.to_string()` / `.to_owned()` where the value is already owned.
+implicit_clone = "warn"
+# `x = y.clone()` instead of `x.clone_from(&y)`, which can reuse x's allocation.
+assigning_clones = "warn"
+# Small `Copy` types passed by reference, and big types passed by value.
+trivially_copy_pass_by_ref = "warn"
+large_types_passed_by_value = "warn"
+
 [workspace.dependencies]
 async-trait = "0.1"
 serde = { version = "1.0", features = ["derive"] }

@@ -684,7 +684,7 @@ mod tests {
         defaults.lan_connection_opened(&key.peer);
         let other_host = PeerGrantKey {
             host: NodeId::from_peer_id(libp2p::PeerId::random()),
-            peer: key.peer.clone(),
+            peer: key.peer,
         };
         assert_eq!(defaults.resolve(&other_host).0, PeerGrant::None);
     }
@@ -718,7 +718,7 @@ mod tests {
             lan: PeerGrant::None,
             trust: vec![TrustScopeConfig {
                 name: "eng".into(),
-                authority: authority_id.clone(),
+                authority: authority_id,
                 access: access.clone(),
                 token: None,
             }],
@@ -830,10 +830,10 @@ mod tests {
         let authority_id = authority.public().to_peer_id().to_string();
         let lan = providers_only("p", ModelSelection::All);
         let config = MeshAccessConfig {
-            lan: lan.clone(),
+            lan: lan,
             trust: vec![TrustScopeConfig {
                 name: "eng".into(),
-                authority: authority_id.clone(),
+                authority: authority_id,
                 access: PeerGrant::Custom {
                     sessions: true,
                     filesystem: false,

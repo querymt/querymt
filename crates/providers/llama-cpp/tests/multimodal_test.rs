@@ -104,7 +104,7 @@ async fn test_vision_chat_basic() {
         .await
         .expect("Chat failed");
     let text = response.text().unwrap_or_default();
-    let usage = response.usage.clone().unwrap_or_default();
+    let usage = response.usage.unwrap_or_default();
 
     assert!(!text.is_empty(), "Response should not be empty");
     assert!(text.len() > 10, "Response should be substantial");

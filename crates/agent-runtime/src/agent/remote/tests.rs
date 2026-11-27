@@ -876,7 +876,7 @@ mod event_relay_extended {
                 .expect("recv should succeed");
 
             assert_eq!(received.session_id(), expected_event.session_id);
-            if let querymt_agent_core::events::EventEnvelope::Durable(de) = &received {
+            if let Some(de) = received.as_durable() {
                 assert!(de.stream_seq >= 1, "journal-assigned seq must be >= 1");
                 received_seqs.push(de.stream_seq);
             } else {

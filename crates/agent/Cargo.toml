@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 description = "Agent and Session management for querymt"
 
+# Not on [workspace.lints] yet: the clippy lints there still flag existing code in
+# this crate. An empty table records the opt-out; replace it with
+# `workspace = true` once the crate is clean.
+[lints]
+
 [features]
 default = ["plugin-loaders"]
 # Enables the ACP WebSocket and SFT export API server without dashboard assets.

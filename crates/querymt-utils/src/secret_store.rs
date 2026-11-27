@@ -376,7 +376,7 @@ impl SecretStore {
     /// * `Option<String>` - The refresh token if found, or None
     pub fn get_refresh_token(&self, provider: &str) -> Option<String> {
         let tokens = self.get_oauth_tokens(provider)?;
-        Some(tokens.refresh_token.clone())
+        Some(tokens.refresh_token)
     }
 }
 

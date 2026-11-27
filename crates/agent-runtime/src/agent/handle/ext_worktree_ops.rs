@@ -35,13 +35,19 @@ const HANDOFF_USAGE: &str = "usage: /worktree handoff [name] [--summary]";
 const CREATE_USAGE: &str =
     "usage: /worktree create [ref] [name] OR /worktree create --include-local-changes [name]";
 
-fn parse_workspace_op_request<T: serde::de::DeserializeOwned>(req: ExtRequest) -> Result<T, Error> {
+fn parse_workspace_op_request<T: serde::de::DeserializeOwned>(
+    req: &ExtRequest,
+) -> Result<T, Error> {
     serde_json::from_str(req.params.get())
         .map_err(|e| Error::invalid_params().data(serde_json::json!({ "error": e.to_string() })))
 }
 
 /// Map a typed operation error onto ACP error semantics. The stable `code`
 /// travels in the error data on every failure; the message stays readable.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "used as a `map_err` callback, so it must take the error by value"
+)]
 fn op_error_to_acp(err: WorktreeOpError) -> Error {
     let base = match &err {
         WorktreeOpError::RemovalRefused { source, .. } if source.is_typed_refusal() => {
@@ -1331,7 +1337,7 @@ impl LocalAgentHandle {
         &self,
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
-        let parsed: WorktreeCreateRequest = parse_workspace_op_request(req)?;
+        let parsed: WorktreeCreateRequest = parse_workspace_op_request(&req)?;
         render(self.create_worktree_session(parsed).await)
     }
 
@@ -1341,7 +1347,7 @@ impl LocalAgentHandle {
         &self,
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
-        let parsed: WorktreeHandoffRequest = parse_workspace_op_request(req)?;
+        let parsed: WorktreeHandoffRequest = parse_workspace_op_request(&req)?;
         render(
             async {
                 let target = WorkspaceTarget::from_parts(parsed.workspace_id, parsed.session_id)?;
@@ -1364,7 +1370,7 @@ impl LocalAgentHandle {
         &self,
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
-        let parsed: WorktreeIdRequest = parse_workspace_op_request(req)?;
+        let parsed: WorktreeIdRequest = parse_workspace_op_request(&req)?;
         render(
             async {
                 let target = WorkspaceTarget::Workspace(parsed.workspace_id);
@@ -1383,7 +1389,7 @@ impl LocalAgentHandle {
         &self,
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
-        let parsed: WorktreeIdRequest = parse_workspace_op_request(req)?;
+        let parsed: WorktreeIdRequest = parse_workspace_op_request(&req)?;
         render(
             async {
                 let target = WorkspaceTarget::Workspace(parsed.workspace_id);
@@ -1402,7 +1408,7 @@ impl LocalAgentHandle {
         &self,
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
-        let parsed: WorktreePublishRequest = parse_workspace_op_request(req)?;
+        let parsed: WorktreePublishRequest = parse_workspace_op_request(&req)?;
         render(
             async {
                 // Default to the caller's own workspace when only a session is given.
@@ -1424,7 +1430,7 @@ impl LocalAgentHandle {
         &self,
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
-        let parsed: WorktreeMergeRequest = parse_workspace_op_request(req)?;
+        let parsed: WorktreeMergeRequest = parse_workspace_op_request(&req)?;
         render(
             async {
                 let follow_up = parsed.follow_up()?;
@@ -1451,7 +1457,7 @@ impl LocalAgentHandle {
         &self,
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
-        let parsed: WorktreeTargetRequest = parse_workspace_op_request(req)?;
+        let parsed: WorktreeTargetRequest = parse_workspace_op_request(&req)?;
         render(
             async {
                 let target = WorkspaceTarget::from_parts(parsed.workspace_id, parsed.session_id)?;
@@ -1469,7 +1475,7 @@ impl LocalAgentHandle {
         &self,
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
-        let parsed: WorktreeTargetRequest = parse_workspace_op_request(req)?;
+        let parsed: WorktreeTargetRequest = parse_workspace_op_request(&req)?;
         render(
             async {
                 let target = WorkspaceTarget::from_parts(parsed.workspace_id, parsed.session_id)?;
@@ -1489,7 +1495,7 @@ impl LocalAgentHandle {
         &self,
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
-        let parsed: WorktreeRecoverRequest = parse_workspace_op_request(req)?;
+        let parsed: WorktreeRecoverRequest = parse_workspace_op_request(&req)?;
         match (parsed.workspace_id, parsed.session_id) {
             (None, Some(session_id)) => {
                 // Session-scoped recovery: complete a pending isolated fork's

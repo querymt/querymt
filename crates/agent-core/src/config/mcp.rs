@@ -162,10 +162,18 @@ impl McpAuth {
     }
 }
 
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's `skip_serializing_if` passes the field by reference"
+)]
 fn is_false(v: &bool) -> bool {
     !*v
 }
 
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's `skip_serializing_if` passes the field by reference"
+)]
 fn is_true(v: &bool) -> bool {
     *v
 }

@@ -27,7 +27,7 @@ pub(crate) struct DeadlineReached {
 /// The raw `EventEnvelope` is forwarded so the actor can inspect the event
 /// kind and match it against event-driven schedule filters.
 pub(crate) struct ProcessEvent {
-    pub envelope: EventEnvelope,
+    pub envelope: std::sync::Arc<EventEnvelope>,
 }
 
 /// Periodic safety pass — re-reads due armed schedules and stale running

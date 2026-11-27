@@ -748,7 +748,7 @@ pub fn parse_agent_document(
         config: DotagentsAgentConfig::default(),
         body: parsed.body,
         extensions,
-        source: source.clone(),
+        source,
         fingerprint: fingerprint(text),
     };
 
@@ -805,24 +805,24 @@ fn parse_agent_connection(fields: &BTreeMap<String, Value>) -> DotagentsAgentCon
 /// inspection and diagnostics rather than silently dropped.
 pub fn parse_agent_config(
     text: &str,
-    source: DotagentsSource,
+    source: &DotagentsSource,
 ) -> Result<DotagentsAgentConfig, Box<DotagentsDiagnostic>> {
-    let object = parse_json_object(text, &source)?;
+    let object = parse_json_object(text, source)?;
     let what = "agent `config.json`";
 
     let model_preset =
         optional_string(&object, "model").or_else(|| optional_string(&object, "modelPreset"));
 
     let tools = if object.contains_key("tools") {
-        Some(string_list(&object, "tools", &source, what)?)
+        Some(string_list(&object, "tools", source, what)?)
     } else {
         None
     };
 
     let mcp_servers = if object.contains_key("mcpServers") {
-        Some(string_list(&object, "mcpServers", &source, what)?)
+        Some(string_list(&object, "mcpServers", source, what)?)
     } else if object.contains_key("mcp") {
-        Some(string_list(&object, "mcp", &source, what)?)
+        Some(string_list(&object, "mcp", source, what)?)
     } else {
         None
     };
@@ -915,7 +915,7 @@ pub fn parse_task_document(
         profile_id,
         prompt,
         extensions,
-        source: source.clone(),
+        source,
         fingerprint: fingerprint(text),
     })
 }
@@ -1372,7 +1372,7 @@ mod tests {
     fn agent_config_minimal_and_full_parse() {
         let minimal = parse_agent_config(
             r#"{"model":"fast"}"#,
-            entry_source("agents/a/config.json", "a"),
+            &entry_source("agents/a/config.json", "a"),
         )
         .unwrap();
         assert_eq!(minimal.model_preset.as_deref(), Some("fast"));
@@ -1381,7 +1381,7 @@ mod tests {
 
         let full = parse_agent_config(
             r#"{"model":"fast","tools":["read"],"mcpServers":["fs"],"other":1}"#,
-            entry_source("agents/a/config.json", "a"),
+            &entry_source("agents/a/config.json", "a"),
         )
         .unwrap();
         assert_eq!(full.tools.as_deref(), Some(&["read".to_string()][..]));
@@ -1393,7 +1393,7 @@ mod tests {
     fn agent_config_accepts_mcp_alias() {
         let config = parse_agent_config(
             r#"{"mcp":["fs"]}"#,
-            entry_source("agents/a/config.json", "a"),
+            &entry_source("agents/a/config.json", "a"),
         )
         .unwrap();
         assert_eq!(config.mcp_servers.as_deref(), Some(&["fs".to_string()][..]));
@@ -1402,7 +1402,7 @@ mod tests {
     #[test]
     fn agent_config_malformed_json_is_an_error() {
         let err =
-            parse_agent_config("nope", entry_source("agents/a/config.json", "a")).unwrap_err();
+            parse_agent_config("nope", &entry_source("agents/a/config.json", "a")).unwrap_err();
         assert_eq!(err.code, DotagentsDiagnosticCode::ParseError);
     }
 

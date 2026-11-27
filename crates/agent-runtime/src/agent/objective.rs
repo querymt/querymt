@@ -109,7 +109,7 @@ impl RunObjective {
 
     pub fn new(
         run_id: querymt_agent_core::model::TurnId,
-        instruction: String,
+        instruction: &str,
         execution_origin: String,
         current_task: Option<&Task>,
         historical_intent: Option<IntentSnapshot>,
@@ -214,7 +214,7 @@ mod tests {
     fn later_user_updates_render_in_order_without_historical_intent() {
         let mut objective = RunObjective::new(
             querymt_agent_core::model::TurnId::new(),
-            "Inspect only".into(),
+            "Inspect only",
             "interactive".into(),
             None,
             None,
@@ -248,7 +248,7 @@ mod tests {
     fn rendered_objective_has_no_progress_review_text() {
         let objective = RunObjective::new(
             querymt_agent_core::model::TurnId::new(),
-            "Implement the fix".into(),
+            "Implement the fix",
             "interactive".into(),
             None,
             None,
@@ -287,7 +287,7 @@ mod tests {
         };
         let mut objective = RunObjective::new(
             querymt_agent_core::model::TurnId::new(),
-            "Implement the fix".into(),
+            "Implement the fix",
             "interactive".into(),
             Some(&task),
             None,

@@ -807,7 +807,7 @@ impl QmtApp {
         let menu_s = s.clone();
         let selector = format!("tab-{key}");
         row.relative()
-            .debug_selector(move || selector.clone())
+            .debug_selector(move || selector)
             .on_drag(dragged, |d, _, _, cx| cx.new(|_| d.clone()))
             .on_drag_move(
                 cx.listener(move |this, ev: &DragMoveEvent<DraggedTab>, _, cx| {
@@ -1229,7 +1229,7 @@ pub(super) fn waiting_dot(session_id: &str, p: &Palette) -> Stateful<Div> {
     let selector = format!("wait-{session_id}");
     div()
         .id(kit::keyed("wait", session_id.to_string()))
-        .debug_selector(move || selector.clone())
+        .debug_selector(move || selector)
         .flex_none()
         .size(px(7.))
         .rounded_full()

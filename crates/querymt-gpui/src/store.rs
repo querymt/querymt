@@ -3003,14 +3003,11 @@ impl AgentsStore {
         });
         // A chosen peer profile may have been removed on the peer since it
         // was listed: check right before creating (desktop `launchSession`).
-        let profile_check = target
-            .clone()
-            .zip(placement.remote_profile.clone())
-            .filter(|_| {
-                self.runtime
-                    .get(agent_id)
-                    .is_some_and(|rt| rt.supports_method("querymt/profiles"))
-            });
+        let profile_check = target.zip(placement.remote_profile).filter(|_| {
+            self.runtime
+                .get(agent_id)
+                .is_some_and(|rt| rt.supports_method("querymt/profiles"))
+        });
         let image_mode = self.prefs.image_send_mode;
         let mode = mode.unwrap_or_else(|| self.prefs.mode().to_string());
         let reasoning = reasoning.unwrap_or_else(|| self.prefs.reasoning().to_string());

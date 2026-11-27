@@ -1214,7 +1214,7 @@ mod tests {
         let (registry, _temp_dir) = empty_plugin_registry().unwrap();
         let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
         let llm = LLMParams::new().provider("mock").model("mock-model");
-        let builder = AgentConfigBuilder::new(Arc::new(registry), storage.clone(), llm);
+        let builder = AgentConfigBuilder::new(Arc::new(registry), storage, llm);
         Arc::new(builder.build())
     }
 

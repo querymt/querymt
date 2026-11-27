@@ -311,16 +311,16 @@ mod tests {
     }
 
     impl Fx {
-        fn new(settings: RepositoryKnowledgeSettings) -> Self {
+        fn new(settings: &RepositoryKnowledgeSettings) -> Self {
             let tmp = tempfile::tempdir().unwrap();
             let registry =
-                RepositoryKnowledgeRegistry::from_settings_in(&settings, tmp.path().join("config"))
+                RepositoryKnowledgeRegistry::from_settings_in(settings, tmp.path().join("config"))
                     .unwrap();
             Self { tmp, registry }
         }
 
         fn enabled() -> Self {
-            Self::new(RepositoryKnowledgeSettings::enabled())
+            Self::new(&RepositoryKnowledgeSettings::enabled())
         }
 
         fn repo(&self, name: &str) -> PathBuf {
@@ -531,7 +531,7 @@ mod tests {
             "root_required"
         );
 
-        let allowed = Fx::new(RepositoryKnowledgeSettings {
+        let allowed = Fx::new(&RepositoryKnowledgeSettings {
             allowed_roots: vec![PathBuf::from("/nonexistent-allowlist")],
             ..RepositoryKnowledgeSettings::enabled()
         });

@@ -1012,7 +1012,7 @@ impl AgentMessage {
                         content.clone()
                     };
                     let mut result = querymt::chat::ToolResult::new(call_id.clone());
-                    result.name = tool_name.clone();
+                    result.name.clone_from(tool_name);
                     result.is_error = *is_error;
                     result.parts = parts;
                     input_parts.push(ChatInputPart::tool_result(result));

@@ -436,7 +436,7 @@ impl UndoTestFixture {
 
         let mut builder = AgentConfigBuilder::new(registry, storage.clone(), llm)
             .with_snapshot_policy(SnapshotPolicy::Diff)
-            .with_snapshot_backend(backend_arc.clone());
+            .with_snapshot_backend(backend_arc);
         if let Some(hooks) = hooks {
             builder = builder.with_hooks(hooks);
         }

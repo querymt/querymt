@@ -518,7 +518,7 @@ pub(crate) fn current_stat(path: &Path) -> Option<Stat> {
 
 pub(crate) fn flatten(repo: &gix::Repository, tree: ObjectId) -> WorktreeResult<FlatTree> {
     let mut flat = FlatTree::new();
-    flatten_tree(repo, tree, &mut flat, String::new())?;
+    flatten_tree(repo, tree, &mut flat, "")?;
     Ok(flat)
 }
 
@@ -676,7 +676,7 @@ mod tests {
         // untouched everywhere else, local staging included.
         let tree = object.tree_id().unwrap().detach();
         let mut committed = FlatTree::new();
-        flatten_tree(&repo, tree, &mut committed, String::new()).unwrap();
+        flatten_tree(&repo, tree, &mut committed, "").unwrap();
         let index = gix::index::File::at(
             repo.index_path(),
             gix::hash::Kind::Sha1,
@@ -737,7 +737,7 @@ mod tests {
             .unwrap()
             .detach();
         let mut committed = FlatTree::new();
-        flatten_tree(&repo, tree, &mut committed, String::new()).unwrap();
+        flatten_tree(&repo, tree, &mut committed, "").unwrap();
         assert_eq!(committed[b"mod.crlf".as_bstr()].1, id);
         let index = gix::index::File::at(
             repo.index_path(),

@@ -1214,7 +1214,7 @@ mod tests {
         assert!(compact_session_summary(&null_pin).get("_meta").is_none());
 
         let lifecycle_with_null_pin_meta = serde_json::from_value::<Map<String, Value>>(json!({
-            "querymt": { "lifecycle": lifecycle.clone(), "pin": null }
+            "querymt": { "lifecycle": lifecycle, "pin": null }
         }))
         .unwrap();
         let lifecycle_with_null_pin =

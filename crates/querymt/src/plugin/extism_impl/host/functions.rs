@@ -430,7 +430,7 @@ pub(crate) fn qmt_http_stream_next(
         });
         match next_chunk {
             Some(Ok(bytes)) => {
-                let handle = plugin.memory_new(bytes.to_vec())?;
+                let handle = plugin.memory_new(bytes)?;
                 outputs[0] = Val::I64(handle.offset as i64);
             }
             Some(Err(e)) => {

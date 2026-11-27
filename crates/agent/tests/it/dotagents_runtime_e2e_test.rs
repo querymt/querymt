@@ -984,7 +984,7 @@ impl querymt_agent::dotagents::DotagentsTaskApprover for AlwaysApprove {
         &self,
         request: DotagentsTaskApprovalRequest,
     ) -> DotagentsTaskApprovalDecision {
-        self.seen.lock().unwrap().push(request.task_id.clone());
+        self.seen.lock().unwrap().push(request.task_id);
         DotagentsTaskApprovalDecision::Approve
     }
 }

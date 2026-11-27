@@ -86,7 +86,7 @@ pub(crate) fn apply_message_to_request(
     }
 
     if !images.is_empty() || !audios.is_empty() {
-        req = req.add_multimodal_message(role, text.clone(), images, audios, vec![]);
+        req = req.add_multimodal_message(role, text, images, audios, vec![]);
     } else if !tool_uses.is_empty() {
         req = req.add_message_with_tool_call(role, text, tool_uses);
     } else if !text.is_empty() {

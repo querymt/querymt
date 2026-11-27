@@ -663,7 +663,7 @@ impl ChatProvider for LlamaCppProvider {
         {
             let template_result =
                 apply_template_with_tools(&self.model, &cfg, messages, tools, media_marker)?;
-            let cfg = cfg.clone();
+            let cfg = cfg;
             let model = Arc::clone(&self.model);
             let mtp_model = self.mtp_model.clone();
             let loras = Arc::clone(&self.loras);
@@ -711,7 +711,7 @@ impl ChatProvider for LlamaCppProvider {
         // streaming, which would leak <think> tags to the UI.
         let thinking_template =
             apply_template_for_thinking(&self.model, &cfg, messages, media_marker)?;
-        let cfg = cfg.clone();
+        let cfg = cfg;
         let model = Arc::clone(&self.model);
         let mtp_model = self.mtp_model.clone();
         let loras = Arc::clone(&self.loras);

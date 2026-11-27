@@ -49,6 +49,10 @@ struct CallFailure {
     output: Option<Box<ChatOutput>>,
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "used as a `map_err` callback, so it must take the error by value"
+)]
 fn accounting_failure(error: AccountingError) -> SessionError {
     SessionError::InvalidOperation(format!("Delegation summary accounting failure: {error}"))
 }
