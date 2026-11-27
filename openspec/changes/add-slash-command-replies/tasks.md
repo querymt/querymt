@@ -2,7 +2,7 @@
 
 Prerequisites: `add-slash-command-records` is done; `slash-command-actions` tasks 1.1 and 1.2 and `slash-command-transcript` are done (group 3 needs them).
 
-Runtime commands use the CI feature set `remote,oauth,plugin-loaders,api` (`cargo t-runtime`, `cargo cl-runtime`). Facade commands (`cargo t-agent`) need `QMT_UI_DIST` set to the fixture from `.github/actions/rust-setup/action.yml`. App paths are relative to `crates/querymt-gpui`.
+Runtime commands use the CI feature set `remote,oauth,plugin-loaders,api` (`cargo t-runtime`, `cargo cl-runtime`). Facade commands (`cargo t-agent`, `cargo cl-agent`) never build the wasm UI and need no `QMT_UI_DIST` (see `.cargo/config.toml`). App paths are relative to `crates/querymt-gpui`.
 
 Tasks 1.1, 1.2, 2.1 and 2.2 were `add-slash-command-records` tasks 3.4, 3.5, 4.3 and 4.4.
 

@@ -2,7 +2,7 @@
 
 Tasks 3.4, 3.5, 4.3 and 4.4 moved to `add-slash-command-replies` (tasks 1.1, 1.2, 2.1 and 2.2 there); their numbers are not reused here.
 
-Runtime commands below use the CI feature set `remote,oauth,plugin-loaders,api` (`cargo t-runtime`, `cargo cl-runtime`). Facade commands (`cargo t-agent`) need `QMT_UI_DIST` set to the fixture from `.github/actions/rust-setup/action.yml`.
+Runtime commands below use the CI feature set `remote,oauth,plugin-loaders,api` (`cargo t-runtime`, `cargo cl-runtime`). Facade commands (`cargo t-agent`, `cargo cl-agent`) never build the wasm UI and need no `QMT_UI_DIST` (see `.cargo/config.toml`).
 
 ## 1. Event and record types (`querymt-agent-protocol-types`)
 
