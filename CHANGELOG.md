@@ -805,6 +805,23 @@
 
 ### Breaking
 
+- **Slash command files validate a new `arguments` key (BREAKING, slash
+  commands).** A command file may declare `arguments: none | optional |
+  required`. A file whose `arguments` value is anything else is not loaded and
+  discovery reports a diagnostic that names it; the key was ignored before.
+  Without the key the input need is `required` when the file has an
+  `argument-hint` or its template contains `$ARGUMENTS`, else `none`, and the
+  ACP `input` is advertised exactly when it is not `none` (as before for the
+  default). Every catalog entry also carries `_meta.querymt` with `source`,
+  `effect`, `input` and `accepts`. Documented in
+  `docs/docs/agent/slash-commands.md`.
+- **Steering: a command is rejected by name, other `/` text is steered (BREAKING,
+  ACP behaviour).** Steered text that starts with `/` but names no command of
+  the session's catalog (for example `/tmp/build.log is empty`) is now accepted
+  as steering. A steered command, built-in or user-defined, is rejected with an
+  invalid-prompt error (`-32602`) that names the command and says to queue it,
+  instead of the `slash_command_not_steerable` turn-control error, which no
+  longer exists. Documented in `docs/docs/agent/slash-commands.md`.
 - **The `qmtcode --dashboard` UI is QueryMT Desktop web (BREAKING, build
   inputs).** The `dashboard` feature of `querymt-agent` now embeds the wasm
   build of `crates/querymt-gpui` instead of the querymt-desktop Svelte

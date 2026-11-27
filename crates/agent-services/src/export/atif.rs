@@ -692,6 +692,7 @@ mod tests {
                 origin: EventOrigin::Local,
                 source_node: None,
                 kind: AgentEventKind::PromptReceived {
+                    slash_command: None,
                     content: "test prompt".to_string(),
                     message_id: None,
                 },

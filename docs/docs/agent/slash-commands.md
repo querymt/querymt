@@ -109,6 +109,42 @@ A session advertises to ACP clients exactly the commands it can run: its user
 commands plus the native built-ins available on its host. A session hosted on a
 remote mesh node currently advertises only `/compact`.
 
+### Command descriptor
+
+Every advertised command (built-in or user-defined) carries a descriptor in
+the `_meta.querymt` of its `available_commands_update` entry, so a client can
+tell what a command is without guessing from its name:
+
+| Field | Values | Meaning |
+|-------|--------|---------|
+| `source` | `builtin`, `global`, `project`, `configured` | Where the command comes from. A command defined in several places reports the source that won. |
+| `effect` | `prompt`, `action` | `prompt`: the command becomes a model turn. `action`: the agent runs it itself. |
+| `input` | `none`, `optional`, `required` | What the command asks of the user's input. |
+| `accepts` | `prompt`, `queue` | The submissions the command runs from. |
+
+```json
+{ "name": "explain", "description": "Explain a topic",
+  "input": { "hint": "[topic]" },
+  "_meta": { "querymt": { "source": "project", "effect": "prompt",
+                          "input": "required", "accepts": ["prompt", "queue"] } } }
+```
+
+`/compact` is `builtin`, `action`, `optional`, `["prompt", "queue"]`;
+`/worktree` is `builtin`, `action`, `required`, `["prompt"]`.
+
+### Commands and steering
+
+While a turn is running, a client can steer it with extra input. A command is
+never steered: if the first text block names a command of the session's
+catalog (built-in or user-defined), the submission is rejected with an
+invalid-prompt error that names the command and says to queue it or submit it
+with `session/prompt`. Nothing of it reaches the running turn.
+
+Steered text that starts with `/` but names no command of the catalog, such as
+`/tmp/build.log is empty`, is accepted as steering and reaches the model
+unchanged. Earlier versions rejected all steered text that started with `/`
+with `slash_command_not_steerable`; that error no longer exists.
+
 ### `/help [command]`
 
 Show available slash commands or detailed help for a specific command.
@@ -361,6 +397,7 @@ tags: ["coding", "review"]
 |-------|------|----------|-------------|
 | `description` | string | Yes | Brief description shown in help and completion |
 | `argument-hint` | string | No | Hint for arguments (e.g., `"<file> [options]"`) |
+| `arguments` | `none`, `optional`, `required` | No | What the command asks of the user's input (default: see below) |
 | `tags` | string[] | No | Tags for filtering and organization |
 | `requires-script` | bool | No | Whether command requires script execution (default: false) |
 | `script` | object | No | Script definition (for script-backed commands) |
@@ -401,6 +438,33 @@ argument-hint: "[target]"                  # Optional target
 argument-hint: "<file> [options...]"       # File with optional options
 argument-hint: "<source> <destination>"    # Two required args
 ```
+
+#### `arguments`
+
+How much input the command needs. Clients read it from the command
+descriptor (`input`) to decide whether to ask for input before sending:
+
+```yaml
+---
+description: "Explain a topic"
+argument-hint: "[topic]"
+arguments: optional
+---
+Explain $ARGUMENTS
+```
+
+- `none`: the command takes no input; no ACP `input` is advertised even when
+  the template contains `$ARGUMENTS`.
+- `optional`: the command works with or without input.
+- `required`: the command is meant to be sent with input.
+
+Without the key the need is `required` when the file has an `argument-hint` or
+the template contains `$ARGUMENTS`, and `none` otherwise. The need is advice
+for clients: a command sent without arguments is still expanded, with empty
+arguments.
+
+A value other than the three above is an error: the command is not loaded and
+discovery reports a diagnostic that names the file.
 
 #### `tags`
 

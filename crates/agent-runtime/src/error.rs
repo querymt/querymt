@@ -419,6 +419,14 @@ impl From<crate::slash_commands::builtin::BuiltinError> for AgentError {
     }
 }
 
+impl From<crate::slash_commands::expander::SteeredCommandError> for AgentError {
+    fn from(error: crate::slash_commands::expander::SteeredCommandError) -> Self {
+        Self::InvalidPromptContent {
+            message: error.to_string(),
+        }
+    }
+}
+
 impl From<crate::slash_commands::builtin::BuiltinError> for AcpError {
     fn from(error: crate::slash_commands::builtin::BuiltinError) -> Self {
         AgentError::from(error).into()

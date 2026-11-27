@@ -333,6 +333,7 @@ impl SessionCore {
                 status: PromptStatus::Pending,
                 error: None,
                 at_ms: Some(at_ms),
+                slash_command: None,
             }),
             TurnHint::Pending(client_prompt_id.to_owned()),
         );

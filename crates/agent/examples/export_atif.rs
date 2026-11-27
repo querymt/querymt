@@ -25,6 +25,7 @@ fn main() {
             origin: EventOrigin::Local,
             source_node: None,
             kind: AgentEventKind::PromptReceived {
+                slash_command: None,
                 content: "What is the current price of GOOGL stock?".to_string(),
                 message_id: None,
             },

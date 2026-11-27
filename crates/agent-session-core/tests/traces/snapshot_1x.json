@@ -6714,7 +6714,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -6763,7 +6764,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -6783,7 +6785,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -6861,7 +6864,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -6939,7 +6943,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -6959,7 +6964,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -7039,7 +7045,8 @@
                     },
                     "runId": "r3"
                   }
-                }
+                },
+                "slashCommand": null
               }
             }
           }
@@ -7065,7 +7072,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -7160,7 +7168,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -7180,7 +7189,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -7229,7 +7239,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -7278,7 +7289,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -7298,7 +7310,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -7378,7 +7391,8 @@
                     },
                     "runId": "r7"
                   }
-                }
+                },
+                "slashCommand": null
               }
             }
           }
@@ -7404,7 +7418,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -7453,7 +7468,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -7473,7 +7489,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -7568,7 +7585,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -7675,7 +7693,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -7695,7 +7714,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -7746,7 +7766,8 @@
                     },
                     "runId": "r11"
                   }
-                }
+                },
+                "slashCommand": null
               }
             }
           }
@@ -7772,7 +7793,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -7879,7 +7901,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -7899,7 +7922,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -7977,7 +8001,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -8043,7 +8068,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -8063,7 +8089,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -8143,7 +8170,8 @@
                     },
                     "runId": "r15"
                   }
-                }
+                },
+                "slashCommand": null
               }
             }
           }
@@ -8169,7 +8197,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -8218,7 +8247,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -8238,7 +8268,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -8287,7 +8318,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -8365,7 +8397,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -8385,7 +8418,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -8465,7 +8499,8 @@
                     },
                     "runId": "r19"
                   }
-                }
+                },
+                "slashCommand": null
               }
             }
           }
@@ -8508,7 +8543,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -8586,7 +8622,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -8606,7 +8643,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -8684,7 +8722,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -8762,7 +8801,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -8782,7 +8822,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -8862,7 +8903,8 @@
                     },
                     "runId": "r23"
                   }
-                }
+                },
+                "slashCommand": null
               }
             }
           }

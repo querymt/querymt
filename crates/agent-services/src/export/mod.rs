@@ -117,6 +117,7 @@ mod session_atif_tests {
             ev(
                 &parent,
                 AgentEventKind::PromptReceived {
+                    slash_command: None,
                     content: "read test.rs".into(),
                     message_id: None,
                 },
@@ -169,6 +170,7 @@ mod session_atif_tests {
             ev(
                 &child,
                 AgentEventKind::PromptReceived {
+                    slash_command: None,
                     content: "child task".into(),
                     message_id: None,
                 },

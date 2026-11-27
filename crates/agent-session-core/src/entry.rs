@@ -1,5 +1,6 @@
 //! Turn entries: the unit a client renders and caches.
 
+use querymt_agent_protocol_types::events::SlashCommandRecord;
 use querymt_agent_protocol_types::protocol::ContentBlock;
 use serde::{Deserialize, Serialize};
 use typeshare::typeshare;
@@ -32,6 +33,10 @@ pub struct UserMessage {
     /// Client time the prompt was submitted; only optimistic prompts have one.
     #[typeshare(serialized_as = "Option<number>")]
     pub at_ms: Option<i64>,
+    /// The slash command this message came from, when the agent said so
+    /// (`_meta.querymt.slashCommand`). The blocks stay what the model
+    /// receives: for a prompt command, its expansion.
+    pub slash_command: Option<SlashCommandRecord>,
 }
 
 /// One assistant message: all text chunks that share a message id.
@@ -117,6 +122,9 @@ pub struct CompactionEntry {
     pub error: Option<String>,
     #[typeshare(serialized_as = "any")]
     pub meta: Option<serde_json::Map<String, serde_json::Value>>,
+    /// The `/compact` invocation that started this compaction, when one did.
+    /// Once set it stays when later updates do not repeat it.
+    pub slash_command: Option<SlashCommandRecord>,
 }
 
 /// What an entry holds.

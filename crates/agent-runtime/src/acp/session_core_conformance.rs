@@ -171,10 +171,12 @@ pub(super) fn live_envelopes(
         AgentEventKind::PromptReceived {
             content,
             message_id: Some(message_id),
+            ..
         } if !blocked.contains(message_id) => {
             envelopes.push(ephemeral(
                 event.seq,
                 AgentEventKind::UserPromptBlock {
+                    slash_command: None,
                     message_id: message_id.clone(),
                     client_prompt_id: None,
                     block: ContentBlock::Text(TextContent::new(content.clone())),

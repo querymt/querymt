@@ -612,6 +612,7 @@ async fn append_prompt_event(
             source_node_id: None,
             source_seq: None,
             kind: AgentEventKind::PromptReceived {
+                slash_command: None,
                 content: "test prompt".to_string(),
                 message_id: Some(message_id.to_string()),
             },
@@ -1195,6 +1196,7 @@ async fn test_cleanup_revert_keeps_accounting_for_undone_turn() -> Result<()> {
     let msg1 = fixture.add_user_message(&session_id, "first").await?;
     stream
         .emit_persisted(AgentEventKind::PromptReceived {
+            slash_command: None,
             content: "first".into(),
             message_id: Some(msg1),
         })
@@ -1202,6 +1204,7 @@ async fn test_cleanup_revert_keeps_accounting_for_undone_turn() -> Result<()> {
     let msg2 = fixture.add_user_message(&session_id, "second").await?;
     let prompt2 = stream
         .emit_persisted(AgentEventKind::PromptReceived {
+            slash_command: None,
             content: "second".into(),
             message_id: Some(msg2.clone()),
         })

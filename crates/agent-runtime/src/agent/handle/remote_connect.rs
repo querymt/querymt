@@ -2347,6 +2347,7 @@ mod tests {
                         }
                     } else {
                         AgentEventKind::PromptReceived {
+                            slash_command: None,
                             content: format!("p{n}"),
                             message_id: None,
                         }
@@ -2889,6 +2890,7 @@ mod tests {
             .emit_event_persisted(
                 &session_id,
                 AgentEventKind::PromptReceived {
+                    slash_command: None,
                     content: "before attach".into(),
                     message_id: None,
                 },
@@ -2947,6 +2949,7 @@ mod tests {
             .emit_event_persisted(
                 &session_id,
                 AgentEventKind::PromptReceived {
+                    slash_command: None,
                     content: "missed live event".into(),
                     message_id: None,
                 },
@@ -3038,6 +3041,7 @@ mod tests {
                 source_seq: None,
                 session_seq: None,
                 kind: AgentEventKind::PromptReceived {
+                    slash_command: None,
                     content: "before owner restart".into(),
                     message_id: None,
                 },

@@ -303,6 +303,7 @@ pub(crate) async fn commit_steering(
             config.emit_event(
                 &env.session_id,
                 AgentEventKind::UserPromptBlock {
+                    slash_command: None,
                     message_id: message_id.clone(),
                     client_prompt_id: client_prompt_id.clone(),
                     block,
@@ -313,6 +314,7 @@ pub(crate) async fn commit_steering(
             .emit_event_persisted(
                 &env.session_id,
                 AgentEventKind::PromptReceived {
+                    slash_command: None,
                     content: display.clone(),
                     message_id: Some(message_id),
                 },
@@ -805,7 +807,7 @@ mod tests {
                     message_id: event_message_id,
                     client_prompt_id: Some(client_prompt_id),
                     block: event_block,
-                } if event_message_id == &message_id && client_prompt_id == "client-1" && event_block == block
+                .. } if event_message_id == &message_id && client_prompt_id == "client-1" && event_block == block
             ));
         }
         assert!(matches!(

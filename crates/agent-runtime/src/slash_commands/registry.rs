@@ -173,6 +173,7 @@ mod tests {
 
     fn make_command(name: &str, description: &str, requires_script: bool) -> SlashCommand {
         SlashCommand {
+            arguments: None,
             name: name.to_string(),
             source: SlashCommandSource::Global(PathBuf::from("/test")),
             path: PathBuf::from(format!("/test/{}.md", name)),

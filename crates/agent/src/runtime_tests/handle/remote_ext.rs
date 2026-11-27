@@ -281,6 +281,7 @@ async fn remote_delegate_child_reuses_session_listing_attach_and_bookmarked_load
         .emit_durable(
             &child_id,
             AgentEventKind::PromptReceived {
+                slash_command: None,
                 content: "Delegate conversation".into(),
                 message_id: None,
             },
@@ -1898,6 +1899,7 @@ async fn viewer_with_synced_history(
             }
         } else {
             AgentEventKind::PromptReceived {
+                slash_command: None,
                 content: format!("prompt {seq}"),
                 message_id: None,
             }
@@ -2182,6 +2184,7 @@ async fn owner_and_viewer_with_image_prompts(
                 origin: "interactive".into(),
             },
             AgentEventKind::PromptReceived {
+                slash_command: None,
                 content: format!("look {turn}\n\n[Image: image/png]"),
                 message_id: Some(message_id.clone()),
             },

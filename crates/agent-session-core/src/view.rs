@@ -2,6 +2,7 @@
 
 use crate::input::UndoFrame;
 use querymt_agent_protocol_types::accounting::AccountingSnapshot;
+use querymt_agent_protocol_types::events::{SlashCommandEffect, SlashCommandSource};
 use querymt_agent_protocol_types::protocol::PlanEntry;
 use querymt_agent_protocol_types::runtime_status::SessionRuntimeStatus;
 use querymt_agent_protocol_types::session::history::{
@@ -167,6 +168,49 @@ pub struct SlashCommandView {
     /// The hint of the command's input, when it takes input. Empty when the
     /// command takes input but gives no hint.
     pub input_hint: Option<String>,
+    /// Where the command comes from, as the agent's descriptor says
+    /// (`_meta.querymt.source`). `None` when the agent sent none or a value
+    /// this core does not know. The same type as an invocation record's
+    /// `source`, so the two compare directly.
+    pub source: Option<SlashCommandSource>,
+    /// What the command does (`_meta.querymt.effect`); `None` as for `source`.
+    /// The same type as an invocation record's `effect`.
+    pub effect: Option<SlashCommandEffect>,
+    /// What the command asks of the user's input (`_meta.querymt.input`);
+    /// `None` as for `source`.
+    pub input: Option<CommandInput>,
+    /// The submissions the command runs from (`_meta.querymt.accepts`).
+    /// `None` when the agent sent no descriptor, which is not the same as
+    /// `Some` of an empty list (a command that runs from no submission): a
+    /// client picks its fallback from `None`. Elements this core does not
+    /// know are dropped.
+    pub accepts: Option<Vec<CommandSubmission>>,
+}
+
+/// What a slash command asks of the user's input.
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CommandInput {
+    /// The command takes no input.
+    None,
+    /// The command works with or without input.
+    Optional,
+    /// The command is meant to be sent with input.
+    Required,
+}
+
+/// A way of submitting a prompt that a command runs from.
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CommandSubmission {
+    /// `session/prompt`.
+    Prompt,
+    /// Queued input.
+    Queue,
 }
 
 /// The session header: all whole-session state.

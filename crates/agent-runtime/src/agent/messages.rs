@@ -916,6 +916,7 @@ mod tests {
             origin: querymt_agent_core::events::EventOrigin::Local,
             source_node: None,
             kind: querymt_agent_core::events::AgentEventKind::PromptReceived {
+                slash_command: None,
                 content: "hi".into(),
                 message_id: None,
             },

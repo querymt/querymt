@@ -841,6 +841,7 @@ mod event_relay_extended {
                 origin: EventOrigin::Local,
                 source_node: None,
                 kind: AgentEventKind::PromptReceived {
+                    slash_command: None,
                     content: "hello".to_string(),
                     message_id: None,
                 },

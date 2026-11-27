@@ -112,6 +112,51 @@ pub struct ArchiveMerge {
     pub branch: Option<String>,
 }
 
+/// Where a slash command comes from.
+/// Typeshare-annotated: generated for TypeScript and Swift.
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlashCommandSource {
+    /// Implemented by the agent itself (`/compact`, `/worktree`).
+    Builtin,
+    /// A command file in the user's global commands directory.
+    Global,
+    /// A command file in the session project's commands directory.
+    Project,
+    /// A command file from a configured path.
+    Configured,
+}
+
+/// What a slash command does when it runs.
+/// Typeshare-annotated: generated for TypeScript and Swift.
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlashCommandEffect {
+    /// The command becomes a model turn.
+    Prompt,
+    /// The agent runs the command itself.
+    Action,
+}
+
+/// The invocation of a slash command, attached to the update that delivers
+/// the command's outcome.
+/// Typeshare-annotated: generated for TypeScript and Swift.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlashCommandRecord {
+    /// Command name without the slash.
+    pub name: String,
+    /// Trimmed text after the name; empty when there is none.
+    pub arguments: String,
+    pub source: SlashCommandSource,
+    pub effect: SlashCommandEffect,
+    /// The client's id for the prompt that invoked the command, when it sent one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_prompt_id: Option<String>,
+}
+
 impl From<StopType> for StopReason {
     fn from(stop_type: StopType) -> Self {
         match stop_type {
@@ -368,6 +413,10 @@ pub enum AgentEventKind {
         content: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message_id: Option<String>,
+        /// Set when the prompt invoked a user-defined slash command; `content`
+        /// is then the expansion.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slash_command: Option<SlashCommandRecord>,
     },
     /// Transient structured prompt block for live ACP delivery. Durable prompt
     /// content remains in MessagePart::Prompt rather than the event journal.
@@ -377,6 +426,8 @@ pub enum AgentEventKind {
         client_prompt_id: Option<String>,
         #[typeshare(serialized_as = "any")]
         block: ContentBlock,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slash_command: Option<SlashCommandRecord>,
     },
     UserMessageStored {
         content: String,
@@ -678,6 +729,9 @@ pub enum AgentEventKind {
         /// identity from the record itself in that case.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         compaction_id: Option<String>,
+        /// Set when `/compact` started this compaction.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slash_command: Option<SlashCommandRecord>,
     },
     CompactionEnd {
         summary: String,
@@ -798,6 +852,20 @@ pub enum AgentEventKind {
     /// workspace registry, so it is neither journaled nor replayed.
     WorktreeCommandOutput {
         text: String,
+        /// Stable error code; absent on success.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slash_command: Option<SlashCommandRecord>,
+    },
+    /// Reply to a slash command whose outcome has no other update (`/compact`
+    /// on an empty conversation, or blocked by a hook). Transient.
+    SlashCommandReply {
+        slash_command: SlashCommandRecord,
+        text: String,
+        /// Stable error code; absent on success.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
     },
     /// Reply to a mutating native `/worktree` command (`publish`, `archive`,
     /// `remove`, `recover`, `handoff`), successful or refused. Durable and
@@ -814,6 +882,8 @@ pub enum AgentEventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         archived: Option<bool>,
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slash_command: Option<SlashCommandRecord>,
     },
     /// Ownership of the session's managed checkout moved to a successor
     /// session. Emitted on the previous owner's stream and replayed on load.
@@ -821,6 +891,8 @@ pub enum AgentEventKind {
         workspace_id: String,
         successor_session_id: String,
         summary_seeded: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slash_command: Option<SlashCommandRecord>,
     },
     /// The session's managed workspace was archived: the session is now
     /// read-only. Emitted on the owner's stream and replayed on load.
@@ -837,6 +909,8 @@ pub enum AgentEventKind {
         /// (`/worktree merge --archive`); absent otherwise.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         merged: Option<ArchiveMerge>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slash_command: Option<SlashCommandRecord>,
     },
     DelegationRequested {
         delegation: Delegation,
@@ -1213,6 +1287,7 @@ impl AgentEventKind {
             Self::ArtifactRecorded { .. } => "artifact_recorded",
             Self::DelegateModelsChanged { .. } => "delegate_models_changed",
             Self::WorktreeCommandOutput { .. } => "worktree_command_output",
+            Self::SlashCommandReply { .. } => "slash_command_reply",
             Self::WorktreeCommandCompleted { .. } => "worktree_command_completed",
             Self::WorktreeOwnershipTransferred { .. } => "worktree_ownership_transferred",
             Self::WorktreeArchived { .. } => "worktree_archived",
@@ -1484,6 +1559,9 @@ pub fn classify_durability(kind: &AgentEventKind) -> Durability {
         // Rationale: command output is a transient reply to one prompt; the
         // registry is authoritative and the handoff has its own durable event.
         AgentEventKind::WorktreeCommandOutput { .. } => Durability::Ephemeral,
+        // Rationale: a transient reply to one prompt whose outcome has no
+        // other update; nothing else records it, so it is not replayed.
+        AgentEventKind::SlashCommandReply { .. } => Durability::Ephemeral,
         // Rationale: live MCP progress hint, superseded by ToolCallEnd; must
         // not be journaled or replayed.
         AgentEventKind::ToolCallProgress { .. } => Durability::Ephemeral,
@@ -2361,6 +2439,7 @@ mod tests {
     #[test]
     fn worktree_command_completed_round_trips() {
         let kind = AgentEventKind::WorktreeCommandCompleted {
+            slash_command: None,
             id: "c1".into(),
             command: "remove".into(),
             code: Some("unpreserved_content".into()),
@@ -2392,6 +2471,7 @@ mod tests {
 
         // Success carries neither a code nor the archived flag.
         let ok = AgentEventKind::WorktreeCommandCompleted {
+            slash_command: None,
             id: "c2".into(),
             command: "publish".into(),
             code: None,
@@ -2416,6 +2496,7 @@ mod tests {
             AgentEventKind::WorktreeArchived { removal: None, .. }
         ));
         let refused = AgentEventKind::WorktreeArchived {
+            slash_command: None,
             workspace_id: "w".into(),
             by_session_id: None,
             removal: Some(ArchiveRemoval::Refused {
@@ -2447,6 +2528,7 @@ mod tests {
             AgentEventKind::WorktreeArchived { merged: None, .. }
         ));
         let merged = AgentEventKind::WorktreeArchived {
+            slash_command: None,
             workspace_id: "w".into(),
             by_session_id: Some("s".into()),
             removal: None,
@@ -2596,6 +2678,7 @@ mod tests {
     #[test]
     fn agent_event_kind_prompt_received_construction() {
         let kind = AgentEventKind::PromptReceived {
+            slash_command: None,
             content: "test prompt".to_string(),
             message_id: Some("msg-1".to_string()),
         };

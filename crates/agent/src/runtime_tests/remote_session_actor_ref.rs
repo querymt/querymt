@@ -1743,6 +1743,7 @@ mod session_actor_ref_remote_tests {
             remote_session_ref_with_host("e13").await;
         let mut user = crate::slash_commands::SlashCommandRegistry::new();
         user.register(crate::slash_commands::SlashCommand {
+            arguments: None,
             name: "deploy".into(),
             source: crate::slash_commands::SlashCommandSource::Global("/tmp".into()),
             path: "/tmp/deploy.md".into(),

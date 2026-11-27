@@ -24,6 +24,7 @@ async fn session_with_runs(f: &RealStorageHandleFixture, runs: usize) -> String 
         sink.emit_durable(
             &id,
             AgentEventKind::PromptReceived {
+                slash_command: None,
                 content: format!("prompt {n}"),
                 message_id: None,
             },

@@ -830,7 +830,11 @@ mod tests {
         assert!(!floor.drops(&delta("s", 11)));
         let progress = ephemeral(
             9,
-            AgentEventKind::WorktreeCommandOutput { text: "out".into() },
+            AgentEventKind::WorktreeCommandOutput {
+                code: None,
+                slash_command: None,
+                text: "out".into(),
+            },
         );
         assert!(
             !floor.drops(&progress),

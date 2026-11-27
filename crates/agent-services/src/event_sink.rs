@@ -957,6 +957,7 @@ mod tests {
             sink.emit_ephemeral(
                 "s1",
                 AgentEventKind::UserPromptBlock {
+                    slash_command: None,
                     message_id: "m1".into(),
                     client_prompt_id: Some("client-1".into()),
                     block,
@@ -966,6 +967,7 @@ mod tests {
         sink.emit_durable(
             "s1",
             AgentEventKind::PromptReceived {
+                slash_command: None,
                 content: "before\n\n[Image: image/png]".into(),
                 message_id: Some("m1".into()),
             },

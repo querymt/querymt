@@ -1146,6 +1146,22 @@ where
         .collect()
 }
 
+/// One block of a user message as a `user_message_chunk`, stamped with the
+/// record of the slash command the message came from, when it did.
+fn user_prompt_update(
+    message_id: &str,
+    client_prompt_id: Option<&str>,
+    block: ContentBlock,
+    slash_command: Option<&querymt_agent_core::events::SlashCommandRecord>,
+) -> SessionUpdate {
+    let mut update =
+        SessionUpdate::UserMessageChunk(user_prompt_chunk(message_id, client_prompt_id, block));
+    if let Some(record) = slash_command {
+        querymt_agent_core::replay::stamp_slash_command(&mut update, record, None);
+    }
+    update
+}
+
 pub fn replay_agent_events_to_session_notifications<I>(
     session_id: &str,
     events: I,
@@ -1404,13 +1420,14 @@ where
         let structured_updates = match &event.kind {
             AgentEventKind::PromptReceived {
                 message_id: Some(message_id),
+                slash_command,
                 ..
             } => user_prompts.get(message_id).map(|blocks| {
                 blocks
                     .iter()
                     .cloned()
                     .map(|block| {
-                        SessionUpdate::UserMessageChunk(user_prompt_chunk(message_id, None, block))
+                        user_prompt_update(message_id, None, block, slash_command.as_ref())
                     })
                     .collect::<Vec<_>>()
             }),
@@ -1484,6 +1501,9 @@ where
                     terminal.tokens_before,
                     terminal.tokens_after,
                 );
+                if let Some(record) = &terminal.slash_command {
+                    querymt_agent_core::replay::stamp_slash_command(&mut update, record, None);
+                }
                 if let Some(run_id) = &current_run {
                     querymt_agent_core::replay::stamp_run_id(&mut update, run_id);
                 }
@@ -1516,6 +1536,8 @@ struct ReplayCompactionTerminal {
     /// `_meta.querymt.compaction` counts, as the live updates carry them.
     tokens_before: Option<u64>,
     tokens_after: Option<u64>,
+    /// The `/compact` invocation that started it, when one did.
+    slash_command: Option<querymt_agent_core::events::SlashCommandRecord>,
 }
 
 /// Folds durable events into the current session-update state for replay.
@@ -1570,9 +1592,11 @@ fn materialize_replay_state(
             AgentEventKind::CompactionStart {
                 compaction_id,
                 token_estimate,
+                slash_command,
             } => {
                 let id = compaction_ids.start(compaction_id.as_deref(), envelope.seq());
                 compaction_ids.start_tokens(&id, token_estimate);
+                compaction_ids.remember_record(&id, slash_command.as_ref());
             }
             AgentEventKind::CompactionEnd {
                 compaction_id,
@@ -1582,6 +1606,7 @@ fn materialize_replay_state(
             } => {
                 let id = compaction_ids.end(compaction_id.as_deref(), envelope.seq());
                 let tokens_before = compaction_ids.take_tokens_before(&id);
+                let slash_command = compaction_ids.take_record(&id);
                 state
                     .compactions
                     .retain(|c: &ReplayCompactionTerminal| c.id != id);
@@ -1593,6 +1618,7 @@ fn materialize_replay_state(
                     error: None,
                     tokens_before,
                     tokens_after: context_tokens,
+                    slash_command,
                 });
                 if let Some(tokens) = context_tokens {
                     state.usage_used = Some(tokens);
@@ -1606,6 +1632,7 @@ fn materialize_replay_state(
                 compaction_ids.failed();
                 let id = CompactionId::from(compaction_id);
                 let tokens_before = compaction_ids.take_tokens_before(&id);
+                let slash_command = compaction_ids.take_record(&id);
                 state.compactions.retain(|c| c.id != id);
                 state.compactions.push(ReplayCompactionTerminal {
                     id,
@@ -1619,6 +1646,7 @@ fn materialize_replay_state(
                     error: (!cancelled).then_some(reason),
                     tokens_before,
                     tokens_after: None,
+                    slash_command,
                 });
             }
             AgentEventKind::CompactionSummaryChunk { .. }
@@ -3022,14 +3050,16 @@ impl AcpLiveEventTranslator {
                 message_id,
                 client_prompt_id,
                 block,
+                slash_command,
             } => {
                 self.structured_user_messages
                     .insert((event.session_id().to_owned(), message_id.clone()));
-                vec![SessionUpdate::UserMessageChunk(user_prompt_chunk(
+                vec![user_prompt_update(
                     message_id,
                     client_prompt_id.as_deref(),
                     block.clone(),
-                ))]
+                    slash_command.as_ref(),
+                )]
             }
             AgentEventKind::PromptReceived {
                 message_id: Some(message_id),
@@ -3259,6 +3289,7 @@ impl AcpLiveEventTranslator {
             AgentEventKind::CompactionStart {
                 compaction_id,
                 token_estimate,
+                slash_command,
             } => {
                 if !self.capabilities.compaction {
                     return Vec::new();
@@ -3281,6 +3312,9 @@ impl AcpLiveEventTranslator {
                     Some(before),
                     None,
                 );
+                if let Some(record) = slash_command {
+                    querymt_agent_core::replay::stamp_slash_command(&mut update, record, None);
+                }
                 vec![update]
             }
             AgentEventKind::CompactionSummaryChunk {
@@ -5061,6 +5095,7 @@ mod tests {
             origin: EventOrigin::Local,
             source_node: None,
             kind: AgentEventKind::PromptReceived {
+                slash_command: None,
                 content: "hello".to_string(),
                 message_id: Some("u-1".to_string()),
             },
@@ -5076,6 +5111,88 @@ mod tests {
             Some("u-1")
         );
         assert!(chunk.meta.is_none());
+    }
+
+    #[test]
+    fn replayed_prompt_command_keeps_its_record() {
+        let record = querymt_agent_core::events::SlashCommandRecord {
+            name: "explain".into(),
+            arguments: "closures".into(),
+            source: querymt_agent_core::events::SlashCommandSource::Project,
+            effect: querymt_agent_core::events::SlashCommandEffect::Prompt,
+            client_prompt_id: Some("c1".into()),
+        };
+        let event = |slash_command| AgentEvent {
+            seq: 1,
+            session_seq: 1,
+            timestamp: 0,
+            session_id: "s-1".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::PromptReceived {
+                slash_command,
+                content: "The user invoked the slash command `/explain`.".to_string(),
+                message_id: Some("u-1".to_string()),
+            },
+        };
+        let prompts = HashMap::from([(
+            "u-1".to_string(),
+            vec![
+                ContentBlock::Text(TextContent::new("expansion")),
+                ContentBlock::Image(crate::acp::protocol::ImageContent::new("AQID", "image/png")),
+            ],
+        )]);
+
+        // Structured replay: every chunk of the message carries the record.
+        let wire = |notifications: Vec<crate::acp::protocol::SessionNotification>| {
+            notifications
+                .into_iter()
+                .map(|n| serde_json::to_value(n.update).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let chunks = wire(replay_agent_events_with_user_prompts(
+            "s-1",
+            [event(Some(record.clone()))],
+            &prompts,
+        ));
+        assert_eq!(chunks.len(), 2, "{chunks:?}");
+        for chunk in &chunks {
+            assert_eq!(
+                chunk["_meta"]["querymt"]["slashCommand"],
+                serde_json::json!({
+                    "name": "explain",
+                    "arguments": "closures",
+                    "source": "project",
+                    "effect": "prompt",
+                    "clientPromptId": "c1",
+                })
+            );
+        }
+
+        // Text-only replay of the same event keeps it too.
+        let text_only = wire(replay_agent_events_with_user_prompts(
+            "s-1",
+            [event(Some(record))],
+            &HashMap::new(),
+        ));
+        assert_eq!(text_only.len(), 1, "{text_only:?}");
+        assert_eq!(
+            text_only[0]["_meta"]["querymt"]["slashCommand"]["name"],
+            "explain"
+        );
+
+        // An ordinary prompt carries none.
+        let plain = wire(replay_agent_events_with_user_prompts(
+            "s-1",
+            [event(None)],
+            &prompts,
+        ));
+        assert!(
+            plain
+                .iter()
+                .all(|chunk| chunk["_meta"]["querymt"].get("slashCommand").is_none()),
+            "{plain:?}"
+        );
     }
 
     #[test]
@@ -5099,6 +5216,7 @@ mod tests {
                             origin: EventOrigin::Local,
                             source_node: None,
                             kind: AgentEventKind::UserPromptBlock {
+                                slash_command: None,
                                 message_id: "u-1".to_string(),
                                 client_prompt_id: Some("client-1".to_string()),
                                 block,
@@ -5146,6 +5264,7 @@ mod tests {
             origin: EventOrigin::Local,
             source_node: None,
             kind: AgentEventKind::PromptReceived {
+                slash_command: None,
                 content: "before\n\nafter".to_string(),
                 message_id: Some("u-1".to_string()),
             },
@@ -5517,6 +5636,7 @@ mod tests {
                     origin: EventOrigin::Local,
                     source_node: None,
                     kind: AgentEventKind::PromptReceived {
+                        slash_command: None,
                         content: "hello".to_string(),
                         message_id: Some("u-1".to_string()),
                     },
@@ -5571,6 +5691,7 @@ mod tests {
             origin: EventOrigin::Local,
             source_node: None,
             kind: AgentEventKind::PromptReceived {
+                slash_command: None,
                 content: "compact summary".to_string(),
                 message_id: Some("u-1".to_string()),
             },
@@ -6681,6 +6802,7 @@ mod tests {
 
     fn docs_slash_command() -> crate::slash_commands::SlashCommand {
         crate::slash_commands::SlashCommand {
+            arguments: None,
             name: "docs".to_string(),
             source: crate::slash_commands::SlashCommandSource::Global(std::path::PathBuf::from(
                 "/tmp",
@@ -6807,6 +6929,7 @@ mod tests {
                 }],
             },
             AgentEventKind::CompactionStart {
+                slash_command: None,
                 token_estimate: 10,
                 compaction_id: Some("compaction-1".to_string()),
             },
@@ -6887,6 +7010,7 @@ mod tests {
                 .to_string(),
             },
             AgentEventKind::CompactionStart {
+                slash_command: None,
                 token_estimate: 10,
                 compaction_id: Some("compaction-1".to_string()),
             },
@@ -9059,6 +9183,7 @@ mod session_update_tests {
         let compaction = envelope(
             3,
             AgentEventKind::CompactionStart {
+                slash_command: None,
                 token_estimate: 1,
                 compaction_id: Some("c".to_string()),
             },
@@ -9382,6 +9507,7 @@ mod session_update_tests {
         translator.translate_updates(&envelope(
             1,
             AgentEventKind::CompactionStart {
+                slash_command: None,
                 token_estimate: 10,
                 compaction_id: Some("c-1".to_string()),
             },
@@ -9587,6 +9713,7 @@ mod session_update_tests {
                 .translate_updates(&envelope(
                     9,
                     AgentEventKind::CompactionStart {
+                        slash_command: None,
                         token_estimate: 10,
                         compaction_id: Some("c-1".to_string()),
                     },
@@ -11015,6 +11142,7 @@ mod session_update_tests {
                 .translate_updates(&envelope(
                     1,
                     AgentEventKind::CompactionStart {
+                        slash_command: None,
                         token_estimate: 1,
                         compaction_id: Some("c".to_string()),
                     },
@@ -11038,6 +11166,7 @@ mod session_update_tests {
         let started = capable.translate_updates(&envelope(
             1,
             AgentEventKind::CompactionStart {
+                slash_command: None,
                 token_estimate: 1,
                 compaction_id: Some("c".to_string()),
             },
@@ -11062,6 +11191,77 @@ mod session_update_tests {
         assert_eq!(update.status, CompactionStatus::Completed);
         // The terminal update carries the final summary as one block.
         assert!(matches!(&update.summary, MaybeUndefined::Value(blocks) if blocks.len() == 1));
+    }
+
+    #[test]
+    fn manual_compaction_record_is_stamped_live_and_on_replay() {
+        let record = querymt_agent_core::events::SlashCommandRecord {
+            name: "compact".into(),
+            arguments: "keep the API decisions".into(),
+            source: querymt_agent_core::events::SlashCommandSource::Builtin,
+            effect: querymt_agent_core::events::SlashCommandEffect::Action,
+            client_prompt_id: Some("c2".into()),
+        };
+        let start = |slash_command| AgentEventKind::CompactionStart {
+            slash_command,
+            token_estimate: 1,
+            compaction_id: Some("c".to_string()),
+        };
+        let end = AgentEventKind::CompactionEnd {
+            summary: "final".to_string(),
+            summary_len: 5,
+            compaction_id: Some("c".to_string()),
+            context_tokens: None,
+        };
+        let record_of = |update: &SessionUpdate| {
+            serde_json::to_value(update).unwrap()["_meta"]["querymt"]["slashCommand"].clone()
+        };
+
+        // Live: the first (in progress) update carries it.
+        let mut live = AcpLiveEventTranslator::new();
+        live.set_capabilities(plan_ops());
+        let started = live.translate_updates(&envelope(1, start(Some(record.clone()))));
+        assert_eq!(
+            record_of(&started[0])["arguments"],
+            "keep the API decisions"
+        );
+        assert_eq!(record_of(&started[0])["clientPromptId"], "c2");
+
+        // Replay: the one terminal update stands for the whole compaction.
+        let updates = replay_updates(
+            vec![
+                agent_event(1, start(Some(record))),
+                agent_event(2, end.clone()),
+            ],
+            plan_ops(),
+        );
+        let compactions: Vec<_> = updates
+            .iter()
+            .filter(|update| matches!(update, SessionUpdate::CompactionUpdate(_)))
+            .collect();
+        assert_eq!(compactions.len(), 1, "{updates:?}");
+        assert_eq!(record_of(compactions[0])["name"], "compact");
+        assert_eq!(
+            record_of(compactions[0])["arguments"],
+            "keep the API decisions"
+        );
+
+        // An automatic compaction carries none, live or replayed.
+        let mut auto = AcpLiveEventTranslator::new();
+        auto.set_capabilities(plan_ops());
+        let started = auto.translate_updates(&envelope(1, start(None)));
+        assert!(record_of(&started[0]).is_null());
+        let updates = replay_updates(
+            vec![agent_event(1, start(None)), agent_event(2, end)],
+            plan_ops(),
+        );
+        assert!(
+            updates
+                .iter()
+                .filter(|update| matches!(update, SessionUpdate::CompactionUpdate(_)))
+                .all(|update| record_of(update).is_null()),
+            "{updates:?}"
+        );
     }
 
     #[test]
@@ -11227,6 +11427,7 @@ mod session_update_tests {
             agent_event(
                 8,
                 AgentEventKind::CompactionStart {
+                    slash_command: None,
                     token_estimate: 1,
                     compaction_id: Some("c-1".to_string()),
                 },
@@ -11456,6 +11657,7 @@ mod session_update_tests {
             compaction(
                 1,
                 AgentEventKind::CompactionStart {
+                    slash_command: None,
                     token_estimate: 10,
                     compaction_id: None,
                 },
@@ -11472,6 +11674,7 @@ mod session_update_tests {
             compaction(
                 3,
                 AgentEventKind::CompactionStart {
+                    slash_command: None,
                     token_estimate: 20,
                     compaction_id: None,
                 },
@@ -11511,6 +11714,7 @@ mod session_update_tests {
             agent_event(
                 1,
                 AgentEventKind::CompactionStart {
+                    slash_command: None,
                     token_estimate: 10,
                     compaction_id: None,
                 },
@@ -11545,6 +11749,7 @@ mod session_update_tests {
             agent_event(
                 seq,
                 AgentEventKind::PromptReceived {
+                    slash_command: None,
                     content: id.to_string(),
                     message_id: Some(id.to_string()),
                 },
@@ -11555,6 +11760,7 @@ mod session_update_tests {
             agent_event(
                 2,
                 AgentEventKind::CompactionStart {
+                    slash_command: None,
                     token_estimate: 10,
                     compaction_id: Some("c1".to_string()),
                 },
@@ -11610,6 +11816,7 @@ mod session_update_tests {
             agent_event(
                 2,
                 AgentEventKind::CompactionStart {
+                    slash_command: None,
                     token_estimate: 90_000,
                     compaction_id: Some("c1".to_string()),
                 },
@@ -11659,6 +11866,7 @@ mod session_update_tests {
             agent_event(
                 1,
                 AgentEventKind::CompactionStart {
+                    slash_command: None,
                     token_estimate: 90_000,
                     compaction_id: Some("c1".to_string()),
                 },
@@ -11702,6 +11910,7 @@ mod session_update_tests {
         let events = vec![agent_event(
             1,
             AgentEventKind::CompactionStart {
+                slash_command: None,
                 token_estimate: 1,
                 compaction_id: Some("in-flight".to_string()),
             },
@@ -11856,6 +12065,7 @@ mod session_update_tests {
                 envelope(
                     2,
                     AgentEventKind::PromptReceived {
+                        slash_command: None,
                         content: "hi".to_string(),
                         message_id: Some("m1".to_string()),
                     },
@@ -11997,6 +12207,7 @@ mod session_update_tests {
             envelope(
                 2,
                 AgentEventKind::PromptReceived {
+                    slash_command: None,
                     content: "go".to_string(),
                     message_id: Some("u1".to_string()),
                 },
@@ -12055,6 +12266,7 @@ mod session_update_tests {
         let after = envelope(
             7,
             AgentEventKind::PromptReceived {
+                slash_command: None,
                 content: "later".to_string(),
                 message_id: Some("u2".to_string()),
             },
@@ -12099,6 +12311,7 @@ mod session_update_tests {
             agent_event(
                 2,
                 AgentEventKind::PromptReceived {
+                    slash_command: None,
                     content: "go".to_string(),
                     message_id: Some("u1".to_string()),
                 },
@@ -12139,6 +12352,7 @@ mod session_update_tests {
             agent_event(
                 7,
                 AgentEventKind::PromptReceived {
+                    slash_command: None,
                     content: "again".to_string(),
                     message_id: Some("u2".to_string()),
                 },
@@ -12176,6 +12390,7 @@ mod session_update_tests {
         let steering = envelope(
             2,
             AgentEventKind::UserPromptBlock {
+                slash_command: None,
                 message_id: "steer-1".to_string(),
                 client_prompt_id: None,
                 block: ContentBlock::Text(TextContent::new("also do x")),

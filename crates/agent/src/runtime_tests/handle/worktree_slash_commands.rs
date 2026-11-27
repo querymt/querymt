@@ -31,6 +31,7 @@ fn workspace_slash_config() -> crate::config::SlashCommandsConfig {
 
 fn test_command(name: &str, template: &str) -> crate::slash_commands::SlashCommand {
     crate::slash_commands::SlashCommand {
+        arguments: None,
         name: name.to_string(),
         source: crate::slash_commands::SlashCommandSource::Global(std::path::PathBuf::from(
             "/agent-level",
@@ -188,6 +189,42 @@ fn advertised_names(notification: &crate::acp::protocol::SessionNotification) ->
         .iter()
         .map(|command| command["name"].as_str().expect("command name").to_string())
         .collect()
+}
+
+/// The catalog of a local session on an agent with the workspace service
+/// describes `/worktree` as a builtin action that needs input and runs from
+/// `session/prompt` only.
+#[tokio::test]
+async fn worktree_descriptor() {
+    let f = slash_worktree_fixture(agent_level_registry()).await;
+    let session = f
+        .handle
+        .new_session(crate::acp::protocol::NewSessionRequest::new(
+            f.repo.path().to_path_buf(),
+        ))
+        .await
+        .unwrap();
+    let catalog = f
+        .handle
+        .slash_command_catalog(&session.session_id.to_string())
+        .await;
+    let value = serde_json::to_value(&catalog).expect("serialize catalog");
+    let entry = value["update"]["availableCommands"]
+        .as_array()
+        .expect("availableCommands")
+        .iter()
+        .find(|command| command["name"] == "worktree")
+        .unwrap_or_else(|| panic!("catalog has no worktree: {value}"));
+    assert_eq!(
+        entry["_meta"]["querymt"],
+        serde_json::json!({
+            "source": "builtin",
+            "effect": "action",
+            "input": "required",
+            "accepts": ["prompt"],
+        })
+    );
+    f.handle.shutdown().await;
 }
 
 /// Two checkouts with differently defined commands expand and advertise

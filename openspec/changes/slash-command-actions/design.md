@@ -34,7 +34,7 @@ See proposal.md for the motivation. Paths are relative to `crates/querymt-gpui`,
   - `input` `None`: a hint means `Required`, no hint means `None`;
   - `accepts` `None`: `accepts_queue` is true; `Some(list)`: true exactly when the list holds `queue` (an empty list accepts nothing);
   - `effect` and `source` are copied, so they stay `None`.
-- A command without an effect is neither a prompt nor an action. No caller may read `!is_prompt()` as "action" or `!is_action()` as "prompt"; `slash-command-transcript` relies on this for agents that send no descriptor.
+- A command without an effect is neither a prompt nor an action. No caller may read `!is_prompt()` as "action" or `!is_action()` as "prompt"; `add-slash-command-replies` (pending command rows) relies on this for agents that send no descriptor.
 - `recognise` follows the agent's own rule (querymt `Builtin::parse`, `try_parse_invocation`): leading whitespace skipped, then `/`, then a word that equals an advertised name exactly and is followed by whitespace or the end.
 - Alternative considered: keeping the fallback in `agent-session-core`. Rejected: the core reports what the agent sent; what an absent field means is this app's policy.
 

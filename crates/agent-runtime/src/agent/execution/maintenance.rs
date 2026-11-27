@@ -225,7 +225,7 @@ pub(crate) async fn compact_history(
     trigger: &str,
     instructions: Option<&str>,
 ) -> Result<CompactionOutcome, anyhow::Error> {
-    compact_history_with(config, env, turn, trigger, instructions, None).await
+    compact_history_with(config, env, turn, trigger, instructions, None, None).await
 }
 
 /// [`compact_history`] for a run whose session provider could not be built.
@@ -238,12 +238,17 @@ pub(crate) async fn compact_history(
 /// ends the compaction only when the summary has to come from the session's
 /// own provider. It does so before `CompactionStart`, with the provider
 /// failure itself, as when the model is resolved up front.
+///
+/// `slash_command` is the record of the `/compact` invocation that asked for
+/// this compaction; it rides on `CompactionStart`. A compaction the agent
+/// starts on its own passes `None`.
 pub(crate) async fn compact_history_with(
     config: &AgentConfig,
     env: &TurnEnv,
     turn: &mut Turn,
     trigger: &str,
     instructions: Option<&str>,
+    slash_command: Option<querymt_agent_core::events::SlashCommandRecord>,
     main_model_error: Option<TurnError>,
 ) -> Result<CompactionOutcome, anyhow::Error> {
     let session_id = &env.session_id;
@@ -331,6 +336,7 @@ pub(crate) async fn compact_history_with(
         config,
         session_id,
         AgentEventKind::CompactionStart {
+            slash_command,
             token_estimate: token_estimate_u32,
             compaction_id: Some(compaction_id.clone()),
         },
@@ -1106,6 +1112,7 @@ mod tests {
             &mut turn,
             TRIGGER_MANUAL,
             None,
+            None,
             Some(main_provider_failure()),
         )
         .await
@@ -1142,6 +1149,7 @@ mod tests {
             &mut turn,
             TRIGGER_MANUAL,
             None,
+            None,
             Some(main_provider_failure()),
         )
         .await
@@ -1156,6 +1164,68 @@ mod tests {
             "the provider failure survives: {error}"
         );
         assert!(take_compaction_events(&mut events).is_empty());
+    }
+
+    /// slash-commands / Manual compaction carries its instructions.
+    #[tokio::test]
+    async fn manual_compaction_carries_its_instructions() {
+        let (config, env, mut turn, _tempdir) =
+            fixture(custom_summary_hooks("Summary", None), None).await;
+        let record = querymt_agent_core::events::SlashCommandRecord {
+            name: "compact".into(),
+            arguments: "keep the API decisions".into(),
+            source: querymt_agent_core::events::SlashCommandSource::Builtin,
+            effect: querymt_agent_core::events::SlashCommandEffect::Action,
+            client_prompt_id: Some("c2".into()),
+        };
+        turn.history = super::super::turn::History::load(&env.session_handle)
+            .await
+            .unwrap();
+        let mut events = config.subscribe_events();
+
+        let outcome = compact_history_with(
+            &config,
+            &env,
+            &mut turn,
+            TRIGGER_MANUAL,
+            Some("keep the API decisions"),
+            Some(record.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, CompactionOutcome::Completed { .. }));
+        let compaction_events = take_compaction_events(&mut events);
+        let AgentEventKind::CompactionStart { slash_command, .. } = &compaction_events[0].kind
+        else {
+            panic!("first compaction event must be a start: {compaction_events:?}");
+        };
+        assert_eq!(slash_command.as_ref(), Some(&record));
+    }
+
+    /// slash-commands / Automatic compaction carries no record.
+    #[tokio::test]
+    async fn automatic_compaction_carries_no_record() {
+        let (config, env, mut turn, _tempdir) =
+            fixture(custom_summary_hooks("Summary", None), None).await;
+        turn.history = super::super::turn::History::load(&env.session_handle)
+            .await
+            .unwrap();
+        let mut events = config.subscribe_events();
+
+        let outcome = compact_history(&config, &env, &mut turn, TRIGGER_CONTEXT_THRESHOLD, None)
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, CompactionOutcome::Completed { .. }));
+        let compaction_events = take_compaction_events(&mut events);
+        assert!(!compaction_events.is_empty());
+        for event in &compaction_events {
+            if let AgentEventKind::CompactionStart { slash_command, .. } = &event.kind {
+                assert!(slash_command.is_none(), "{event:?}");
+            }
+        }
     }
 
     #[tokio::test]

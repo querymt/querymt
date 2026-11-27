@@ -6,7 +6,9 @@
 //! here and neither side keeps a copy: tool kinds, the todo plan, reasoning
 //! chunks, workspace announcements and compaction identity.
 
-use crate::events::{AgentEventKind, ArchiveMerge, ArchiveRemoval, ReasoningPartStored};
+use crate::events::{
+    AgentEventKind, ArchiveMerge, ArchiveRemoval, ReasoningPartStored, SlashCommandRecord,
+};
 use crate::protocol::{
     CompactionId, Content, ContentBlock, ContentChunk, CursorAnchor, CursorAnchorPosition,
     CursorCapabilities, CursorCompactionAnchor, CursorForkCapabilities, CursorMessageAnchor,
@@ -106,6 +108,29 @@ pub const COMPACTION_TOKENS_AFTER_KEY: &str = "tokensAfter";
 /// resolved). Live-only; it is never part of a replay.
 pub const SKILL_PROBLEMS_META_KEY: &str = "skillProblems";
 
+/// `_meta.querymt` key holding the [`SlashCommandRecord`] of the invocation
+/// an update belongs to: `name`, `arguments`, `source`, `effect` and, when the
+/// prompt carried one, `clientPromptId`.
+pub const SLASH_COMMAND_META_KEY: &str = "slashCommand";
+
+/// `_meta.querymt` key holding the stable error code of a slash command that
+/// was refused or failed, next to [`SLASH_COMMAND_META_KEY`].
+pub const SLASH_COMMAND_ERROR_META_KEY: &str = "slashCommandError";
+
+/// The wire form of a [`SlashCommandRecord`] (camelCase keys).
+fn slash_command_meta_value(record: &SlashCommandRecord) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "name": record.name,
+        "arguments": record.arguments,
+        "source": record.source,
+        "effect": record.effect,
+    });
+    if let (Some(id), Some(map)) = (&record.client_prompt_id, value.as_object_mut()) {
+        map.insert("clientPromptId".to_owned(), id.clone().into());
+    }
+    value
+}
+
 /// Run `edit` on the `_meta.querymt` object of `meta`, creating it (or
 /// replacing a value that is not an object) when needed.
 fn with_querymt_namespace(
@@ -177,6 +202,57 @@ pub fn stamp_compaction_tokens(
             MaybeUndefined::Value(meta)
         };
     }
+}
+
+/// Stamp the record of a slash command on the update that delivers its
+/// outcome: `_meta.querymt.slashCommand`, and `slashCommandError` when `error`
+/// is given, merged next to the existing keys. Only user message chunks, agent
+/// message chunks and compaction updates carry one; other kinds are left
+/// unchanged. Live delivery, replay and the session view all call this, so
+/// they agree.
+pub fn stamp_slash_command(
+    update: &mut SessionUpdate,
+    record: &SlashCommandRecord,
+    error: Option<&str>,
+) {
+    let stamp = |meta: &mut Meta| {
+        with_querymt_namespace(meta, |namespace| {
+            namespace.insert(
+                SLASH_COMMAND_META_KEY.to_owned(),
+                slash_command_meta_value(record),
+            );
+            if let Some(error) = error {
+                namespace.insert(SLASH_COMMAND_ERROR_META_KEY.to_owned(), error.into());
+            }
+        });
+    };
+    match update {
+        SessionUpdate::UserMessageChunk(chunk) | SessionUpdate::AgentMessageChunk(chunk) => {
+            stamp(chunk.meta.get_or_insert_with(Meta::new));
+        }
+        SessionUpdate::CompactionUpdate(compaction) => {
+            let mut meta = match std::mem::take(&mut compaction.meta) {
+                MaybeUndefined::Value(meta) => meta,
+                _ => Meta::new(),
+            };
+            stamp(&mut meta);
+            compaction.meta = MaybeUndefined::Value(meta);
+        }
+        _ => {}
+    }
+}
+
+/// One agent message update, stamped with the command record when there is one.
+fn agent_message_update(
+    chunk: ContentChunk,
+    record: Option<&SlashCommandRecord>,
+    error: Option<&str>,
+) -> Vec<SessionUpdate> {
+    let mut update = SessionUpdate::AgentMessageChunk(chunk);
+    if let Some(record) = record {
+        stamp_slash_command(&mut update, record, error);
+    }
+    vec![update]
 }
 
 /// `tokensBefore` of a compaction that starts now: the last context
@@ -459,10 +535,17 @@ pub fn replayable_updates(kind: &AgentEventKind) -> Vec<SessionUpdate> {
         AgentEventKind::PromptReceived {
             content,
             message_id,
-        } => vec![SessionUpdate::UserMessageChunk(
-            ContentChunk::new(text_block(content))
-                .message_id(message_id.clone().map(MessageId::from)),
-        )],
+            slash_command,
+        } => {
+            let mut update = SessionUpdate::UserMessageChunk(
+                ContentChunk::new(text_block(content))
+                    .message_id(message_id.clone().map(MessageId::from)),
+            );
+            if let Some(record) = slash_command {
+                stamp_slash_command(&mut update, record, None);
+            }
+            vec![update]
+        }
         AgentEventKind::AssistantMessageStored {
             content,
             message_id,
@@ -540,42 +623,62 @@ pub fn replayable_updates(kind: &AgentEventKind) -> Vec<SessionUpdate> {
                     .raw_output(raw_output),
             ))]
         }
-        AgentEventKind::WorktreeCommandOutput { text } => vec![SessionUpdate::AgentMessageChunk(
+        AgentEventKind::WorktreeCommandOutput {
+            text,
+            code,
+            slash_command,
+        } => agent_message_update(
             ContentChunk::new(text_block(text)),
-        )],
+            slash_command.as_ref(),
+            code.as_deref(),
+        ),
+        AgentEventKind::SlashCommandReply {
+            slash_command,
+            text,
+            code,
+        } => agent_message_update(
+            ContentChunk::new(text_block(text)),
+            Some(slash_command),
+            code.as_deref(),
+        ),
         AgentEventKind::WorktreeCommandCompleted {
             id,
             command,
             code,
             archived,
             text,
-        } => vec![SessionUpdate::AgentMessageChunk(worktree_command_chunk(
-            id,
-            command,
+            slash_command,
+        } => agent_message_update(
+            worktree_command_chunk(id, command, code.as_deref(), *archived, text),
+            slash_command.as_ref(),
             code.as_deref(),
-            *archived,
-            text,
-        ))],
+        ),
         AgentEventKind::WorktreeOwnershipTransferred {
             workspace_id,
             successor_session_id,
             summary_seeded,
-        } => vec![SessionUpdate::AgentMessageChunk(worktree_handoff_chunk(
-            workspace_id,
-            successor_session_id,
-            *summary_seeded,
-        ))],
+            slash_command,
+        } => agent_message_update(
+            worktree_handoff_chunk(workspace_id, successor_session_id, *summary_seeded),
+            slash_command.as_ref(),
+            None,
+        ),
         AgentEventKind::WorktreeArchived {
             workspace_id,
             by_session_id,
             removal,
             merged,
-        } => vec![SessionUpdate::AgentMessageChunk(worktree_archived_chunk(
-            workspace_id,
-            by_session_id.as_deref(),
-            removal.as_ref(),
-            merged.as_ref(),
-        ))],
+            slash_command,
+        } => agent_message_update(
+            worktree_archived_chunk(
+                workspace_id,
+                by_session_id.as_deref(),
+                removal.as_ref(),
+                merged.as_ref(),
+            ),
+            slash_command.as_ref(),
+            None,
+        ),
         _ => Vec::new(),
     }
 }
@@ -606,6 +709,9 @@ pub struct CompactionIds {
     last_measurement: Option<u64>,
     /// `tokensBefore` of the compactions that started and did not settle.
     open_tokens_before: std::collections::BTreeMap<String, u64>,
+    /// The slash command record of the compactions that started and did not
+    /// settle, so the terminal update can carry it.
+    open_records: std::collections::BTreeMap<String, SlashCommandRecord>,
 }
 
 impl CompactionIds {
@@ -635,6 +741,20 @@ impl CompactionIds {
     /// settles (end or failure).
     pub fn take_tokens_before(&mut self, id: &CompactionId) -> Option<u64> {
         self.open_tokens_before.remove(&*id.0)
+    }
+
+    /// Remember the record of the compaction `id` that starts now (none for a
+    /// compaction the agent started on its own), until it settles.
+    pub fn remember_record(&mut self, id: &CompactionId, record: Option<&SlashCommandRecord>) {
+        if let Some(record) = record {
+            self.open_records.insert(id.0.to_string(), record.clone());
+        }
+    }
+
+    /// The record remembered for `id`, forgotten once its compaction settles
+    /// (end or failure).
+    pub fn take_record(&mut self, id: &CompactionId) -> Option<SlashCommandRecord> {
+        self.open_records.remove(&*id.0)
     }
 
     fn next_legacy(&mut self, seq: i64) -> CompactionId {
@@ -1051,6 +1171,7 @@ mod tests {
 
     fn prompt(id: &str) -> AgentEventKind {
         AgentEventKind::PromptReceived {
+            slash_command: None,
             content: "hi".into(),
             message_id: Some(id.into()),
         }
@@ -1058,9 +1179,124 @@ mod tests {
 
     fn compaction_start(id: Option<&str>) -> AgentEventKind {
         AgentEventKind::CompactionStart {
+            slash_command: None,
             token_estimate: 10,
             compaction_id: id.map(str::to_owned),
         }
+    }
+
+    fn record(name: &str, arguments: &str) -> SlashCommandRecord {
+        SlashCommandRecord {
+            name: name.into(),
+            arguments: arguments.into(),
+            source: crate::events::SlashCommandSource::Builtin,
+            effect: crate::events::SlashCommandEffect::Action,
+            client_prompt_id: Some("c1".into()),
+        }
+    }
+
+    #[test]
+    fn replayed_worktree_publish_reply_keeps_its_record() {
+        let reply = AgentEventKind::WorktreeCommandCompleted {
+            id: "c1".into(),
+            command: "publish".into(),
+            code: None,
+            archived: None,
+            text: "published".into(),
+            slash_command: Some(record("worktree", "publish")),
+        };
+        let value = serde_json::to_value(chunk_of(&reply)).unwrap();
+        assert_eq!(
+            value["_meta"][QUERYMT_META_NAMESPACE][SLASH_COMMAND_META_KEY],
+            serde_json::json!({
+                "name": "worktree",
+                "arguments": "publish",
+                "source": "builtin",
+                "effect": "action",
+                "clientPromptId": "c1",
+            })
+        );
+        assert!(
+            value["_meta"][QUERYMT_META_NAMESPACE]
+                .get(SLASH_COMMAND_ERROR_META_KEY)
+                .is_none()
+        );
+        // The worktree metadata stays next to the record.
+        assert_eq!(
+            value["_meta"][QUERYMT_META_NAMESPACE]["worktreeCommand"],
+            serde_json::json!({ "command": "publish" })
+        );
+
+        let refused = AgentEventKind::WorktreeCommandOutput {
+            text: "busy".into(),
+            code: Some("owner_active".into()),
+            slash_command: Some(record("worktree", "archive")),
+        };
+        let value = serde_json::to_value(chunk_of(&refused)).unwrap();
+        assert_eq!(
+            value["_meta"][QUERYMT_META_NAMESPACE][SLASH_COMMAND_ERROR_META_KEY],
+            "owner_active"
+        );
+    }
+
+    #[test]
+    fn history_without_records_replays_unchanged() {
+        // Journal JSON written before records existed has no `slash_command`.
+        let prompt: AgentEventKind = serde_json::from_value(serde_json::json!({
+            "type": "prompt_received",
+            "data": { "content": "hi", "message_id": "m1" }
+        }))
+        .unwrap();
+        let reply: AgentEventKind = serde_json::from_value(serde_json::json!({
+            "type": "worktree_command_completed",
+            "data": { "id": "c1", "command": "publish", "text": "published" }
+        }))
+        .unwrap();
+        let archived: AgentEventKind = serde_json::from_value(serde_json::json!({
+            "type": "worktree_archived",
+            "data": { "workspace_id": "w1" }
+        }))
+        .unwrap();
+        for kind in [prompt, reply, archived] {
+            let updates = replayable_updates(&kind);
+            assert_eq!(updates.len(), 1, "{kind:?}");
+            let value = serde_json::to_value(&updates[0]).unwrap();
+            assert!(
+                value["_meta"][QUERYMT_META_NAMESPACE]
+                    .get(SLASH_COMMAND_META_KEY)
+                    .is_none(),
+                "{value}"
+            );
+        }
+        let prompt_value = serde_json::to_value(
+            &replayable_updates(&AgentEventKind::PromptReceived {
+                content: "hi".into(),
+                message_id: Some("m1".into()),
+                slash_command: None,
+            })[0],
+        )
+        .unwrap();
+        assert!(prompt_value.get("_meta").is_none(), "{prompt_value}");
+    }
+
+    #[test]
+    fn replayed_manual_compaction_keeps_its_record() {
+        let mut ids = CompactionIds::default();
+        let id = ids.start(Some("k1"), 1);
+        ids.remember_record(&id, Some(&record("compact", "keep the API decisions")));
+        let end = ids.end(Some("k1"), 2);
+        let mut update = compaction_update("k1");
+        let taken = ids.take_record(&end).expect("the record was remembered");
+        stamp_slash_command(&mut update, &taken, None);
+        assert_eq!(
+            meta_of(&update).unwrap()[QUERYMT_META_NAMESPACE][SLASH_COMMAND_META_KEY]["arguments"],
+            "keep the API decisions"
+        );
+        // Settled: nothing is kept, and an automatic compaction has no record.
+        assert!(ids.take_record(&end).is_none());
+        let auto = ids.start(Some("k2"), 3);
+        ids.remember_record(&auto, None);
+        assert!(ids.take_record(&auto).is_none());
     }
 
     fn compaction_end(id: Option<&str>) -> AgentEventKind {
@@ -1272,6 +1508,7 @@ mod tests {
     #[test]
     fn worktree_events_project_to_agent_messages() {
         let archived = AgentEventKind::WorktreeArchived {
+            slash_command: None,
             workspace_id: "w1".into(),
             by_session_id: None,
             removal: None,
@@ -1300,6 +1537,7 @@ mod tests {
     #[test]
     fn mutating_command_reply_is_replayed() {
         let refused = AgentEventKind::WorktreeCommandCompleted {
+            slash_command: None,
             id: "c1".into(),
             command: "remove".into(),
             code: Some("unpreserved_content".into()),
@@ -1321,6 +1559,7 @@ mod tests {
 
         // A success has neither `code` nor `archived`.
         let ok = AgentEventKind::WorktreeCommandCompleted {
+            slash_command: None,
             id: "c2".into(),
             command: "publish".into(),
             code: None,
@@ -1338,6 +1577,7 @@ mod tests {
     #[test]
     fn archived_update_replayed_with_the_removal_outcome() {
         let archived = |removal| AgentEventKind::WorktreeArchived {
+            slash_command: None,
             workspace_id: "w1".into(),
             by_session_id: None,
             removal,
@@ -1376,6 +1616,7 @@ mod tests {
     #[test]
     fn archived_update_replayed_with_the_merge_outcome() {
         let archived = |removal, merged| AgentEventKind::WorktreeArchived {
+            slash_command: None,
             workspace_id: "w1".into(),
             by_session_id: None,
             removal,

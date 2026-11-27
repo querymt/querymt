@@ -349,6 +349,10 @@ mod pure_tests {
             name: name.into(),
             description: String::new(),
             input_hint: hint.map(Into::into),
+            source: None,
+            effect: None,
+            input: None,
+            accepts: None,
         }
     }
 

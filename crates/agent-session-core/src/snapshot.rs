@@ -218,15 +218,26 @@ impl SessionCore {
             let updates = match &event.kind {
                 AgentEventKind::PromptReceived {
                     message_id: Some(id),
+                    slash_command,
                     ..
                 } if by_message.contains_key(id.as_str()) => by_message[id.as_str()]
                     .blocks
                     .iter()
                     .map(|block| {
-                        SessionUpdate::UserMessageChunk(
+                        let mut update = SessionUpdate::UserMessageChunk(
                             ContentChunk::new(block.clone())
                                 .message_id(MessageId::from(id.clone())),
-                        )
+                        );
+                        // The same record the agent stamps on a replayed
+                        // prompt command, on every chunk of the message.
+                        if let Some(record) = slash_command {
+                            querymt_agent_protocol_types::replay::stamp_slash_command(
+                                &mut update,
+                                record,
+                                None,
+                            );
+                        }
+                        update
                     })
                     .collect(),
                 _ => event_updates(event, &mut compaction_ids),

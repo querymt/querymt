@@ -121,7 +121,8 @@
                   }
                 ],
                 "error": null,
-                "meta": null
+                "meta": null,
+                "slashCommand": null
               }
             }
           }

@@ -6832,6 +6832,7 @@ async fn fork_copies_events_that_point_at_the_forks_own_messages() {
         new_durable(
             &sid,
             AgentEventKind::PromptReceived {
+                slash_command: None,
                 content: text.to_string(),
                 message_id: Some(id.to_string()),
             },

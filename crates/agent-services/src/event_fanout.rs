@@ -497,7 +497,11 @@ mod tests {
         fanout.publish(content(1, "m1", "a"));
         fanout.publish(ephemeral(
             7,
-            AgentEventKind::WorktreeCommandOutput { text: "out".into() },
+            AgentEventKind::WorktreeCommandOutput {
+                code: None,
+                slash_command: None,
+                text: "out".into(),
+            },
         ));
         assert_eq!(fanout.inflight_text("s1").unwrap().through_seq, 1);
 

@@ -836,6 +836,7 @@ mod tests {
             append(
                 journal,
                 AgentEventKind::PromptReceived {
+                    slash_command: None,
                     content: format!("p{n}"),
                     message_id: None,
                 },

@@ -9,6 +9,9 @@ use crate::acp::protocol::{
     AvailableCommand, AvailableCommandInput, ContentBlock, UnstructuredCommandInput,
 };
 use crate::agent::turn_control::InputDelivery;
+use crate::slash_commands::acp::{AcceptedSubmission, descriptor_meta};
+use crate::slash_commands::types::ArgumentsNeed;
+use querymt_agent_core::events::{SlashCommandEffect, SlashCommandSource};
 
 /// A natively handled slash command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,8 +103,39 @@ impl Builtin {
         }
     }
 
-    /// ACP catalog entry advertising this command.
+    /// How much input the command takes: `/compact` runs without any,
+    /// `/worktree` needs a subcommand.
+    pub const fn input(self) -> ArgumentsNeed {
+        match self {
+            Builtin::Compact => ArgumentsNeed::Optional,
+            Builtin::Worktree => ArgumentsNeed::Required,
+        }
+    }
+
+    /// The submissions this command is advertised as running from, derived
+    /// from [`Self::accepts`] so the catalog cannot drift from what runs.
+    fn advertised_submissions(self) -> Vec<AcceptedSubmission> {
+        let mut accepted = Vec::new();
+        if self.accepts(Submission::Prompt) {
+            accepted.push(AcceptedSubmission::Prompt);
+        }
+        if self.accepts(Submission::Turn) {
+            accepted.push(AcceptedSubmission::Queue);
+        }
+        accepted
+    }
+
+    /// ACP catalog entry advertising this command, with its descriptor.
     pub fn entry(self) -> AvailableCommand {
+        self.entry_without_descriptor().meta(descriptor_meta(
+            SlashCommandSource::Builtin,
+            SlashCommandEffect::Action,
+            self.input(),
+            &self.advertised_submissions(),
+        ))
+    }
+
+    fn entry_without_descriptor(self) -> AvailableCommand {
         match self {
             Builtin::Compact => AvailableCommand::new(
                 self.command_name(),

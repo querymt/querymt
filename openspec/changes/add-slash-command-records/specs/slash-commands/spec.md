@@ -56,22 +56,24 @@ The agent SHALL NOT refuse a user-defined command because its arguments are miss
 - **THEN** the agent expands it with empty arguments and starts the turn
 
 ### Requirement: Invocation record
-When a submitted prompt's first text block names a command of the session's catalog, exactly one session update of that invocation SHALL carry `_meta.querymt.slashCommand` with:
+An invocation record SHALL be `_meta.querymt.slashCommand` with:
 - `name` without the slash;
 - `arguments`: the trimmed text after the name, an empty string when there is none;
 - `source` and `effect` as advertised;
 - `clientPromptId` when the prompt carried one.
 
+A record SHALL appear only on the updates of the user message or compaction that delivers the command's outcome.
+
 #### Scenario: Record carries the client prompt id
-- **WHEN** a client submits `/worktree list` with `_meta.querymt.client_prompt_id` `c1`
-- **THEN** the update that carries the record has `slashCommand.clientPromptId` `c1`
+- **WHEN** a client submits `/explain closures` with `_meta.querymt.client_prompt_id` `c1` and the project defines `explain`
+- **THEN** the user message that carries the record has `slashCommand.clientPromptId` `c1`
 
 #### Scenario: Queued command record has no client prompt id
 - **WHEN** a client queues `/explain closures` as input and its turn later starts
 - **THEN** the turn's user message carries a `slashCommand` without `clientPromptId`
 
 ### Requirement: Only catalog commands are recorded
-Command names SHALL match a catalog entry exactly, including case. A prompt that names no catalog command SHALL be an ordinary prompt and SHALL produce no record. A command whose prompt request fails with an error SHALL produce no record.
+Command names SHALL match a catalog entry exactly, including case. A prompt that names no catalog command SHALL be an ordinary prompt and SHALL produce no record.
 
 #### Scenario: Unknown slash text carries no record
 - **WHEN** a client submits the prompt `/tmp/build.log is empty` to a session with no command named `tmp`
@@ -80,10 +82,6 @@ Command names SHALL match a catalog entry exactly, including case. A prompt that
 #### Scenario: Command name case must match
 - **WHEN** a client submits the prompt `/COMPACT`
 - **THEN** no compaction starts and the prompt is an ordinary user message with no `slashCommand`
-
-#### Scenario: Failed command prompt carries no record
-- **WHEN** a client submits `/compact` together with an image block and the request fails with an invalid-prompt error
-- **THEN** no session update carries a `slashCommand` for that prompt
 
 ### Requirement: Record on a prompt command's user message
 For a command whose effect is `prompt`, every `user_message_chunk` of the message the command produced SHALL carry the record. The message content SHALL remain the expanded prompt that the model receives.
@@ -108,42 +106,8 @@ A compaction started by `/compact` SHALL carry the record on its first `compacti
 - **WHEN** the agent compacts because the context threshold was reached
 - **THEN** none of that compaction's updates carries a `slashCommand`
 
-### Requirement: Record on a native command reply
-A native command that answers with an agent message update SHALL carry the record on that update. When the command was refused or failed, the update SHALL also carry `_meta.querymt.slashCommandError` with the stable error code. When the outcome reaches the issuing session as a durable ownership-transferred or archived announcement, that announcement SHALL carry the record and no separate reply SHALL be sent.
-
-#### Scenario: Worktree list reply carries the record
-- **WHEN** a client submits `/worktree list` and it succeeds
-- **THEN** the agent message update with the output carries `slashCommand` with `name` `worktree`, `arguments` `list` and `effect` `action`, and no `slashCommandError`
-
-#### Scenario: Refused worktree command carries its error code
-- **WHEN** a client submits `/worktree archive` and it is refused because the owner is busy
-- **THEN** the agent message update with the refusal carries the record and `slashCommandError` `owner_active`
-
-#### Scenario: Handoff announcement carries the record
-- **WHEN** a client submits `/worktree handoff review` and the handoff succeeds
-- **THEN** the ownership-transferred announcement on that session's stream carries `slashCommand` with `arguments` `handoff review`
-- **AND** no other agent message update is sent for the command
-
-#### Scenario: Archive issued from another session
-- **WHEN** session A submits `/worktree archive <id>` for a workspace owned by session B
-- **THEN** A's reply carries the record
-- **AND** the archived announcement on B's stream carries no `slashCommand`
-
-### Requirement: Command reply when nothing else reports the outcome
-An `action` command whose prompt completes without a compaction, an announcement or another reply SHALL be answered by one transient agent message update that carries the record and the outcome text. For a command submitted with `session/prompt`, the update SHALL be delivered before the prompt response. The agent SHALL NOT report these outcomes as a `notice`.
-
-#### Scenario: Compact on an empty conversation replies
-- **WHEN** a client submits `/compact` to a session with no messages
-- **THEN** one agent message update says there is nothing to compact and carries the record, before the prompt response
-- **AND** no `notice` and no `compaction_update` is sent for it
-
-#### Scenario: Compact blocked by a hook replies
-- **WHEN** a pre-compaction hook blocks a `/compact`
-- **THEN** one agent message update carries the block reason, the record and `slashCommandError` `blocked_by_hook`
-- **AND** no `compaction_update` is sent for it
-
 ### Requirement: Records in replayed and loaded history
-An update that is replayed or served in a load snapshot SHALL carry the same record it carried live. A terminal `compaction_update` that stands for a whole compaction on replay SHALL carry the compaction's record. Transient replies SHALL NOT be replayed. History written before records existed SHALL replay without records.
+An update that is replayed or served in a load snapshot SHALL carry the same record it carried live. A terminal `compaction_update` that stands for a whole compaction on replay SHALL carry the compaction's record. History written before records existed SHALL replay without records.
 
 #### Scenario: Replayed prompt command keeps its record
 - **WHEN** a client that receives history as session updates loads a session in which `/explain closures` was run
@@ -156,14 +120,6 @@ An update that is replayed or served in a load snapshot SHALL carry the same rec
 #### Scenario: Replayed manual compaction keeps its record
 - **WHEN** a session in which `/compact keep the API decisions` completed is replayed
 - **THEN** the one terminal `compaction_update` for it carries `slashCommand` with `arguments` `keep the API decisions`
-
-#### Scenario: Replayed worktree publish reply keeps its record
-- **WHEN** a session in which `/worktree publish` was run is replayed
-- **THEN** the replayed reply carries `slashCommand` with `arguments` `publish`
-
-#### Scenario: Transient reply is not replayed
-- **WHEN** a session in which `/worktree list` was run is replayed
-- **THEN** no update for that command is replayed
 
 #### Scenario: History without records replays unchanged
 - **WHEN** a session whose journal was written before this change is replayed

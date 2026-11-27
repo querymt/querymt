@@ -318,6 +318,7 @@ mod tests {
                 1,
                 100,
                 AgentEventKind::PromptReceived {
+                    slash_command: None,
                     content: "hello".to_string(),
                     message_id: None,
                 },
@@ -410,6 +411,7 @@ mod tests {
                 1,
                 100,
                 AgentEventKind::PromptReceived {
+                    slash_command: None,
                     content: "read test.rs".to_string(),
                     message_id: None,
                 },
@@ -484,6 +486,7 @@ mod tests {
                 1,
                 100,
                 AgentEventKind::PromptReceived {
+                    slash_command: None,
                     content: "plan the work".to_string(),
                     message_id: None,
                 },
@@ -621,6 +624,7 @@ mod tests {
                 2,
                 101,
                 AgentEventKind::PromptReceived {
+                    slash_command: None,
                     content: "turn 1".to_string(),
                     message_id: None,
                 },
@@ -668,6 +672,7 @@ mod tests {
                 7,
                 201,
                 AgentEventKind::PromptReceived {
+                    slash_command: None,
                     content: "turn 2".to_string(),
                     message_id: None,
                 },

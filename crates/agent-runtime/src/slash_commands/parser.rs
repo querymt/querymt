@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::slash_commands::types::ArgumentsNeed;
 use crate::slash_commands::types::{
     CommandFrontmatter, SlashCommand, SlashCommandDiagnostic, SlashCommandSource,
     is_valid_command_name,
@@ -83,6 +85,7 @@ pub fn parse_command_file(
         template,
         script: metadata.script,
         requires_script: metadata.requires_script,
+        arguments: metadata.arguments,
     })
 }
 
@@ -270,6 +273,88 @@ Body
             SlashCommandSource::Project(dir.path().to_path_buf())
         );
         assert_eq!(cmd.name, "test-cmd");
+    }
+
+    #[test]
+    fn arguments_key_sets_the_input_need() {
+        let dir = TempDir::new().unwrap();
+        for (value, expected) in [
+            ("none", ArgumentsNeed::None),
+            ("optional", ArgumentsNeed::Optional),
+            ("required", ArgumentsNeed::Required),
+        ] {
+            let path = write_command(
+                dir.path(),
+                "explain.md",
+                &format!(
+                    "---\ndescription: Explain a topic\nargument-hint: \"[topic]\"\narguments: {value}\n---\nExplain $ARGUMENTS\n"
+                ),
+            );
+            let cmd =
+                parse_command_file(&path, SlashCommandSource::Project(dir.path().to_path_buf()))
+                    .unwrap();
+            assert_eq!(cmd.arguments, Some(expected), "{value}");
+            assert_eq!(cmd.input_need(), expected, "{value}");
+        }
+    }
+
+    #[test]
+    fn input_need_defaults_to_none_without_a_placeholder() {
+        let dir = TempDir::new().unwrap();
+        let plain = write_command(
+            dir.path(),
+            "plain.md",
+            "---\ndescription: Plain\n---\nNo placeholder here.\n",
+        );
+        let cmd = parse_command_file(&plain, SlashCommandSource::Global(dir.path().to_path_buf()))
+            .unwrap();
+        assert_eq!(cmd.arguments, None);
+        assert_eq!(cmd.input_need(), ArgumentsNeed::None);
+
+        // A placeholder or a hint keeps today's behaviour: input is expected.
+        let placeholder = write_command(
+            dir.path(),
+            "placeholder.md",
+            "---\ndescription: P\n---\nDo $ARGUMENTS\n",
+        );
+        let cmd = parse_command_file(
+            &placeholder,
+            SlashCommandSource::Global(dir.path().to_path_buf()),
+        )
+        .unwrap();
+        assert_eq!(cmd.input_need(), ArgumentsNeed::Required);
+        let hinted = write_command(
+            dir.path(),
+            "hinted.md",
+            "---\ndescription: H\nargument-hint: \"[x]\"\n---\nBody\n",
+        );
+        let cmd = parse_command_file(
+            &hinted,
+            SlashCommandSource::Global(dir.path().to_path_buf()),
+        )
+        .unwrap();
+        assert_eq!(cmd.input_need(), ArgumentsNeed::Required);
+    }
+
+    #[test]
+    fn invalid_arguments_value_is_a_diagnostic() {
+        let dir = TempDir::new().unwrap();
+        let path = write_command(
+            dir.path(),
+            "sometimes.md",
+            "---\ndescription: Bad\narguments: sometimes\n---\nBody $ARGUMENTS\n",
+        );
+        let diagnostic =
+            parse_command_file(&path, SlashCommandSource::Global(dir.path().to_path_buf()))
+                .unwrap_err();
+        assert_eq!(diagnostic.path, path);
+        for accepted in ["none", "optional", "required"] {
+            assert!(
+                diagnostic.message.contains(accepted),
+                "the diagnostic names `{accepted}`: {}",
+                diagnostic.message
+            );
+        }
     }
 
     #[test]
