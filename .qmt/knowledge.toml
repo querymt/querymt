@@ -61,7 +61,6 @@ include = [
   "crates/querymt-gpui/src/ui/model_picker.rs",
   "crates/querymt-gpui/src/ui/keys.rs",
   "crates/querymt-gpui/src/search.rs",
-  "crates/querymt-gpui/src/theme.rs",
   # The film harness and its scene files (the "Filming demo clips" note).
   "crates/querymt-gpui/src/film/*.rs",
   "crates/querymt-gpui/film/scenes/*.toml",
