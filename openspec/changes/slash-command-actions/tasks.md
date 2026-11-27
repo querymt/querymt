@@ -4,11 +4,11 @@ Paths are relative to `crates/querymt-gpui`. Verification commands (from the wor
 - `cargo nextest run --package querymt-gpui --bins --locked`
 - `cargo clippy --package querymt-gpui --all-targets --locked -- -D warnings`
 - `cargo fmt -p querymt-gpui -- --check`
-- `RUSTC_BOOTSTRAP=1 cargo build --locked --bin querymt-gpui --target wasm32-unknown-unknown`
+- `RUSTC_BOOTSTRAP=1 cargo build --locked -p querymt-gpui --bin querymt-gpui --target wasm32-unknown-unknown`
 
 ## 1. Descriptor and recognition
 
-- [ ] 1.1 Check that `add-slash-command-records` has landed in this workspace: `SlashCommandView` has `source`, `effect`, `input` and `accepts: Option<Vec<..>>`, and that change's task 4.1 already fixed the test helper `src/ui/slash.rs` `command`. No revision to bump (path dependency). Extend the helper so tests can set a descriptor. Verify: `cargo check -p querymt-gpui --locked --all-targets` passes and the full suite passes with no behaviour change.
+- [ ] 1.1 Check that `add-slash-command-records` has landed in this workspace: `SlashCommandView` has `source`, `effect`, `input` and `accepts: Option<Vec<..>>`, and that change's task 4.1 already fixed the test helper `src/ui/slash.rs` `command`. No revision to bump (path dependency). In `crates/agent-session-core/src/view.rs`, re-export `SlashCommandSource`, `SlashCommandEffect` and `SlashCommandRecord` from `querymt_agent_protocol_types::events` (`pub use`), so the app can name them without a new dependency (design Context, Types). Extend the helper so tests can set a descriptor. Verify: `cargo check -p querymt-gpui --locked --all-targets` passes, `cargo nextest run -p querymt-agent-session-core --features test-support` passes, and the full gpui suite passes with no behaviour change.
 - [ ] 1.2 Add `src/session/commands.rs` with `CommandTraits::of` and `recognise` (design D1). Verify: unit tests `descriptor_states_an_optional_input`, `command_without_a_descriptor` (also asserts `is_prompt()` and `is_action()` are both false), `empty_accepts_is_not_a_missing_descriptor` (`accepts: Some(vec![])` gives `accepts_queue` false), `path_is_not_a_command`, `name_case_must_match` (spec: Descriptor states an optional input, Command without a descriptor, and the recognition half of Path is not a command and Name case must match).
 
 ## 2. Submission and readiness
@@ -37,8 +37,8 @@ Paths are relative to `crates/querymt-gpui`. Verification commands (from the wor
 - [ ] 4.1 Run the four verification commands. Verify: all pass; record the counts here.
 - [ ] 4.2 Against a querymt agent built with `add-slash-command-records`, by hand on macOS:
   - `compact` runs on Enter and Tab puts `/compact ` in the composer;
-  - a project command from `.qmt/commands` shows `…` and `Prompt`;
-  - `worktree…` is unavailable during a turn, in the palette and when typed;
+  - a user command shows `…` and `Prompt`. Put the file in `~/.qmt/commands` unless `add-session-project-commands` has landed: until then a session does not read its own folder's `.qmt/commands`;
+  - `worktree…` is unavailable during a turn, in the palette and when typed. `/worktree` is only advertised when managed worktrees are on (`[agent.workspace]` in the agent config); the embedded `qmtcode` config has them off;
   - `/tmp/x is broken` can be steered into a running turn;
   - an agent without the descriptor behaves as before.
   Verify: each item noted here as pass or fail.

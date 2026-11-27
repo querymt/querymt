@@ -12,7 +12,8 @@ See proposal.md for the motivation. Paths are relative to `crates/querymt-gpui`,
   - binds Esc, Enter, Up and Down only;
   - has `on_select`, `on_confirm(IndexPath)`, `footer`, and `CommandItem::child` for custom row content;
   - skips disabled items when it picks the highlighted row (`CommandState::selected_index`), so the highlight moves to the first enabled row.
-- **Agent rules** (`add-slash-command-records`): `SlashCommandView` gains `source`, `effect`, `input` (each an `Option`) and `accepts: Option<Vec<..>>`, each `None` when the agent sends no descriptor. No command is steerable. `/worktree` accepts only `session/prompt`.
+- **Agent rules** (`add-slash-command-records`): `SlashCommandView` has `source: Option<SlashCommandSource>`, `effect: Option<SlashCommandEffect>`, `input: Option<CommandInput>` and `accepts: Option<Vec<CommandSubmission>>`, each `None` when the agent sends no descriptor. No command is steerable. `/worktree` accepts only `session/prompt`.
+- **Types.** `CommandInput` and `CommandSubmission` are defined in `querymt_agent_session_core::view`. `SlashCommandSource` and `SlashCommandEffect` are defined in `querymt-agent-protocol-types`, which `querymt-gpui` does not depend on; `querymt_agent_session_core::view` re-exports them (task 1.1), and the app uses them from there.
 
 ## Goals / Non-Goals
 
@@ -28,7 +29,8 @@ See proposal.md for the motivation. Paths are relative to `crates/querymt-gpui`,
 ### D1. One resolver turns the agent's view into what the app acts on
 
 - New module `src/session/commands.rs` (no UI types, so `open.rs` can use it):
-  - `CommandTraits::of(&SlashCommandView) -> CommandTraits { input: InputNeed, accepts_queue: bool, effect: Option<Effect>, source: Option<Source> }`, with `is_prompt()` (`effect == Some(Prompt)`) and `is_action()` (`effect == Some(Action)`);
+  - `CommandTraits::of(&SlashCommandView) -> CommandTraits { input: CommandInput, accepts_queue: bool, effect: Option<SlashCommandEffect>, source: Option<SlashCommandSource> }`, with `is_prompt()` (`effect == Some(SlashCommandEffect::Prompt)`) and `is_action()` (`effect == Some(SlashCommandEffect::Action)`);
+  - the core's types are used as they are; the app defines no parallel input, effect or source enums;
   - `recognise(text, &[SlashCommandView]) -> Option<&SlashCommandView>`.
 - `CommandTraits::of` is the only place with the no-descriptor fallback, decided per field from `None`:
   - `input` `None`: a hint means `Required`, no hint means `None`;
@@ -61,7 +63,7 @@ See proposal.md for the motivation. Paths are relative to `crates/querymt-gpui`,
 
 ### D4. Unavailable palette rows stay selectable
 
-- `PaletteTarget::SlashCommand { name, input: InputNeed, blocked: Option<Blocked> }` replaces `takes_input`.
+- `PaletteTarget::SlashCommand { name, input: CommandInput, blocked: Option<Blocked> }` replaces `takes_input`.
 - `App::run_palette` returns before `palette_open = false` when the target is a blocked slash command.
 - The row is drawn dimmed (label and icon in `p.dim`, the reason in `p.muted`) but is not a kit-disabled item.
 - Why not `Disableable::disabled(true)`: the kit would move the highlight to the first enabled row. With `worktree` typed and its row disabled, Enter would run whatever is listed next. The main spec promises that the first row is the best match and the one Enter acts on.
