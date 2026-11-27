@@ -1801,24 +1801,37 @@ fn cmd_k_puts_the_keyboard_on_the_search(cx: &mut TestAppContext) {
 fn esc_closes_the_panel_over_a_read_only_session_picked_from_the_list(cx: &mut TestAppContext) {
     bind_keys(cx);
     let rig = rig(cx);
-    rig.summaries(cx, vec![summary("a", "Alpha", "idle", "3")]);
-    let (window, panel) = rig.open_panel(cx);
-    show_view(
+    // The archived session is the newest, so the list's cursor starts on it.
+    rig.summaries(
         cx,
-        &rig,
-        &panel,
-        read_only(long_view("archived", 1, "idle")),
+        vec![
+            summary("a", "Alpha", "idle", "3"),
+            summary("archived", "Archived", "idle", "9"),
+        ],
     );
+    let (window, panel) = rig.open_panel(cx);
+    // Held: the store shares an open session only while someone holds it.
+    let _archived = cx.update(|cx| {
+        rig.store.update(cx, |s, cx| {
+            s.adopt_for_test(read_only(long_view("archived", 1, "idle")), cx)
+        })
+    });
+    show_view(cx, &rig, &panel, long_view("a", 1, "idle"));
     settle(cx, window);
     let k = secondary(cx, "k");
     press(cx, window, &k);
     settle(cx, window);
     assert!(list_search_focused(cx, window, &panel));
-    // Closing the list goes back to the read-only conversation.
-    then_next_frame(cx, window, &panel, |p, window, cx| {
-        p.toggle_picker_for_test(window, cx)
-    });
+    assert_eq!(row_ids(cx, &panel), ["archived", "a"]);
+    // Enter on the row shows the read-only session; the list closes.
+    press(cx, window, "enter");
     settle(cx, window);
+    assert_eq!(
+        pane_key(cx, &panel).as_deref(),
+        Some("archived"),
+        "the list's row was picked"
+    );
+    assert!(!panel.read_with(cx, |p, _| p.picker_open_for_test()));
     assert!(
         keys_reach_panel(cx, window, &panel),
         "the keyboard is in the panel"
@@ -1833,13 +1846,18 @@ fn esc_closes_the_panel_over_a_read_only_session_picked_from_the_list(cx: &mut T
 fn esc_closes_the_panel_opened_on_a_read_only_session(cx: &mut TestAppContext) {
     bind_keys(cx);
     let rig = rig(cx);
+    // The window starts on the session, as one closed with it shown does.
+    let archived = cx.update(|cx| {
+        rig.store.update(cx, |s, cx| {
+            s.adopt_for_test(read_only(long_view("archived", 1, "idle")), cx)
+        })
+    });
+    cx.update(|cx| {
+        rig.host
+            .update(cx, |h, _| h.resume_session_for_test(archived.clone()))
+    });
     let (window, panel) = rig.open_panel(cx);
-    show_view(
-        cx,
-        &rig,
-        &panel,
-        read_only(long_view("archived", 1, "idle")),
-    );
+    assert_eq!(pane_key(cx, &panel).as_deref(), Some("archived"));
     settle(cx, window);
     assert!(
         keys_reach_panel(cx, window, &panel),
@@ -2776,6 +2794,66 @@ fn a_bar_has_a_section_per_todo_and_says_whether_the_session_is_live(cx: &mut Te
         let chip = bounds_dyn(cx, window, format!("quick-pick-tone:{ix}:Needs input"));
         assert_eq!(chip.is_some(), id == "ask", "{id}");
     }
+    // The chip does not move the columns: the waiting row's bar and time sit
+    // where a running row's do.
+    let ix = |id: &str| ids.iter().position(|i| i == id).expect(id);
+    let (ask, run) = (ix("ask"), ix("run"));
+    let left = |cx: &mut TestAppContext, sel: String| {
+        f32::from(bounds_dyn(cx, window, sel).expect("drawn").left())
+    };
+    let (a, r) = (
+        left(cx, format!("quick-pick-bar:{ask}")),
+        left(cx, format!("quick-pick-bar:{run}")),
+    );
+    assert!((a - r).abs() < 0.5, "bars: {a} vs {r}");
+    let (a, r) = (
+        left(cx, format!("quick-pick-time:{ask}:")),
+        left(cx, format!("quick-pick-time:{run}:")),
+    );
+    assert!((a - r).abs() < 0.5, "times: {a} vs {r}");
+}
+
+// quick-panel / One highlight in the picker: a pointer that creeps in steps
+// under a pixel still moves the highlight once it has gone a pixel.
+#[gpui_kit::test]
+fn slow_pointer_movement_adds_up_to_a_move(cx: &mut TestAppContext) {
+    let rig = rig(cx);
+    rig.summaries(
+        cx,
+        vec![
+            summary("a", "Session A", "idle", "3"),
+            summary("b", "Session B", "idle", "2"),
+        ],
+    );
+    let (window, panel) = rig.open_panel(cx);
+    show_picker(cx, window, &panel);
+    let cursor = |cx: &mut TestAppContext| panel.read_with(cx, |p, _| p.picker_cursor_for_test());
+    let row0 = bounds_dyn(cx, window, "quick-pick-row:0".into()).expect("row");
+    let row1 = bounds_dyn(cx, window, "quick-pick-row:1".into()).expect("row");
+    let move_to = |cx: &mut TestAppContext, at| {
+        VisualTestContext::from_window(window, cx).simulate_mouse_move(
+            at,
+            None,
+            gpui_kit::Modifiers::none(),
+        );
+    };
+    // The first event places the pointer over the cursor's own row.
+    let mut at = centre(row0);
+    move_to(cx, at);
+    assert_eq!(cursor(cx), 0);
+    // Straight down into row 1 in steps of 0.4 px: each is under the
+    // threshold, together they are over it. Measured from the last
+    // position that counted, the highlight follows; measured from the last
+    // event, it would never move.
+    let step = gpui_kit::px(0.4);
+    let target = centre(row1).y;
+    let mut moves = 0;
+    while cursor(cx) == 0 && at.y < target && moves < 400 {
+        at = gpui_kit::point(at.x, at.y + step);
+        move_to(cx, at);
+        moves += 1;
+    }
+    assert_eq!(cursor(cx), 1, "the small steps added up");
 }
 
 // quick-panel / The bar stays readable and calm: Reduced motion
@@ -3021,6 +3099,10 @@ fn progress_moves_while_the_picker_is_open(cx: &mut TestAppContext) {
     };
     assert!(doing(cx, "todo 1"));
     assert_eq!(done(cx), Some((1, 3)));
+    let drawn = |cx: &mut TestAppContext, i: usize, state: &str| {
+        bounds_dyn(cx, window, format!("quick-pick-bar-section:0:{i}:{state}")).is_some()
+    };
+    assert!(drawn(cx, 0, "done") && drawn(cx, 1, "active") && drawn(cx, 2, "pending"));
     let before = row_ids(cx, &panel);
 
     let entries: Vec<Value> = ["completed", "completed", "in_progress"]
@@ -3042,8 +3124,13 @@ fn progress_moves_while_the_picker_is_open(cx: &mut TestAppContext) {
     });
     settle(cx, window);
     assert!(doing(cx, "todo 2") && !doing(cx, "todo 1"));
-    assert_eq!(done(cx), Some((2, 3)), "the bar has one more section done");
-    assert!(bounds_dyn(cx, window, "quick-pick-bar:0".into()).is_some());
+    assert_eq!(done(cx), Some((2, 3)), "the store's digest moved");
+    // The bar drawn moved with it: two sections done, the third in progress.
+    let drawn = |cx: &mut TestAppContext, i: usize, state: &str| {
+        bounds_dyn(cx, window, format!("quick-pick-bar-section:0:{i}:{state}")).is_some()
+    };
+    assert!(drawn(cx, 0, "done") && drawn(cx, 1, "done") && drawn(cx, 2, "active"));
+    assert!(!drawn(cx, 1, "active") && !drawn(cx, 1, "pending"));
     assert_eq!(row_ids(cx, &panel), before, "no reordering");
     assert!(
         panel.read_with(cx, |p, _| p.picker_open_for_test()),

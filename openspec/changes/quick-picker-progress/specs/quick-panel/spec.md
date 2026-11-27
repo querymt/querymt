@@ -95,9 +95,13 @@ The picker SHALL offer a grid layout that shows the same sessions, in the same o
 - **WHEN** the picker shows the grid
 - **THEN** A's card shows a bar of six sections across the card, the in-progress todo, the first two pending todos and "+1 more"
 
-#### Scenario: Card of a session without todos
-- **WHEN** the grid shows a session with no plan
+#### Scenario: Card of an idle session without todos
+- **WHEN** the grid shows an idle session with no plan
 - **THEN** its card shows the title, status and agent · workspace · time, and no bar or todo lines
+
+#### Scenario: Card of a running session without todos
+- **WHEN** the grid shows a running session with no plan
+- **THEN** its card shows a sliding bar, as its row does, and no todo lines
 
 #### Scenario: Same order in both layouts
 - **GIVEN** one session waits for the user, one is running and six are idle
