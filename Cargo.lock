@@ -15507,7 +15507,6 @@ dependencies = [
  "mime_guess",
  "mio",
  "moka",
- "netlink-proto 0.12.2",
  "noq",
  "noq-proto",
  "num",
