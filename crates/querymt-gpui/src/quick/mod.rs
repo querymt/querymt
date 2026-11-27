@@ -508,6 +508,12 @@ impl QuickHost {
         self.hotkey = Some(hotkey);
     }
 
+    /// Start the next panel window on `session`, as one closed with it shown.
+    #[cfg(test)]
+    pub(crate) fn resume_session_for_test(&mut self, session: Entity<OpenSession>) {
+        self.state.session = Some(session);
+    }
+
     #[cfg(test)]
     pub(crate) fn state(&self) -> &QuickState {
         &self.state

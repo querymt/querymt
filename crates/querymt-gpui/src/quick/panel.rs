@@ -1049,8 +1049,13 @@ impl QuickPanel {
             let (dx, dy) = (f32::from(at.x - last.x), f32::from(at.y - last.y));
             dx.abs() >= 1. || dy.abs() >= 1.
         });
+        // Only an accepted move updates the reference, so slow movement
+        // in sub-pixel steps adds up to one.
+        if !moved {
+            return;
+        }
         self.last_pointer = Some(at);
-        if moved && self.picker_cursor != ix {
+        if self.picker_cursor != ix {
             self.picker_cursor = ix;
             cx.notify();
         }
@@ -1239,8 +1244,16 @@ impl QuickPanel {
                     pane.show(session, cx);
                     pane.set_draft("", window, cx);
                 });
-                self.focus_epoch += 1;
-                self.focus_conversation(window, cx);
+                // A sheet opened for the chat that just started (the folder
+                // chooser, the model picker) would cover the conversation.
+                if matches!(self.sheet, Sheet::Folder | Sheet::Models) {
+                    self.switch_sheet(Sheet::None, window, cx);
+                } else {
+                    self.focus_epoch += 1;
+                    if self.sheet == Sheet::None {
+                        self.focus_conversation(window, cx);
+                    }
+                }
                 if std::mem::take(&mut self.open_after_launch) {
                     self.open_in_main(None, cx);
                 }
@@ -1813,7 +1826,9 @@ impl QuickPanel {
         let rows = self.picker_rows(cx);
         let empty = rows.is_empty();
         let cursor = self.picker_cursor.min(rows.len().saturating_sub(1));
-        let moving = !cx.reduce_motion() && !self.low_power;
+        // Read now: `self.low_power` only follows the shown session's
+        // activity, which a list over a new quick chat never changes.
+        let moving = !cx.reduce_motion() && !chrome::low_power();
         let BarMotion {
             alpha,
             slide,
@@ -2026,13 +2041,34 @@ impl QuickPanel {
                 v_flex()
                     .flex_1()
                     .min_w_0()
+                    // The chip sits with the title, not in a column of its
+                    // own: a waiting row keeps its bar and time where the
+                    // other rows have theirs.
                     .child(
-                        div()
-                            .debug_selector(move || format!("quick-pick-title:{ix}"))
-                            .truncate()
-                            .text_sm()
-                            .text_color(p.text)
-                            .child(row.title.clone()),
+                        h_flex()
+                            .min_w_0()
+                            .gap_3()
+                            .items_center()
+                            .child(
+                                div()
+                                    .debug_selector(move || format!("quick-pick-title:{ix}"))
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_sm()
+                                    .text_color(p.text)
+                                    .child(row.title.clone()),
+                            )
+                            .when_some(tone, |el, (label, color)| {
+                                el.child(
+                                    div()
+                                        .debug_selector(move || {
+                                            format!("quick-pick-tone:{ix}:{label}")
+                                        })
+                                        .flex_none()
+                                        .child(kit::tone_chip(label, color)),
+                                )
+                            }),
                     )
                     .child(
                         h_flex()
@@ -2086,14 +2122,6 @@ impl QuickPanel {
                     .text_color(p.dim)
                     .child(when),
             )
-            .when_some(tone, |el, (label, color)| {
-                el.child(
-                    div()
-                        .debug_selector(move || format!("quick-pick-tone:{ix}:{label}"))
-                        .flex_none()
-                        .child(kit::tone_chip(label, color)),
-                )
-            })
             .when_some(hint.filter(|_| ix < 9), |el, hint| {
                 el.child(div().flex_none().text_xs().text_color(p.dim).child(hint))
             })
@@ -2123,8 +2151,9 @@ impl QuickPanel {
         } else {
             format!("{} · {} · {when}", row.agent_name, row.workspace)
         };
-        // As in the list: a live session's bar in colour, an idle one's todos
-        // as they were left; a session without todos, none.
+        // As in the list: a live session's bar in colour (a running one
+        // without todos slides a segment), an idle one's todos as they were
+        // left; an idle session without todos, none.
         let progress = live_bar(&row).map(|bar| {
             let (shown, hidden) = match &row.plan {
                 Some(d) => {
@@ -3171,7 +3200,13 @@ fn live_bar_element(bar: &LiveBar, ix: usize, look: RowLook, p: &Palette) -> Div
                     BarSection::Active => active,
                     BarSection::Pending => pending,
                 };
+                let state = match s {
+                    BarSection::Done => "done",
+                    BarSection::Active => "active",
+                    BarSection::Pending => "pending",
+                };
                 div()
+                    .debug_selector(move || format!("quick-pick-bar-section:{ix}:{i}:{state}"))
                     .flex_1()
                     .h_full()
                     .bg(colour)
