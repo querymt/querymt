@@ -19,7 +19,7 @@ use gpui_kit::*;
 use super::activity::{self, Activity, Observation, Tracker};
 use super::chrome::{self, Chrome};
 use super::edge::{self, Edge, EdgeColours, EdgeFrame, EdgeLight, EdgeState, MOTION, Outline};
-use super::hud::{PROGRESS_FILL_ALPHA, hud_palette, progress_colour};
+use super::hud::hud_palette;
 use super::{Picks, Resume};
 use crate::session::PlanDigest;
 use crate::session::open::{OpenSession, SessionKey, SessionRef};
@@ -76,6 +76,28 @@ const OVERLAY_SHARE: f32 = 0.9;
 /// header, search, padding. Only an estimate, for the first frame.
 const PICKER_CHROME: f32 = HEADER_HEIGHT + 52. + 24.;
 const PICKER_ROW: f32 = 46.;
+/// Corners of a row or card of the list: the panel's, less the inset the
+/// list keeps from its edge, so the corners stay concentric.
+const ROW_RADIUS: f32 = chrome::RADIUS - 8.;
+/// Height of a live session's bar.
+const BAR: f32 = 4.;
+/// Width of the bar at the end of a list row.
+const LIVE_BAR_WIDTH: f32 = 56.;
+/// Width of the time an idle row shows (`now`, `59m`, `23h`, `Nov 7`).
+const TIME_WIDTH: f32 = 36.;
+/// Above this many todos the sections are too thin to tell apart, and the
+/// bar is drawn whole.
+const BAR_SECTIONS_MAX: usize = 20;
+/// One breath of the section being worked on.
+const PULSE_MS: f64 = 1500.;
+/// The live section's strength when motion is off: still, but set apart.
+const PULSE_STILL: f32 = 0.75;
+/// One pass of the sliding segment of a running session without todos.
+const SLIDE_MS: f64 = 1400.;
+/// Where that segment rests when motion is off: the middle of the track.
+const SLIDE_STILL: f32 = 0.5;
+/// Width of that segment, as a share of the track.
+const SLIDE_WIDTH: f32 = 0.35;
 /// A card of the picker's grid with every line it can have: title, meta,
 /// bar, three todos and "+N more".
 const GRID_CARD: f32 = 148.;
@@ -110,6 +132,18 @@ pub(crate) enum QuickPanelEvent {
         target: SessionRef,
         then: Option<SessionPaneEvent>,
     },
+}
+
+/// What takes the conversation's place (design D17). One value, so that at
+/// most one is open and every way of opening one closes the others.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Sheet {
+    /// The conversation, or in a new quick chat only the bar.
+    #[default]
+    None,
+    Sessions,
+    Models,
+    Folder,
 }
 
 pub(crate) struct QuickPanel {
@@ -158,15 +192,33 @@ pub(crate) struct QuickPanel {
     wake: Option<(f64, Task<()>)>,
     pane: Entity<SessionPane>,
     query: Entity<InputState>,
-    picker_open: bool,
+    /// Which sheet is open. [`Sheet::Models`] mirrors the picker's own open
+    /// flag, which only [`Self::switch_sheet`] and the picker's own events
+    /// change.
+    sheet: Sheet,
+    /// Where the keys go when nothing inside the panel has the focus, so the
+    /// panel's shortcuts and Esc always reach it.
+    focus: FocusHandle,
+    /// Bumped whenever the panel puts the focus somewhere on purpose. The
+    /// focus check a frame schedules is about that frame; one from before the
+    /// last bump is stale and stands down.
+    focus_epoch: u64,
+    /// What the focus depends on when the last focus check was scheduled:
+    /// the epoch, the sheet, the session shown and whether it takes input.
+    /// A check is scheduled only when it changes, so an idle panel asks for
+    /// no frames.
+    focus_checked: Option<(u64, Sheet, Option<EntityId>, bool)>,
     /// The row of the session list the keyboard is on.
     picker_cursor: usize,
+    /// Where the pointer was over the list: a row takes the cursor only when
+    /// the pointer really moves onto it, not on every move event while it
+    /// rests (which would undo the arrow keys).
+    last_pointer: Option<Point<Pixels>>,
     /// The model picker, drawn inside the panel (design D12).
     models: Entity<ModelPicker>,
     /// The folder chooser of a new quick chat, drawn inside the panel.
     folders: Entity<WorkspaceField>,
     folder_input: Entity<InputState>,
-    folder_open: bool,
     /// What was picked for the next quick chat. It is the panel's own: the
     /// start page's launch defaults are not touched by it (the folder is
     /// remembered by the launch, as for any session).
@@ -447,11 +499,15 @@ impl QuickPanel {
             cx.observe(&pane, |_, _, cx| cx.notify()),
             cx.subscribe_in(&pane, window, Self::on_pane_event),
             cx.observe_in(&models, window, |this, models, window, cx| {
-                // Closing the picker gives the keyboard back to the composer.
+                // The picker closed itself (a pick): the keyboard goes back
+                // to the composer. When the panel closed it to show another
+                // sheet, `sheet` has moved on and the focus is that sheet's.
                 let open = models.read(cx).is_open();
-                if std::mem::replace(&mut this.models_were_open, open) && !open {
-                    this.pane
-                        .update(cx, |pane, cx| pane.focus_composer(window, cx));
+                if std::mem::replace(&mut this.models_were_open, open)
+                    && !open
+                    && this.sheet == Sheet::Models
+                {
+                    this.switch_sheet(Sheet::None, window, cx);
                 }
                 cx.notify();
             }),
@@ -492,7 +548,7 @@ impl QuickPanel {
                 &folder_input,
                 window,
                 |this, input, ev: &InputEvent, window, cx| {
-                    if matches!(ev, InputEvent::PressEnter { .. }) && this.folder_open {
+                    if matches!(ev, InputEvent::PressEnter { .. }) && this.sheet == Sheet::Folder {
                         let path = input.read(cx).value().to_string();
                         this.choose_folder(&path, window, cx);
                     }
@@ -531,12 +587,15 @@ impl QuickPanel {
             wake: None,
             pane,
             query,
-            picker_open: false,
+            sheet: Sheet::None,
+            focus: cx.focus_handle(),
+            focus_epoch: 0,
+            focus_checked: None,
             picker_cursor: 0,
+            last_pointer: None,
             models,
             folders,
             folder_input,
-            folder_open: false,
             picks,
             open_after_launch: false,
             models_were_open: false,
@@ -674,10 +733,130 @@ impl QuickPanel {
                 }
             },
         };
-        self.picker_open = false;
-        self.folder_open = false;
+        // Any other sheet closes first; the picker then takes the keyboard.
+        self.set_sheet(Sheet::Models, window, cx);
         self.models
             .update(cx, |models, cx| models.open(target, window, cx));
+        cx.notify();
+    }
+
+    /// Cmd/Ctrl+M: open the model picker, or close it when it is open.
+    fn toggle_model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sheet == Sheet::Models {
+            self.switch_sheet(Sheet::None, window, cx);
+        } else {
+            self.open_model_picker(window, cx);
+        }
+    }
+
+    /// Show `next` in place of the conversation and close whatever else was
+    /// open, and put the keyboard where `next` wants it: the composer for
+    /// [`Sheet::None`], the search of the session list for [`Sheet::Sessions`].
+    /// The model picker and the folder chooser take the keyboard themselves
+    /// when they open, so they are opened by their own functions.
+    fn switch_sheet(&mut self, next: Sheet, window: &mut Window, cx: &mut Context<Self>) {
+        // Set first: the model picker's observer reads it when it sees the
+        // picker close.
+        self.set_sheet(next, window, cx);
+        if next != Sheet::Models {
+            self.models.update(cx, |models, cx| {
+                models.close(cx);
+            });
+        }
+        match next {
+            Sheet::None => self.focus_conversation(window, cx),
+            Sheet::Sessions => {
+                self.picker_cursor = 0;
+                self.query.update(cx, |q, cx| q.focus(window, cx));
+            }
+            Sheet::Models | Sheet::Folder => {}
+        }
+        cx.notify();
+    }
+
+    /// Put the keyboard on the conversation: its composer, or, for a
+    /// read-only session that shows none, the panel itself, so Esc and the
+    /// shortcuts still reach it.
+    fn focus_conversation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pane.read(cx).takes_input(cx) {
+            self.pane
+                .update(cx, |pane, cx| pane.focus_composer(window, cx));
+        } else {
+            window.focus(&self.focus, cx);
+        }
+    }
+
+    /// Record `next` as the open sheet.
+    fn set_sheet(&mut self, next: Sheet, _window: &mut Window, _cx: &mut Context<Self>) {
+        let was = std::mem::replace(&mut self.sheet, next);
+        // The focus moves with the sheet; checks of the frame before are stale.
+        self.focus_epoch += 1;
+        if next == Sheet::Sessions && was != Sheet::Sessions {
+            self.last_pointer = None;
+        }
+    }
+
+    /// Close the open sheet, returning the keyboard to the composer; false
+    /// when none was open.
+    fn close_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.sheet == Sheet::None {
+            return false;
+        }
+        self.switch_sheet(Sheet::None, window, cx);
+        true
+    }
+
+    /// Scheduled by every frame: once that frame is the one on screen, if the
+    /// focused element is not in it inside the panel (a field of a sheet that
+    /// is gone, the composer of a session that turned read-only), put the
+    /// keyboard back where the panel's state says. Without a focused element
+    /// GPUI sends keys from the window's root, above the panel: its shortcuts
+    /// and Esc would stop working and only the mouse could get out.
+    ///
+    /// It is scheduled when what the focus depends on changed since the last
+    /// one (see [`Self::focus_checked`]), so an idle panel asks for no frames.
+    /// The check is scheduled from `render`, never from a handler: the
+    /// platform runs next-frame callbacks *before* it draws, so a check
+    /// scheduled by a key would look at the frame from before the key and
+    /// take the focus from a sheet that is not drawn yet. A focus change
+    /// after the render that scheduled it (a bumped [`Self::focus_epoch`])
+    /// makes it stand down; the next frame schedules a current one.
+    fn schedule_focus_check(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let pane = self.pane.read(cx);
+        let state = (
+            self.focus_epoch,
+            self.sheet,
+            pane.session().map(|s| s.entity_id()),
+            pane.takes_input(cx),
+        );
+        if self.focus_checked == Some(state) {
+            return;
+        }
+        self.focus_checked = Some(state);
+        let this = cx.entity().downgrade();
+        let epoch = self.focus_epoch;
+        window.on_next_frame(move |window, cx| {
+            let _ = this.update(cx, |this, cx| this.check_focus(epoch, window, cx));
+        });
+    }
+
+    fn check_focus(&mut self, epoch: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closed
+            || epoch != self.focus_epoch
+            || !window.is_window_active()
+            || self.focus.contains_focused(window, cx)
+        {
+            return;
+        }
+        match self.sheet {
+            Sheet::None => self.focus_conversation(window, cx),
+            Sheet::Sessions => self.query.update(cx, |q, cx| q.focus(window, cx)),
+            Sheet::Models | Sheet::Folder => {}
+        }
+        // Still nothing in the frame on screen: the panel itself.
+        if !self.focus.contains_focused(window, cx) {
+            window.focus(&self.focus, cx);
+        }
     }
 
     /// Ask the host to show the session in the main window.
@@ -693,13 +872,10 @@ impl QuickPanel {
         self.launching = None;
         self.open_after_launch = false;
         self.error = None;
-        self.picker_open = false;
-        self.folder_open = false;
         self.picks.mode = None;
-        self.pane.update(cx, |pane, cx| {
-            pane.clear(cx);
-            pane.focus_composer(window, cx);
-        });
+        self.pane.update(cx, |pane, cx| pane.clear(cx));
+        // Closes any sheet and focuses the composer.
+        self.switch_sheet(Sheet::None, window, cx);
         // Back to the bar.
         self.height = BAR_HEIGHT;
         self.settling = None;
@@ -739,7 +915,7 @@ impl QuickPanel {
             Some(h) => h.ceil() + around,
             None => estimate + if shown { 0. } else { BAR_HEIGHT },
         };
-        let sessions = if self.picker_open {
+        let sessions = if self.sheet == Sheet::Sessions {
             let (search, rows) = (self.list_search_h.get(), self.list_rows_h.get());
             let estimate = picker_height(self.picker_layout(cx), self.picker_rows(cx).len());
             placed((rows > 0.).then_some(search + rows), estimate)
@@ -755,7 +931,7 @@ impl QuickPanel {
             self.model_h.set(0.);
             0.
         };
-        let folders = if self.folder_open {
+        let folders = if self.sheet == Sheet::Folder {
             let h = self.folder_h.get();
             placed((h > 0.).then_some(h), FOLDER_FLOOR)
         } else {
@@ -825,33 +1001,27 @@ impl QuickPanel {
             cwd: summary.cwd.clone(),
             title: summary.display_title(),
         };
-        self.picker_open = false;
         self.error = None;
         self.make_room(window, cx);
-        self.pane.update(cx, |pane, cx| {
-            pane.open(target, cx);
-            pane.focus_composer(window, cx);
-        });
-        cx.notify();
+        self.pane.update(cx, |pane, cx| pane.open(target, cx));
+        // Closes the list and focuses the composer.
+        self.switch_sheet(Sheet::None, window, cx);
     }
 
+    /// Cmd/Ctrl+K: open the session list, or close it when it is open.
     fn toggle_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.picker_open = !self.picker_open;
-        if self.picker_open {
-            self.picker_cursor = 0;
-            self.folder_open = false;
-            self.query.update(cx, |q, cx| q.focus(window, cx));
+        let next = if self.sheet == Sheet::Sessions {
+            Sheet::None
         } else {
-            self.pane
-                .update(cx, |pane, cx| pane.focus_composer(window, cx));
-        }
-        cx.notify();
+            Sheet::Sessions
+        };
+        self.switch_sheet(next, window, cx);
     }
 
     /// Show the session in row `ix` of the open list (Cmd/Ctrl+1…8). False
     /// when the list is closed or has no such row.
     fn pick_nth(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if !self.picker_open {
+        if self.sheet != Sheet::Sessions {
             return false;
         }
         let Some(row) = self.picker_rows(cx).into_iter().nth(ix) else {
@@ -867,10 +1037,34 @@ impl QuickPanel {
         self.pick_nth(at, window, cx);
     }
 
+    /// The pointer moved over row `ix`: the keyboard's row is that one, so
+    /// the list has a single highlight. A move event where the pointer
+    /// already was (it rests over the list while the arrows are used) leaves
+    /// the cursor where the keyboard put it.
+    fn point_at(&mut self, ix: usize, at: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.sheet != Sheet::Sessions {
+            return;
+        }
+        let moved = self.last_pointer.is_none_or(|last| {
+            let (dx, dy) = (f32::from(at.x - last.x), f32::from(at.y - last.y));
+            dx.abs() >= 1. || dy.abs() >= 1.
+        });
+        // Only an accepted move updates the reference, so slow movement
+        // in sub-pixel steps adds up to one.
+        if !moved {
+            return;
+        }
+        self.last_pointer = Some(at);
+        if self.picker_cursor != ix {
+            self.picker_cursor = ix;
+            cx.notify();
+        }
+    }
+
     /// Up and Down in the list's search field; wraps around.
     fn move_picker_cursor(&mut self, down: bool, cx: &mut Context<Self>) -> bool {
         let len = self.picker_rows(cx).len();
-        if !self.picker_open || len == 0 {
+        if self.sheet != Sheet::Sessions || len == 0 {
             return false;
         }
         let at = self.picker_cursor.min(len - 1);
@@ -897,7 +1091,8 @@ impl QuickPanel {
         if self.pane.read(cx).session().is_some() {
             return;
         }
-        self.picker_open = false;
+        // Set before closing the model picker, whose observer reads it.
+        self.set_sheet(Sheet::Folder, window, cx);
         self.models.update(cx, |models, cx| {
             models.close(cx);
         });
@@ -906,19 +1101,7 @@ impl QuickPanel {
             input.set_value(cwd, window, cx);
             input.focus(window, cx);
         });
-        self.folder_open = true;
         cx.notify();
-    }
-
-    /// Close the folder chooser; true when it was open.
-    fn close_folder_chooser(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let was = std::mem::replace(&mut self.folder_open, false);
-        if was {
-            self.pane
-                .update(cx, |pane, cx| pane.focus_composer(window, cx));
-            cx.notify();
-        }
-        was
     }
 
     /// Run the next quick chat in `path` (`~` is the home folder).
@@ -945,10 +1128,7 @@ impl QuickPanel {
             trimmed.to_string()
         });
         self.error = None;
-        self.folder_open = false;
-        self.pane
-            .update(cx, |pane, cx| pane.focus_composer(window, cx));
-        cx.notify();
+        self.switch_sheet(Sheet::None, window, cx);
     }
 
     /// The reasoning effort the next quick chat starts with.
@@ -1063,8 +1243,17 @@ impl QuickPanel {
                 self.pane.update(cx, |pane, cx| {
                     pane.show(session, cx);
                     pane.set_draft("", window, cx);
-                    pane.focus_composer(window, cx);
                 });
+                // A sheet opened for the chat that just started (the folder
+                // chooser, the model picker) would cover the conversation.
+                if matches!(self.sheet, Sheet::Folder | Sheet::Models) {
+                    self.switch_sheet(Sheet::None, window, cx);
+                } else {
+                    self.focus_epoch += 1;
+                    if self.sheet == Sheet::None {
+                        self.focus_conversation(window, cx);
+                    }
+                }
                 if std::mem::take(&mut self.open_after_launch) {
                     self.open_in_main(None, cx);
                 }
@@ -1098,7 +1287,20 @@ impl QuickPanel {
     /// The session picker is open.
     #[cfg(test)]
     pub(crate) fn picker_open_for_test(&self) -> bool {
-        self.picker_open
+        self.sheet == Sheet::Sessions
+    }
+
+    /// The row of the session list the keyboard is on.
+    #[cfg(test)]
+    pub(crate) fn picker_cursor_for_test(&self) -> usize {
+        self.picker_cursor
+    }
+
+    /// Whether the focused element is inside the panel, so that its
+    /// shortcuts and Esc reach it.
+    #[cfg(test)]
+    pub(crate) fn keys_reach_panel_for_test(&self, window: &Window, cx: &App) -> bool {
+        self.focus.contains_focused(window, cx)
     }
 
     /// Press the picker's layout toggle.
@@ -1115,7 +1317,7 @@ impl QuickPanel {
     /// Show or hide the session picker.
     #[cfg(test)]
     pub(crate) fn set_picker_for_test(&mut self, open: bool, cx: &mut Context<Self>) {
-        self.picker_open = open;
+        self.sheet = if open { Sheet::Sessions } else { Sheet::None };
         cx.notify();
     }
 
@@ -1135,7 +1337,7 @@ impl QuickPanel {
     /// The folder chooser is open.
     #[cfg(test)]
     pub(crate) fn folder_open_for_test(&self) -> bool {
-        self.folder_open
+        self.sheet == Sheet::Folder
     }
 
     /// Last value of the opening animation.
@@ -1458,7 +1660,7 @@ impl QuickPanel {
                 kit::tip_with_key(model_tip.clone(), &OpenModelPicker, window).build(window, cx)
             })
             .when(model_live, |el| {
-                el.on_click(cx.listener(|this, _, window, cx| this.open_model_picker(window, cx)))
+                el.on_click(cx.listener(|this, _, window, cx| this.toggle_model_picker(window, cx)))
             });
         let efforts = run.efforts;
         let effort = run.effort.map(|effort| {
@@ -1538,7 +1740,7 @@ impl QuickPanel {
     /// The folder chooser in place of the conversation, while it is open
     /// (design D17), its suggestions laid out under the field.
     fn render_folder_sheet(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !self.folder_open {
+        if self.sheet != Sheet::Folder {
             return None;
         }
         let p = self.hud(cx);
@@ -1624,6 +1826,28 @@ impl QuickPanel {
         let rows = self.picker_rows(cx);
         let empty = rows.is_empty();
         let cursor = self.picker_cursor.min(rows.len().saturating_sub(1));
+        // Read now: `self.low_power` only follows the shown session's
+        // activity, which a list over a new quick chat never changes.
+        let moving = !cx.reduce_motion() && !chrome::low_power();
+        let BarMotion {
+            alpha,
+            slide,
+            animate,
+        } = bar_motion(&rows, moving, crate::util::now_ms());
+        if animate {
+            window.request_animation_frame();
+        }
+        let look = RowLook {
+            alpha,
+            slide,
+            bar_slot: rows.iter().any(|r| live_bar(r).is_some()),
+            show_agent: rows
+                .iter()
+                .map(|r| r.agent_id.as_str())
+                .collect::<HashSet<_>>()
+                .len()
+                > 1,
+        };
         let (toggle_icon, toggle_tip) = match layout {
             PickerLayout::List => (IconName::LayoutGrid, "Show sessions as cards"),
             PickerLayout::Grid => (IconName::List, "Show sessions as a list"),
@@ -1662,7 +1886,7 @@ impl QuickPanel {
                 v_flex()
                     .gap_1()
                     .children(rows.into_iter().enumerate().map(|(ix, row)| {
-                        self.picker_list_row(ix, row, ix == cursor, &p, window, cx)
+                        self.picker_list_row(ix, row, ix == cursor, look, &p, window, cx)
                     }))
                     .into_any_element(),
                 "quick-picker-list",
@@ -1673,7 +1897,7 @@ impl QuickPanel {
                 let mut cards = rows
                     .into_iter()
                     .enumerate()
-                    .map(|(ix, row)| self.picker_card(ix, row, ix == cursor, &p, cx))
+                    .map(|(ix, row)| self.picker_card(ix, row, ix == cursor, look, &p, cx))
                     .collect::<Vec<_>>()
                     .into_iter();
                 let mut grid_rows = Vec::new();
@@ -1741,23 +1965,22 @@ impl QuickPanel {
 
     /// A session's status chip in the picker: waiting or running.
     fn picker_tone(row: &PickerRow, p: &Palette) -> Option<(&'static str, Hsla)> {
-        if row.waiting {
-            Some(("Needs input", p.warn))
-        } else if row.running {
-            Some(("Running", p.accent))
-        } else {
-            None
-        }
+        // Running is the bar's to show; only what asks for the user is said.
+        row.waiting.then_some(("Needs input", p.warn))
     }
 
-    /// One line of the list layout. A session with progress has its row
-    /// filled from the left as far as its share of done todos, and its count
-    /// before the chip.
+    /// One line of the list layout: the title over where the session runs
+    /// (the project, for a worktree with a branch mark) and, while it runs,
+    /// what it is doing; then, centred on the row, its bar (one section per
+    /// todo; in colour while live, grey and still once idle), how long ago an
+    /// idle one was active, and its shortcut.
+    #[allow(clippy::too_many_arguments)]
     fn picker_list_row(
         &self,
         ix: usize,
         row: PickerRow,
         selected: bool,
+        look: RowLook,
         p: &Palette,
         window: &Window,
         cx: &mut Context<Self>,
@@ -1769,72 +1992,136 @@ impl QuickPanel {
         let id = kit::keyed("quick-pick", format!("{}/{}", row.agent_id, row.id));
         let summary = row.summary.clone();
         let tone = Self::picker_tone(&row, &p);
-        let progress = row.plan.as_ref().map(|d| {
-            (
-                progress_colour(&p, d.is_finished(), row.running),
-                d.fraction(),
-                d.done,
-                d.total,
-            )
-        });
+        let bar = live_bar(&row);
+        let live = row.running || row.waiting;
+        let doing = row
+            .plan
+            .as_ref()
+            .filter(|_| live)
+            .and_then(|d| d.current())
+            .and_then(|e| e.content.lines().next())
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_owned);
+        // A worktree is named by the project it was made from; its own folder
+        // is a hash. Its branch is named only when a person named it.
+        let worktree = row.summary.worktree.as_ref();
+        let branch = worktree
+            .and_then(|w| w.branch.clone())
+            .filter(|b| !b.starts_with("qmt/workspace/"));
+        let mut place = Vec::new();
+        if look.show_agent {
+            place.push(row.agent_name.clone());
+        }
+        place.push(folder_tail(row.summary.group_cwd()));
+        let place = place.join(" \u{b7} ");
+        let when = if live {
+            String::new()
+        } else {
+            crate::util::short_time(&row.summary.updated_at)
+        };
+        let sub = |text: String| div().flex_none().child(text);
+        let place_sel = format!("quick-pick-sub:{ix}:{place}");
+        let time_sel = format!("quick-pick-time:{ix}:{when}");
         h_flex()
             .id(id)
             .debug_selector(move || format!("quick-pick-row:{ix}"))
-            .relative()
-            .overflow_hidden()
-            .gap_2()
+            .items_center()
+            .gap_3()
             .px_2()
             .py_1p5()
-            .rounded(px(8.))
-            .cursor_pointer()
-            .hover(move |s| s.bg(p.card_hover))
+            .rounded(px(ROW_RADIUS))
+            // One highlight: the row the keyboard is on, which the pointer
+            // moves too. There is no separate hover colour to compete with it.
             .when(selected, |el| el.bg(p.card_hover))
-            // Under everything else of the row.
-            .when_some(progress, |el, (colour, fraction, _, _)| {
-                el.child(
-                    div()
-                        .debug_selector(move || format!("quick-pick-fill:{ix}"))
-                        .absolute()
-                        .left_0()
-                        .top_0()
-                        .bottom_0()
-                        .w(relative(fraction))
-                        .bg(colour.opacity(PROGRESS_FILL_ALPHA)),
-                )
-            })
+            .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _, cx| {
+                this.point_at(ix, ev.position, cx)
+            }))
             .child(
                 v_flex()
                     .flex_1()
                     .min_w_0()
+                    // The chip sits with the title, not in a column of its
+                    // own: a waiting row keeps its bar and time where the
+                    // other rows have theirs.
                     .child(
-                        div()
-                            .truncate()
-                            .text_sm()
-                            .text_color(p.text)
-                            .child(row.title.clone()),
+                        h_flex()
+                            .min_w_0()
+                            .gap_3()
+                            .items_center()
+                            .child(
+                                div()
+                                    .debug_selector(move || format!("quick-pick-title:{ix}"))
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_sm()
+                                    .text_color(p.text)
+                                    .child(row.title.clone()),
+                            )
+                            .when_some(tone, |el, (label, color)| {
+                                el.child(
+                                    div()
+                                        .debug_selector(move || {
+                                            format!("quick-pick-tone:{ix}:{label}")
+                                        })
+                                        .flex_none()
+                                        .child(kit::tone_chip(label, color)),
+                                )
+                            }),
                     )
                     .child(
-                        div()
-                            .truncate()
+                        h_flex()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .gap_1()
+                            .items_center()
                             .text_xs()
                             .text_color(p.muted)
-                            .child(format!("{} · {}", row.agent_name, row.workspace)),
+                            .child(sub(place).debug_selector(move || place_sel))
+                            .when(worktree.is_some(), |el| {
+                                el.child(
+                                    div()
+                                        .debug_selector(move || format!("quick-pick-worktree:{ix}"))
+                                        .flex_none()
+                                        .child(kit::icon(IconName::GitBranch, 11., p.dim)),
+                                )
+                                .children(branch.map(|b| {
+                                    let sel = format!("quick-pick-branch:{ix}:{b}");
+                                    sub(b).debug_selector(move || sel).text_color(p.dim)
+                                }))
+                            })
+                            .when_some(doing, |el, todo| {
+                                let sel = format!("quick-pick-doing:{ix}:{todo}");
+                                el.child(div().flex_none().text_color(p.dim).child("\u{b7}"))
+                                    .child(
+                                        div()
+                                            .debug_selector(move || sel)
+                                            .min_w_0()
+                                            .truncate()
+                                            .child(todo),
+                                    )
+                            }),
                     ),
             )
-            .when_some(progress, |el, (_, _, done, total)| {
+            .when(look.bar_slot, |el| {
                 el.child(
                     div()
-                        .debug_selector(move || format!("quick-pick-count:{ix}:{done}/{total}"))
                         .flex_none()
-                        .font_family(kit::MONO)
-                        .text_xs()
-                        .text_color(p.muted)
-                        .child(format!("{done}/{total}")),
+                        .w(px(LIVE_BAR_WIDTH))
+                        .children(bar.map(|b| live_bar_element(&b, ix, look, &p))),
                 )
             })
-            .when_some(tone, |el, (label, color)| {
-                el.child(kit::tone_chip(label, color))
-            })
+            .child(
+                div()
+                    .debug_selector(move || time_sel)
+                    .flex_none()
+                    .w(px(TIME_WIDTH))
+                    .text_right()
+                    .text_xs()
+                    .text_color(p.dim)
+                    .child(when),
+            )
             .when_some(hint.filter(|_| ix < 9), |el, hint| {
                 el.child(div().flex_none().text_xs().text_color(p.dim).child(hint))
             })
@@ -1850,6 +2137,7 @@ impl QuickPanel {
         ix: usize,
         row: PickerRow,
         selected: bool,
+        look: RowLook,
         p: &Palette,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -1863,37 +2151,26 @@ impl QuickPanel {
         } else {
             format!("{} · {} · {when}", row.agent_name, row.workspace)
         };
-        let progress = row.plan.as_ref().map(|d| {
-            let colour = progress_colour(&p, d.is_finished(), row.running);
-            let shown: Vec<_> = match d.current() {
-                Some(current) => std::iter::once(current).chain(d.upcoming(2)).collect(),
-                None => d.upcoming(3),
+        // As in the list: a live session's bar in colour (a running one
+        // without todos slides a segment), an idle one's todos as they were
+        // left; an idle session without todos, none.
+        let progress = live_bar(&row).map(|bar| {
+            let (shown, hidden) = match &row.plan {
+                Some(d) => {
+                    let shown: Vec<_> = match d.current() {
+                        Some(current) => std::iter::once(current).chain(d.upcoming(2)).collect(),
+                        None => d.upcoming(3),
+                    };
+                    let hidden = d.hidden(shown.len());
+                    (shown, hidden)
+                }
+                None => (Vec::new(), 0),
             };
-            let hidden = d.hidden(shown.len());
-            let (done, total) = (d.done, d.total);
-            let bar = h_flex()
-                .debug_selector(move || format!("quick-card-bar:{ix}:{done}/{total}"))
+            let bar = div()
                 .h(px(14.))
-                .gap_2()
+                .flex()
                 .items_center()
-                .child(
-                    div().flex_1().h(px(4.)).rounded_full().bg(p.chip).child(
-                        div()
-                            .debug_selector(move || format!("quick-card-fill:{ix}"))
-                            .h_full()
-                            .w(relative(d.fraction()))
-                            .rounded_full()
-                            .bg(colour),
-                    ),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .font_family(kit::MONO)
-                        .text_xs()
-                        .text_color(p.muted)
-                        .child(format!("{done}/{total}")),
-                );
+                .child(live_bar_element(&bar, ix, look, &p));
             let lines: Vec<AnyElement> = shown
                 .into_iter()
                 .map(|e| {
@@ -1942,15 +2219,15 @@ impl QuickPanel {
             .debug_selector(move || format!("quick-pick-card:{ix}"))
             .flex_1()
             .min_w_0()
-            .min_h(px(GRID_CARD))
             .px_2()
             .py(px(6.))
             .gap(px(3.))
-            .rounded(px(10.))
+            .rounded(px(ROW_RADIUS))
             .bg(p.card)
-            .cursor_pointer()
-            .hover(move |s| s.bg(p.card_hover))
             .when(selected, |el| el.bg(p.card_hover))
+            .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _, cx| {
+                this.point_at(ix, ev.position, cx)
+            }))
             .child(
                 h_flex()
                     .h(px(20.))
@@ -2106,7 +2383,7 @@ impl QuickPanel {
                         .child(text(220., model))
                         .child(kit::icon(IconName::ChevronDown, 10., p.dim))
                         .on_click(
-                            cx.listener(|this, _, window, cx| this.open_model_picker(window, cx)),
+                            cx.listener(|this, _, window, cx| this.toggle_model_picker(window, cx)),
                         )
                         .into_any_element(),
                 );
@@ -2523,16 +2800,16 @@ impl Render for QuickPanel {
         if ring.is_none() {
             self.ring_frame.set(None);
         }
+        self.schedule_focus_check(window, cx);
         // The session list, the model picker and the folder chooser take the
         // conversation's place (design D17); the pane is kept, so the
         // conversation returns where it was scrolled to. In a new quick chat
         // they lie above the bar. At most one is open.
-        let list = match self.render_folder_sheet(cx) {
-            Some(sheet) => Some(sheet),
-            None => match self.render_model_sheet(session, cx) {
-                Some(sheet) => Some(sheet),
-                None => self.picker_open.then(|| self.render_picker(window, cx)),
-            },
+        let list = match self.sheet {
+            Sheet::None => None,
+            Sheet::Folder => self.render_folder_sheet(cx),
+            Sheet::Models => self.render_model_sheet(session, cx),
+            Sheet::Sessions => Some(self.render_picker(window, cx)),
         };
         // A new quick chat is only its bar.
         let header = session.then(|| self.render_header(cx));
@@ -2550,6 +2827,13 @@ impl Render for QuickPanel {
         };
         v_flex()
             .id("quick-panel")
+            .track_focus(&self.focus)
+            // The panel is focusable only as the keyboard's last resort. GPUI
+            // would focus it on any click that nothing deeper takes (a row,
+            // the glass), taking the keyboard from the list's search and so
+            // the arrows. This runs before that transfer and cancels it;
+            // fields still take the focus on their own clicks.
+            .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
             .absolute()
             .top_0()
             .bottom_0()
@@ -2571,21 +2855,16 @@ impl Render for QuickPanel {
                     {
                         // Only the composer's command list closes.
                         cx.notify();
-                    } else if this.close_folder_chooser(window, cx) {
-                        // The composer gets the focus back.
-                    } else if this.models.update(cx, |models, cx| models.close(cx)) {
-                        // The composer gets the focus back when it closes.
-                    } else if std::mem::take(&mut this.picker_open) {
-                        this.pane
-                            .update(cx, |pane, cx| pane.focus_composer(window, cx));
-                        cx.notify();
+                    } else if this.close_sheet(window, cx) {
+                        // The composer has the focus again.
                     } else {
                         this.dismiss(window, cx);
                     }
                 }
             }))
+            // Cmd/Ctrl+M opens and closes the model picker.
             .on_action(cx.listener(|this, _: &OpenModelPicker, window, cx| {
-                this.open_model_picker(window, cx)
+                this.toggle_model_picker(window, cx)
             }))
             .on_action(cx.listener(|this, _: &CycleReasoning, _, cx| this.cycle_reasoning(cx)))
             .on_action(cx.listener(|this, _: &ChooseFolder, window, cx| {
@@ -2707,6 +2986,239 @@ pub(crate) struct PickerRow {
     /// Progress of the session's todos, if it has any.
     pub(crate) plan: Option<PlanDigest>,
     summary: SessionSummary,
+}
+
+/// What every row of the open list shares.
+#[derive(Clone, Copy, Debug)]
+struct RowLook {
+    /// Strength of the breathing section now.
+    alpha: f32,
+    /// Where the sliding segment of a running session without todos is,
+    /// 0 to 1 across its cycle.
+    slide: f32,
+    /// Some row has a bar: every row keeps its place, so bars and times
+    /// form columns.
+    bar_slot: bool,
+    /// The list holds sessions of more than one agent: name it.
+    show_agent: bool,
+}
+
+/// The last two parts of `cwd`, `qmt/querymt`: enough to tell two checkouts
+/// of the same name apart, and the same on a remote machine.
+fn folder_tail(cwd: &str) -> String {
+    let parts: Vec<&str> = cwd
+        .trim_end_matches(['/', '\\'])
+        .split(['/', '\\'])
+        .filter(|p| !p.is_empty())
+        .collect();
+    match parts.len() {
+        0 => cwd.to_string(),
+        1 => parts[0].to_string(),
+        n => format!("{}/{}", parts[n - 2], parts[n - 1]),
+    }
+}
+
+/// One section of a live session's bar: a todo.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BarSection {
+    Done,
+    /// Being worked on.
+    Active,
+    Pending,
+}
+
+/// What of a live session's bar breathes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BarPulse {
+    /// Still: the session waits for the user.
+    None,
+    /// The todo being worked on.
+    Section(usize),
+    /// Running with no todo in progress: the whole bar.
+    Whole,
+}
+
+/// The bar of a live session: one section per todo, or a single one for a
+/// running session without todos.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct LiveBar {
+    pub(super) sections: Vec<BarSection>,
+    pub(super) pulse: BarPulse,
+    pub(super) waiting: bool,
+    pub(super) finished: bool,
+    /// Neither running nor waiting: the todos as they were left, still and
+    /// grey.
+    pub(super) idle: bool,
+    /// Running without todos: nothing to count, so a segment slides along
+    /// the track instead of sections.
+    pub(super) indeterminate: bool,
+}
+
+/// A session's bar: live (running or waiting) in colour, a running one
+/// without todos as a single section; idle with todos as they were left,
+/// still and grey; idle without todos, none.
+pub(super) fn live_bar(row: &PickerRow) -> Option<LiveBar> {
+    let idle = !row.running && !row.waiting;
+    if idle && row.plan.is_none() {
+        return None;
+    }
+    let (sections, finished) = match &row.plan {
+        Some(d) => (
+            d.entries
+                .iter()
+                .map(|e| match e.status.as_str() {
+                    "completed" => BarSection::Done,
+                    "in_progress" => BarSection::Active,
+                    _ => BarSection::Pending,
+                })
+                .collect::<Vec<_>>(),
+            d.is_finished(),
+        ),
+        None => (vec![BarSection::Active], false),
+    };
+    let pulse = if row.waiting || idle {
+        BarPulse::None
+    } else if let Some(at) = sections.iter().position(|s| *s == BarSection::Active) {
+        BarPulse::Section(at)
+    } else {
+        BarPulse::Whole
+    };
+    Some(LiveBar {
+        sections,
+        pulse,
+        waiting: row.waiting,
+        finished,
+        idle,
+        indeterminate: row.plan.is_none() && !row.waiting,
+    })
+}
+
+/// Where the list's bars are in their motion at one moment.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct BarMotion {
+    /// Strength of the breathing section.
+    pub(super) alpha: f32,
+    /// Where the sliding segment is, 0 to 1 across its cycle.
+    pub(super) slide: f32,
+    /// Some bar moves: the next frame is wanted.
+    pub(super) animate: bool,
+}
+
+/// The motion of `rows`' bars at `now_ms`. The section being worked on
+/// breathes, all in one phase; with motion off (`moving` false: reduced
+/// motion or Low Power Mode) everything is still, the breathing section at a
+/// fixed strength and the sliding segment mid-track, and no frame is asked
+/// for.
+pub(super) fn bar_motion(rows: &[PickerRow], moving: bool, now_ms: f64) -> BarMotion {
+    if !moving {
+        return BarMotion {
+            alpha: PULSE_STILL,
+            slide: SLIDE_STILL,
+            animate: false,
+        };
+    }
+    BarMotion {
+        alpha: pulse_alpha(now_ms),
+        slide: ((now_ms % SLIDE_MS) / SLIDE_MS) as f32,
+        animate: rows
+            .iter()
+            .any(|r| live_bar(r).is_some_and(|b| b.pulse != BarPulse::None || b.indeterminate)),
+    }
+}
+
+/// Strength of the breathing section at `now_ms`: one slow breath between
+/// 40% and full, the same phase for every row.
+pub(super) fn pulse_alpha(now_ms: f64) -> f32 {
+    let phase = (now_ms % PULSE_MS) / PULSE_MS;
+    let wave = 0.5 - 0.5 * (phase * std::f64::consts::TAU).cos();
+    (0.4 + 0.6 * wave) as f32
+}
+
+/// The bar of `bar`, as wide as its parent: rounded at its two ends only, so
+/// the sections read as one capsule cut in parts. Colour means live: a
+/// running session is in the accent (done solid, the todo being worked on
+/// breathing, the rest faint), one waiting for the user in the warning
+/// colour, and an idle one in a dim grey well under the text.
+fn live_bar_element(bar: &LiveBar, ix: usize, look: RowLook, p: &Palette) -> Div {
+    let base = if bar.idle {
+        p.dim
+    } else if bar.waiting {
+        p.warn
+    } else {
+        p.accent
+    };
+    let (done, active, pending) = if bar.idle {
+        (base.opacity(0.55), base.opacity(0.35), base.opacity(0.16))
+    } else {
+        (base, base, base.opacity(0.22))
+    };
+    let track = |el: Div| el.h(px(BAR)).w_full().rounded_full().bg(pending);
+    if bar.indeterminate {
+        // Nothing to count: a segment slides along the track.
+        let left = look.slide * (1. + SLIDE_WIDTH) - SLIDE_WIDTH;
+        let (from, to) = (left.max(0.), (left + SLIDE_WIDTH).min(1.));
+        return track(div())
+            .debug_selector(move || format!("quick-pick-bar:{ix}"))
+            .relative()
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(relative(from))
+                    .w(relative((to - from).max(0.)))
+                    .rounded_full()
+                    .bg(active),
+            );
+    }
+    let n = bar.sections.len();
+    let el = if n > BAR_SECTIONS_MAX {
+        let done_n = bar
+            .sections
+            .iter()
+            .filter(|s| **s == BarSection::Done)
+            .count();
+        track(div()).child(
+            div()
+                .h_full()
+                .w(relative(done_n as f32 / n as f32))
+                .rounded_full()
+                .bg(done),
+        )
+    } else {
+        let gap = if n <= 12 { 2. } else { 1. };
+        h_flex()
+            .h(px(BAR))
+            .w_full()
+            .gap(px(gap))
+            .children(bar.sections.iter().enumerate().map(|(i, s)| {
+                let colour = match s {
+                    BarSection::Done => done,
+                    BarSection::Active if bar.pulse == BarPulse::Section(i) => {
+                        active.opacity(look.alpha)
+                    }
+                    BarSection::Active => active,
+                    BarSection::Pending => pending,
+                };
+                let state = match s {
+                    BarSection::Done => "done",
+                    BarSection::Active => "active",
+                    BarSection::Pending => "pending",
+                };
+                div()
+                    .debug_selector(move || format!("quick-pick-bar-section:{ix}:{i}:{state}"))
+                    .flex_1()
+                    .h_full()
+                    .bg(colour)
+                    .when(i == 0, |d| d.rounded_l_full())
+                    .when(i + 1 == n, |d| d.rounded_r_full())
+            }))
+    };
+    el.debug_selector(move || format!("quick-pick-bar:{ix}"))
+        .when(
+            bar.pulse == BarPulse::Whole || (n > BAR_SECTIONS_MAX && bar.pulse != BarPulse::None),
+            |e| e.opacity(look.alpha),
+        )
 }
 
 /// Height the open session picker needs besides the conversation: its

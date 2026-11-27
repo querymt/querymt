@@ -716,15 +716,6 @@ impl PlanDigest {
         Self::from_entries(&plan.entries)
     }
 
-    /// Share of completed entries, 0..=1.
-    pub fn fraction(&self) -> f32 {
-        if self.total == 0 {
-            0.0
-        } else {
-            self.done as f32 / self.total as f32
-        }
-    }
-
     pub fn is_finished(&self) -> bool {
         self.done == self.total
     }
@@ -781,7 +772,6 @@ mod plan_digest_tests {
         )])
         .unwrap();
         assert_eq!((digest.done, digest.total), (1, 4));
-        assert_eq!(digest.fraction(), 0.25);
         assert!(!digest.is_finished());
     }
 

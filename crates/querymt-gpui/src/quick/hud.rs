@@ -115,27 +115,10 @@ pub(crate) fn hud_palette(user: &Palette, glass: bool) -> Palette {
     }
 }
 
-/// Strength of the progress fill behind a picker row. Text lies over it,
-/// so it stays faint; the cards' bar uses the colour at full strength.
-pub(crate) const PROGRESS_FILL_ALPHA: f32 = 0.14;
-
-/// Colour of a session's progress: success once finished, the accent while
-/// it runs, dim otherwise. Full strength; rows lay [`PROGRESS_FILL_ALPHA`]
-/// of it down.
-pub(crate) fn progress_colour(p: &Palette, finished: bool, running: bool) -> Hsla {
-    if finished {
-        p.success
-    } else if running {
-        p.accent
-    } else {
-        p.dim
-    }
-}
-
 #[cfg(test)]
 mod tests {
     // Not `super::*`: the gpui glob brings a `test` macro that shadows `#[test]`.
-    use super::{PROGRESS_FILL_ALPHA, TINT, hud_palette, progress_colour};
+    use super::{TINT, hud_palette};
     use crate::quick::chrome::Chrome;
     use crate::theme::Palette;
     use gpui_kit::{Hsla, Rgba};
@@ -168,27 +151,6 @@ mod tests {
             a: 1.,
         }
         .into()
-    }
-
-    #[test]
-    fn row_text_keeps_its_contrast_over_the_progress_fill() {
-        for user in [Palette::light(), Palette::dark()] {
-            for glass in [false, true] {
-                let p = hud_palette(&user, glass);
-                for (finished, running) in [(true, false), (false, true), (false, false)] {
-                    let fill = progress_colour(&p, finished, running).opacity(PROGRESS_FILL_ALPHA);
-                    // The fill lies on the surface the picker is painted with.
-                    let under = over(fill, Hsla { a: 1., ..p.surface });
-                    for text in [p.text, p.muted] {
-                        let ratio = contrast(text, under);
-                        assert!(
-                            ratio >= 4.5,
-                            "glass={glass} finished={finished} running={running}: {ratio}"
-                        );
-                    }
-                }
-            }
-        }
     }
 
     // quick-panel / Overlays sit on the panel

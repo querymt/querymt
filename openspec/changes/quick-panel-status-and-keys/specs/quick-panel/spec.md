@@ -13,7 +13,32 @@ Cmd+K on macOS and Ctrl+K elsewhere SHALL open the panel's session list with its
 #### Scenario: Close it again
 - **GIVEN** the session list is open
 - **WHEN** the user presses Cmd/Ctrl+K
-- **THEN** the list closes and the composer has focus
+- **THEN** the list closes and the keyboard is on the composer when it is shown, and on the panel otherwise (a read-only conversation), so Esc and the shortcuts keep working
+
+### Requirement: Model picker by keyboard
+Cmd+M on macOS and Ctrl+M elsewhere SHALL open the model picker, and SHALL close it again when it is open, as Cmd/Ctrl+K does for the session list.
+
+#### Scenario: Cmd+M twice
+- **GIVEN** the model picker is open
+- **WHEN** the user presses Cmd/Ctrl+M
+- **THEN** the picker closes and the keyboard is on the composer when it is shown, and on the panel otherwise (a read-only conversation), so Esc and the shortcuts keep working
+
+### Requirement: One sheet at a time, and the keyboard never lost
+The session list, the model picker and the folder chooser SHALL take the conversation's place one at a time: opening one SHALL close any other and move the keyboard to the one opened. In any order of these keys, Esc SHALL close the open sheet and then the panel, and the panel's shortcuts SHALL keep working. The keyboard SHALL NOT be left on an element that is not shown.
+
+#### Scenario: Model picker, then session list
+- **GIVEN** the model picker is open
+- **WHEN** the user presses Cmd/Ctrl+K
+- **THEN** the model picker closes, the session list is open with its search focused, and Esc closes the list
+
+#### Scenario: Session list, then model picker
+- **GIVEN** the session list is open
+- **WHEN** the user presses Cmd/Ctrl+M
+- **THEN** the session list closes and the model picker is open
+
+#### Scenario: Alternating keys
+- **WHEN** the user presses Cmd/Ctrl+M and Cmd/Ctrl+K alternately, in a conversation or in a new quick chat
+- **THEN** at most one sheet is open after each key, the keyboard is inside the panel, and Esc, Esc closes the sheet and then the panel
 
 ### Requirement: New quick chat by keyboard
 Cmd+N on macOS and Ctrl+N elsewhere SHALL start a new quick chat in the panel, exactly as the header's new-chat button does, and SHALL NOT open the main window.
