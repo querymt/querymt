@@ -474,8 +474,8 @@ impl QuickPanel {
             picks,
         } = resume;
         // Under reduced motion GPUI draws the animation's last frame at once.
-        let chrome = chrome::install(window, !cx.reduce_motion(), palette(cx).dark)
-            .within_frame(window, cx);
+        let chrome =
+            chrome::install(window, !cx.reduce_motion(), palette(cx).dark).within_frame(window, cx);
         let hud = hud_palette(palette(cx), chrome.glass);
         let height = initial_height(session.is_some());
         // The window was opened at the panel's size; a frame drawn inside it
