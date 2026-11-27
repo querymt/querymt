@@ -23,7 +23,6 @@ async fn set_planning_context_preserves_custom_params() {
         let p = d.path().join("providers.toml");
         std::fs::write(&p, "providers = []\n").unwrap();
         // Leak the TempDir so the file stays alive for the test
-        let p = p;
         std::mem::forget(d);
         p
     };
