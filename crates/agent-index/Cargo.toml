@@ -75,4 +75,4 @@ tempfile = "3.0"
 tokio = { version = "1.0", features = ["full"] }
 serde_json.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-gix = { version = "0.90", default-features = false, features = ["basic", "worktree-mutation", "attributes", "sha1", "status", "merge"] }
+gix = { version = "0.91", default-features = false, features = ["basic", "worktree-mutation", "attributes", "sha1", "status", "merge"] }

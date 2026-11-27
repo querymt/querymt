@@ -58,7 +58,7 @@ imagesize = "0.15"
 indexmap = { version = "2", features = ["serde"] }
 fast_html2md = { package = "fast_html2md", version = "0.0.66", features = ["scraper"] }
 mdq = "0.10.0"
-gix = { version = "0.90", default-features = false, features = ["basic", "worktree-mutation", "attributes", "sha1", "status", "merge"] }
+gix = { version = "0.91", default-features = false, features = ["basic", "worktree-mutation", "attributes", "sha1", "status", "merge"] }
 gix-error = "0.5"
 dirs.workspace = true
 dunce = "1"

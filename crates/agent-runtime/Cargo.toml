@@ -91,7 +91,7 @@ sha2 = "0.11"
 infer = "0.22"
 gray_matter = "0.3"
 mdq = "0.10.0"
-gix = { version = "0.90", default-features = false, features = ["basic", "worktree-mutation", "attributes", "sha1", "status", "merge"] }
+gix = { version = "0.91", default-features = false, features = ["basic", "worktree-mutation", "attributes", "sha1", "status", "merge"] }
 dirs.workspace = true
 dunce = "1"
 opentelemetry = "0.33"
