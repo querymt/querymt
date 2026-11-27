@@ -407,6 +407,53 @@ fn descriptor_is_read_from_the_catalog() {
 }
 
 #[test]
+fn malformed_subcommand_entries_are_dropped() {
+    let mut core = SessionCore::new("s1");
+    core.apply(&[commands_update(json!([{
+        "name": "worktree",
+        "description": "Worktree",
+        "_meta": { "querymt": { "subcommands": [
+            { "name": "list", "description": "List the worktrees" },
+            { "description": "no name" },
+            { "name": "", "description": "empty name" },
+            { "name": "two words", "description": "whitespace" },
+            { "name": "list", "description": "duplicate" },
+            { "name": "status" }
+        ] } }
+    }]))]);
+    let subcommands = &core.header().available_commands[0].subcommands;
+    let read: Vec<(&str, &str)> = subcommands
+        .iter()
+        .map(|sub| (sub.name.as_str(), sub.description.as_str()))
+        .collect();
+    // The first `list` is kept; a missing description reads as empty.
+    assert_eq!(read, [("list", "List the worktrees"), ("status", "")]);
+}
+
+#[test]
+fn agent_without_subcommands() {
+    let mut core = SessionCore::new("s1");
+    core.apply(&[commands_update(json!([
+        { "name": "worktree", "description": "Worktree" },
+        {
+            "name": "compact",
+            "description": "Compact",
+            "_meta": { "querymt": { "source": "builtin" } }
+        },
+        {
+            "name": "explain",
+            "description": "Explain",
+            "_meta": { "querymt": { "subcommands": "list" } }
+        }
+    ]))]);
+    let commands = &core.header().available_commands;
+    assert_eq!(commands.len(), 3);
+    for command in commands {
+        assert!(command.subcommands.is_empty(), "{}", command.name);
+    }
+}
+
+#[test]
 fn catalog_without_descriptors() {
     let mut core = SessionCore::new("s1");
     core.apply(&[commands_update(json!([

@@ -24,24 +24,42 @@ impl AcceptedSubmission {
     }
 }
 
+/// One operation a command offers as its first argument, advertised as an
+/// element of `_meta.querymt.subcommands`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Subcommand {
+    /// One word, as typed after the command name.
+    pub name: &'static str,
+    /// One line for people.
+    pub description: &'static str,
+}
+
 /// The `_meta` of a catalog entry: `_meta.querymt` with the command's
-/// `source`, `effect`, `input` and `accepts`. Built-in and user-defined
-/// commands are described by the same four fields.
+/// `source`, `effect`, `input` and `accepts`, and its `subcommands` when it
+/// has any. Built-in and user-defined commands share these fields.
 pub fn descriptor_meta(
     source: SlashCommandSource,
     effect: SlashCommandEffect,
     input: ArgumentsNeed,
     accepts: &[AcceptedSubmission],
+    subcommands: &[Subcommand],
 ) -> Meta {
     let accepts: Vec<&str> = accepts.iter().map(|via| via.as_str()).collect();
+    let mut descriptor = serde_json::json!({
+        "source": source,
+        "effect": effect,
+        "input": input.as_str(),
+        "accepts": accepts,
+    });
+    if !subcommands.is_empty() {
+        descriptor["subcommands"] = subcommands
+            .iter()
+            .map(|sub| serde_json::json!({ "name": sub.name, "description": sub.description }))
+            .collect();
+    }
     Meta::from_iter([(
         crate::acp::shared::QUERYMT_META_NAMESPACE.to_owned(),
-        serde_json::json!({
-            "source": source,
-            "effect": effect,
-            "input": input.as_str(),
-            "accepts": accepts,
-        }),
+        descriptor,
     )])
 }
 
@@ -66,6 +84,7 @@ pub fn registry_to_acp_update(registry: &SlashCommandRegistry) -> AvailableComma
                 SlashCommandEffect::Prompt,
                 input,
                 &[AcceptedSubmission::Prompt, AcceptedSubmission::Queue],
+                &[],
             ))
         })
         .collect();
@@ -211,6 +230,46 @@ mod tests {
         assert_eq!(update.available_commands[0].name, "help");
         // No argument hint and no $ARGUMENTS in template
         assert!(update.available_commands[0].input.is_none());
+    }
+
+    #[test]
+    fn command_without_subcommands_omits_the_field() {
+        use crate::slash_commands::builtin::Builtin;
+        let mut registry = SlashCommandRegistry::new();
+        registry.register(make_command("review", "Review changes", Some("[scope]")));
+        registry.register(make_command("help", "Show help", None));
+        let update = registry_to_acp_update(&registry);
+        let mut commands = update.available_commands;
+        commands.push(Builtin::Compact.entry());
+        assert_eq!(commands.len(), 3);
+        for cmd in &commands {
+            let value = serde_json::to_value(cmd).unwrap();
+            let querymt = value["_meta"]["querymt"].as_object().expect("descriptor");
+            assert!(
+                !querymt.contains_key("subcommands"),
+                "{} must omit subcommands: {querymt:?}",
+                cmd.name
+            );
+        }
+    }
+
+    #[test]
+    fn descriptor_writes_subcommands_when_given() {
+        let meta = descriptor_meta(
+            querymt_agent_core::events::SlashCommandSource::Builtin,
+            SlashCommandEffect::Action,
+            ArgumentsNeed::Required,
+            &[AcceptedSubmission::Prompt],
+            &[Subcommand {
+                name: "list",
+                description: "List things",
+            }],
+        );
+        let value = serde_json::to_value(meta).unwrap();
+        assert_eq!(
+            value["querymt"]["subcommands"],
+            serde_json::json!([{ "name": "list", "description": "List things" }])
+        );
     }
 
     #[test]

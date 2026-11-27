@@ -51,6 +51,51 @@ fn complete(text: &str, name: &str) -> (String, u32) {
     (out, column)
 }
 
+/// The composer text and cursor after picking `subcommand` of `command`.
+/// An empty draft becomes `/command subcommand `. A draft that starts with a
+/// command word has that word replaced; when it was `command` itself and its
+/// next word is one of `known` subcommands or a prefix of one (a subcommand
+/// being typed), that word is replaced too, so `/worktree status ws-1`
+/// becomes `/worktree list ws-1`. What follows stays as the arguments. Any
+/// other draft becomes `/command subcommand <draft>`. The cursor ends after
+/// the subcommand for a replaced word and at the end of the text otherwise.
+fn complete_subcommand(
+    draft: &str,
+    command: &str,
+    subcommand: &str,
+    known: &[&str],
+) -> (String, Position) {
+    let command = command.trim_start_matches('/');
+    let head = format!("/{command} {subcommand}");
+    if draft.trim().is_empty() || !starts_with_command_word(draft) {
+        let text = if draft.trim().is_empty() {
+            format!("{head} ")
+        } else {
+            format!("{head} {draft}")
+        };
+        let end = end_position(&text);
+        return (text, end);
+    }
+    let first_end = draft.find(char::is_whitespace).unwrap_or(draft.len());
+    let (first, rest) = draft.split_at(first_end);
+    let mut args = rest;
+    if first.trim_start_matches('/') == command {
+        let after = rest.trim_start_matches([' ', '\t']);
+        let word_end = after.find(char::is_whitespace).unwrap_or(after.len());
+        let word = &after[..word_end];
+        if !word.is_empty() && known.iter().any(|name| name.starts_with(word)) {
+            args = &after[word_end..];
+        }
+    }
+    let column = head.chars().count() as u32 + 1;
+    let mut text = head;
+    if !args.starts_with([' ', '\t']) {
+        text.push(' ');
+    }
+    text.push_str(args);
+    (text, Position::new(0, column))
+}
+
 /// Whether `text` starts with a command being typed: `/` and a name-like
 /// first word. A first word with another `/` is a path (`/tmp/x`), and is
 /// part of the message, not a command name to replace.
@@ -213,6 +258,36 @@ impl SessionPane {
             let end = end_position(&text);
             (text, end)
         };
+        self.prompt.update(cx, |state, cx| {
+            state.set_value(text, window, cx);
+            // Moves the caret and focuses the composer.
+            state.set_cursor_position(cursor, window, cx);
+        });
+        self.slash_cursor = 0;
+        self.slash_dismissed = None;
+        cx.notify();
+    }
+
+    /// Put `/command subcommand ` in the composer with the focus, keeping the
+    /// draft as the arguments and replacing a subcommand already typed (see
+    /// [`complete_subcommand`]).
+    pub(crate) fn prefill_slash_subcommand(
+        &mut self,
+        command: &str,
+        subcommand: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let bare = command.trim_start_matches('/');
+        let known: Vec<String> = self
+            .slash_commands(cx)
+            .iter()
+            .find(|c| c.name.trim_start_matches('/') == bare)
+            .map(|c| c.subcommands.iter().map(|s| s.name.clone()).collect())
+            .unwrap_or_default();
+        let known: Vec<&str> = known.iter().map(String::as_str).collect();
+        let draft = self.prompt.read(cx).value().to_string();
+        let (text, cursor) = complete_subcommand(&draft, bare, subcommand, &known);
         self.prompt.update(cx, |state, cx| {
             state.set_value(text, window, cx);
             // Moves the caret and focuses the composer.
@@ -406,7 +481,7 @@ impl SessionPane {
 
 #[cfg(test)]
 mod pure_tests {
-    use super::{complete, hinted, slash_query, starts_with_command_word};
+    use super::{complete, complete_subcommand, hinted, slash_query, starts_with_command_word};
     use querymt_agent_session_core::view::SlashCommandView;
 
     fn command(name: &str, hint: Option<&str>) -> SlashCommandView {
@@ -418,6 +493,7 @@ mod pure_tests {
             effect: None,
             input: None,
             accepts: None,
+            subcommands: Vec::new(),
         }
     }
 
@@ -470,6 +546,65 @@ mod pure_tests {
         );
         // A bare or slash-prefixed name gives one slash.
         assert_eq!(complete("/c", "/compact"), ("/compact ".into(), 9));
+    }
+
+    const SUBS: [&str; 3] = ["create", "list", "status"];
+
+    /// `complete_subcommand` for `worktree list`, the cursor as (line, column).
+    fn subcommand(draft: &str) -> (String, (u32, u32)) {
+        let (text, cursor) = complete_subcommand(draft, "worktree", "list", &SUBS);
+        (text, (cursor.line, cursor.character))
+    }
+
+    #[test]
+    fn a_subcommand_is_put_after_the_command() {
+        assert_eq!(subcommand(""), ("/worktree list ".into(), (0, 15)));
+        assert_eq!(subcommand("  "), ("/worktree list ".into(), (0, 15)));
+        // A draft is kept as the arguments.
+        assert_eq!(
+            subcommand("feature-x"),
+            ("/worktree list feature-x".into(), (0, 24))
+        );
+        // A path is not a command word.
+        assert_eq!(
+            subcommand("/tmp/x"),
+            ("/worktree list /tmp/x".into(), (0, 21))
+        );
+    }
+
+    #[test]
+    fn a_typed_subcommand_is_replaced() {
+        let list_ws = ("/worktree list ws-1".to_owned(), (0, 15));
+        assert_eq!(subcommand("/worktree status ws-1"), list_ws);
+        assert_eq!(subcommand("/worktree   status ws-1"), list_ws);
+        // A prefix of a subcommand is a subcommand being typed.
+        assert_eq!(subcommand("/worktree st ws-1"), list_ws);
+        assert_eq!(
+            subcommand("/worktree st"),
+            ("/worktree list ".into(), (0, 15))
+        );
+        assert_eq!(subcommand("/worktree list ws-1"), list_ws);
+        // The lines after the first stay.
+        assert_eq!(
+            subcommand("/worktree status\nsecond"),
+            ("/worktree list \nsecond".into(), (0, 15))
+        );
+    }
+
+    #[test]
+    fn a_word_that_is_not_a_subcommand_is_kept() {
+        // `feature-x` is an argument, not a subcommand: nothing is replaced.
+        assert_eq!(
+            subcommand("/worktree feature-x"),
+            ("/worktree list feature-x".into(), (0, 15))
+        );
+        // The command word alone is replaced by the full command.
+        assert_eq!(subcommand("/wor"), ("/worktree list ".into(), (0, 15)));
+        // Another command's word is replaced; its arguments stay.
+        assert_eq!(
+            subcommand("/compact status"),
+            ("/worktree list status".into(), (0, 15))
+        );
     }
 
     #[test]

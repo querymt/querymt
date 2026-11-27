@@ -6,7 +6,7 @@ use crate::entry::{
     ToolCallEntry, UserMessage,
 };
 use crate::store::TurnHint;
-use crate::view::{CommandSubmission, PlanView, SlashCommandView};
+use crate::view::{CommandSubmission, PlanView, SlashCommandView, SlashSubcommandView};
 use querymt_agent_protocol_types::events::SlashCommandRecord;
 use querymt_agent_protocol_types::protocol::{
     AvailableCommand, AvailableCommandInput, CompactionStatus, CompactionSummaryChunk,
@@ -95,6 +95,39 @@ fn slash_commands(commands: &[AvailableCommand]) -> Vec<SlashCommandView> {
                         .filter_map(descriptor_value::<CommandSubmission>)
                         .collect()
                 }),
+            subcommands: subcommands(field("subcommands")),
+        });
+    }
+    out
+}
+
+/// The subcommands of a descriptor (`_meta.querymt.subcommands`). A value
+/// that is not a list is empty. An element without a non-empty `name`, or
+/// whose name contains whitespace, is dropped; the first of duplicate names is
+/// kept; a missing `description` is empty.
+fn subcommands(value: Option<&serde_json::Value>) -> Vec<SlashSubcommandView> {
+    let Some(values) = value.and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out: Vec<SlashSubcommandView> = Vec::with_capacity(values.len());
+    for value in values {
+        let Some(name) = value
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| !name.is_empty() && !name.contains(char::is_whitespace))
+        else {
+            continue;
+        };
+        if out.iter().any(|known| known.name == name) {
+            continue;
+        }
+        out.push(SlashSubcommandView {
+            name: name.to_owned(),
+            description: value
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
         });
     }
     out

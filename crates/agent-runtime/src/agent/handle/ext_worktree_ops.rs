@@ -167,7 +167,7 @@ struct WorktreeRecoverRequest {
 
 /// A parsed native command. Parsing is pure so every malformed input is
 /// rejected before any administration happens.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, strum::EnumCount)]
 enum NativeCommand {
     Create {
         include_local_changes: bool,
@@ -210,13 +210,33 @@ impl NativeCommand {
     /// `create`, `list`, `status` and `result` replies stay transient.
     fn durable_reply(&self) -> Option<&'static str> {
         match self {
-            Self::Publish(_) => Some("publish"),
-            Self::Archive(_) => Some("archive"),
-            Self::Remove { .. } => Some("remove"),
-            Self::Recover(_) => Some("recover"),
-            Self::Handoff(_) => Some("handoff"),
-            Self::Merge { .. } => Some("merge"),
+            Self::Publish(_)
+            | Self::Archive(_)
+            | Self::Remove { .. }
+            | Self::Recover(_)
+            | Self::Handoff(_)
+            | Self::Merge { .. } => Some(self.subcommand()),
             Self::Create { .. } | Self::List | Self::Status(_) | Self::Result(_) => None,
+        }
+    }
+
+    /// The name this command is typed and advertised as, the first word of
+    /// `/worktree`'s arguments. Exhaustive on purpose: a new variant must be
+    /// named here. The derived variant count then makes the test
+    /// `advertised_subcommands_are_accepted` fail until the variant is also
+    /// listed in `WORKTREE_SUBCOMMANDS`.
+    fn subcommand(&self) -> &'static str {
+        match self {
+            Self::Create { .. } => "create",
+            Self::Handoff(_) => "handoff",
+            Self::List => "list",
+            Self::Status(_) => "status",
+            Self::Result(_) => "result",
+            Self::Publish(_) => "publish",
+            Self::Merge { .. } => "merge",
+            Self::Remove { .. } => "remove",
+            Self::Recover(_) => "recover",
+            Self::Archive(_) => "archive",
         }
     }
 
@@ -1569,6 +1589,34 @@ mod native_command_tests {
     fn parse(line: &str) -> Result<NativeCommand, WorktreeOpError> {
         let words: Vec<String> = line.split_whitespace().map(str::to_owned).collect();
         NativeCommand::parse(&words)
+    }
+
+    #[test]
+    fn advertised_subcommands_are_accepted() {
+        use crate::slash_commands::builtin::WORKTREE_SUBCOMMANDS;
+        use strum::EnumCount as _;
+        // The count is derived, so a new variant fails here until it is
+        // advertised.
+        assert_eq!(
+            WORKTREE_SUBCOMMANDS.len(),
+            NativeCommand::COUNT,
+            "every NativeCommand variant is advertised, and nothing else"
+        );
+        for sub in WORKTREE_SUBCOMMANDS {
+            // The minimal arguments each operation needs.
+            let line = match sub.name {
+                "recover" => "recover ws-1".to_owned(),
+                name => name.to_owned(),
+            };
+            let parsed = parse(&line).unwrap_or_else(|err| {
+                panic!("`/worktree {line}` is advertised but rejected: {err}")
+            });
+            assert_eq!(parsed.subcommand(), sub.name);
+        }
+        let mut names: Vec<&str> = WORKTREE_SUBCOMMANDS.iter().map(|sub| sub.name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), WORKTREE_SUBCOMMANDS.len(), "names are unique");
     }
 
     #[test]

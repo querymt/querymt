@@ -190,6 +190,23 @@ pub struct SlashCommandView {
     /// client picks its fallback from `None`. Elements this core does not
     /// know are dropped.
     pub accepts: Option<Vec<CommandSubmission>>,
+    /// The operations the command offers as its first argument
+    /// (`_meta.querymt.subcommands`), in the agent's order. Empty when the
+    /// agent sent none: absent and empty mean the same here. Entries without
+    /// a usable name are dropped and the first of duplicate names is kept.
+    #[serde(default)]
+    pub subcommands: Vec<SlashSubcommandView>,
+}
+
+/// One operation of a slash command, such as `list` of `/worktree`.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlashSubcommandView {
+    /// One word, as typed after the command name.
+    pub name: String,
+    /// One line for people. Empty when the agent sent none.
+    pub description: String,
 }
 
 /// What a slash command asks of the user's input.
