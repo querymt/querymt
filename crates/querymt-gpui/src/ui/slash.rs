@@ -51,6 +51,16 @@ fn complete(text: &str, name: &str) -> (String, u32) {
     (out, column)
 }
 
+/// Whether `text` starts with a command being typed: `/` and a name-like
+/// first word. A first word with another `/` is a path (`/tmp/x`), and is
+/// part of the message, not a command name to replace.
+fn starts_with_command_word(text: &str) -> bool {
+    let first = text.split(char::is_whitespace).next().unwrap_or("");
+    first
+        .strip_prefix('/')
+        .is_some_and(|word| !word.contains('/'))
+}
+
 /// The cursor position after the last character of `text`.
 fn end_position(text: &str) -> Position {
     let line = text.matches('\n').count() as u32;
@@ -179,8 +189,9 @@ impl SessionPane {
 
     /// Put `/name ` in the composer with the focus, keeping the draft as
     /// the command's arguments (design D7): an empty composer becomes
-    /// `/name `, a draft whose first word is `/word` has that word replaced,
-    /// any other draft becomes `/name <draft>`. The cursor ends up after the
+    /// `/name `, a draft whose first word is `/word` (a command being typed,
+    /// not a path such as `/tmp/x`) has that word replaced, any other draft
+    /// becomes `/name <draft>`. The cursor ends up after the
     /// name for a replaced word and at the end of the text otherwise.
     pub(crate) fn prefill_slash(
         &mut self,
@@ -194,7 +205,7 @@ impl SessionPane {
             let text = format!("/{name} ");
             let end = end_position(&text);
             (text, end)
-        } else if draft.starts_with('/') {
+        } else if starts_with_command_word(&draft) {
             let (text, column) = complete(&draft, name);
             (text, Position::new(0, column))
         } else {
@@ -395,7 +406,7 @@ impl SessionPane {
 
 #[cfg(test)]
 mod pure_tests {
-    use super::{complete, hinted, slash_query};
+    use super::{complete, hinted, slash_query, starts_with_command_word};
     use querymt_agent_session_core::view::SlashCommandView;
 
     fn command(name: &str, hint: Option<&str>) -> SlashCommandView {
@@ -430,6 +441,18 @@ mod pure_tests {
         // A cursor inside a multi-byte character is not a position.
         assert_eq!(slash_query("/é", 2), None);
         assert_eq!(slash_query("/é", 3), Some("é"));
+    }
+
+    #[test]
+    fn a_path_is_not_a_command_word() {
+        assert!(starts_with_command_word("/"));
+        assert!(starts_with_command_word("/expl"));
+        assert!(starts_with_command_word("/compact keep the plan"));
+        assert!(starts_with_command_word("/compact\nmore"));
+        assert!(!starts_with_command_word("/tmp/build.log is empty"));
+        assert!(!starts_with_command_word("/tmp/"));
+        assert!(!starts_with_command_word("closures in Rust"));
+        assert!(!starts_with_command_word(" /compact"));
     }
 
     #[test]

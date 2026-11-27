@@ -167,6 +167,11 @@ Picking an available command whose input is `none` or `optional` SHALL submit `/
 - **WHEN** the user picks `explain…` from the palette
 - **THEN** the composer contains `/explain closures in Rust` with the cursor at the end
 
+#### Scenario: Draft that starts with a path
+- **GIVEN** the composer holds the draft `/tmp/build.log is empty`
+- **WHEN** the user picks `explain…` from the palette
+- **THEN** the composer contains `/explain /tmp/build.log is empty` with the cursor at the end
+
 #### Scenario: Palette command during a running turn
 - **GIVEN** a turn is running on an agent that can queue input
 - **WHEN** the user picks a command without input that accepts queueing

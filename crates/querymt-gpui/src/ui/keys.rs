@@ -1682,6 +1682,35 @@ mod tests {
         .unwrap();
     }
 
+    #[gpui_kit::test]
+    fn a_path_draft_becomes_the_arguments(cx: &mut TestAppContext) {
+        let rig = rig(
+            cx,
+            Page::Session,
+            Some(session_with(described_commands())),
+            |_| {},
+        );
+        cx.update_window(rig.handle, |_, window, cx| {
+            let prompt = rig.app.read(cx).pane.read(cx).prompt.clone();
+            prompt.update(cx, |s, cx| {
+                s.set_value("/tmp/build.log is empty", window, cx)
+            });
+        })
+        .unwrap();
+        let target = target_of(&groups(cx, &rig), "explain…");
+        pick(cx, &rig, target);
+        assert!(sent(&rig).is_empty());
+        cx.update_window(rig.handle, |_, _, cx| {
+            let state = rig.app.read(cx).pane.read(cx).prompt.clone();
+            let state = state.read(cx);
+            // The path is part of the message, not a command name to replace.
+            assert_eq!(state.value().as_ref(), "/explain /tmp/build.log is empty");
+            let c = state.cursor_position();
+            assert_eq!((c.line, c.character), (0, 32), "cursor at the end");
+        })
+        .unwrap();
+    }
+
     fn press_tab(cx: &mut TestAppContext, rig: &Rig) {
         cx.update_window(rig.handle, |_, window, cx| window.press("tab", cx))
             .unwrap();

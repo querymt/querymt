@@ -6,7 +6,7 @@ See proposal.md for the motivation. Paths are relative to `crates/querymt-gpui`,
 
 - **Catalog in the app.** `SessionView.slash_commands` (`src/session.rs`) holds `querymt_agent_session_core::view::SlashCommandView { name, description, input_hint }`. `SessionPane::slash_commands` (`src/ui/slash.rs`) returns it, or nothing for a read-only session.
 - **Palette.** `App::palette_groups` (`src/ui/keys.rs`) builds `PaletteTarget::SlashCommand { name, takes_input: input_hint.is_some() }`. `App::run_palette` sets `palette_open = false` before it looks at the target. `SessionPane::run_slash_command` then fills the composer or sends; when the session is not ready it does neither.
-- **Readiness.** `SessionPane::session_ready` (`src/ui/session_view.rs`) is one boolean: connected, not read-only, loaded, no load error, and a running turn can be controlled. `send_session_prompt` returns silently when it is false.
+- **Readiness.** Before this change `SessionPane::session_ready` (`src/ui/session_view.rs`) was one boolean: connected, not read-only, loaded, no load error, and a running turn can be controlled. `send_session_prompt` returned silently when it was false.
 - **Delivery.** `OpenSession::send` (`src/session/open.rs`) queues any text that starts with `/` while a turn runs, and otherwise follows the caller's `Delivery`. `SessionPane.delivery` defaults to steer.
 - **Kit.** gpui-component 0.11 `Command`:
   - binds Esc, Enter, Up and Down only;
@@ -48,17 +48,19 @@ See proposal.md for the motivation. Paths are relative to `crates/querymt-gpui`,
 
 ### D3. Readiness returns a reason
 
-- `SessionPane::readiness(command: Option<&SlashCommandView>, cx) -> Result<(), Blocked>` replaces the body of `session_ready`, which becomes `readiness(None, cx).is_ok()`.
+- `SessionPane::readiness(command: Option<&SlashCommandView>, cx) -> Result<(), Blocked>` replaces `session_ready`, which is removed: once the palette and `send_session_prompt` call `readiness`, it has no callers left.
+- `Blocked` is defined in `src/ui/session_pane.rs`, with `Blocked::reason()` giving the copy.
 - Checks, in order:
 
   | Condition | `Blocked` | Copy |
   | --- | --- | --- |
   | agent not connected | `NotConnected` | "Agent not connected" |
+  | session is read-only | `ReadOnly` | "Session is read-only" |
   | session loading | `Loading` | "Session is loading" |
   | load error | `LoadFailed` | "Session could not be loaded" |
   | turn running and it cannot be controlled, or the command does not accept queueing | `TurnRunning` | "Available when the turn ends" |
 
-- A read-only session keeps listing no commands (`SessionPane::slash_commands`), so it needs no reason.
+- `ReadOnly` keeps the check total, so every condition that used to make `session_ready` false has a reason. No list shows it: a read-only session keeps listing no commands (`SessionPane::slash_commands`), and a typed prompt in it shows no reason (only a blocked command does).
 - `send_session_prompt` calls `readiness(recognise(text), cx)`. When it is blocked and the text is a command, the text stays and the reason shows in the composer's hint row (`slash_hint` / `render_slash_hint`), which already sits under the composer.
 
 ### D4. Unavailable palette rows stay selectable
@@ -82,18 +84,18 @@ See proposal.md for the motivation. Paths are relative to `crates/querymt-gpui`,
 ### D6. Enter, Tab and the key hint
 
 - Enter and click on an available row: `None` and `Optional` submit; `Required` prefills.
-- Tab: `capture_key_down` on the palette card. For an unmodified Tab it resolves the highlighted target (`CommandState::selected_index` into the groups `filter_palette(self.palette_groups(cx), query)` gives, the same ones `palette_view` renders) and:
+- Tab: the palette's search field binds Tab to the input's `IndentInline` action, and actions run before key-down listeners. The palette card therefore captures `IndentInline` (`capture_action`), and also an unmodified Tab with `capture_key_down` for a keymap that does not bind it; both stop propagation. Either way it resolves the highlighted target (`CommandState::selected_index` into the groups `filter_palette(self.palette_groups(cx), query)` gives, the same ones `palette_view` renders) and:
   - on an available slash row with `Optional` or `Required` input, prefills and closes the palette;
   - on any other row, stops the key and does nothing, so focus cannot leave the search field.
-- Key hint: `Command::footer` renders "Enter to run · Tab to add arguments" with kit `Kbd` while the highlighted target is an available slash row with `Optional` input. `Command::on_select` notifies `App` so the footer follows the highlight.
+- Key hint: `Command::footer` renders "Enter to run · Tab to add arguments" with kit `Kbd` while the highlighted target is an available slash row with `Optional` input. The footer closure receives the `CommandState` at render and reads `selected_index()` from it, so it follows the highlight without an `on_select` callback.
 - Alternative considered: a tooltip on the row. Rejected: the palette is driven from the keyboard, and a hover tooltip is not seen.
 
 ### D7. Prefill keeps the draft
 
-- `SessionPane::run_slash_command(name, input, window, cx)` prefills through one helper:
+- `SessionPane::run_slash_command(name, input, window, cx)` and Tab prefill through one helper, `SessionPane::prefill_slash`:
   - an empty composer becomes `/name `;
-  - a draft whose first word is `/word` has that word replaced (the existing `complete`);
-  - any other draft becomes the arguments: `/name <draft>`.
+  - a draft whose first word is `/` plus a word without another `/` (a command being typed, such as `/expl` or `/compact keep`) has that word replaced (the existing `complete`);
+  - any other draft becomes the arguments: `/name <draft>`. That includes a draft that starts with a path: `/tmp/build.log is empty` becomes `/explain /tmp/build.log is empty`, so the path is not lost.
 - Submitting (`None`, `Optional`) leaves the composer's draft untouched, as today.
 
 ## Risks / Trade-offs
