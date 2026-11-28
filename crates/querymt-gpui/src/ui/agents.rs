@@ -333,7 +333,7 @@ impl QmtApp {
             .min_w_0()
             .child(
                 div()
-                    .text_size(px(13.4))
+                    .text_size(kit::rpx(13.4))
                     .font_semibold()
                     .truncate()
                     .child(c.name.clone()),
@@ -359,14 +359,17 @@ impl QmtApp {
             .text_color(p.muted)
             .child(
                 div()
-                    .font_family(kit::MONO)
+                    .font_family(kit::mono_family(cx))
                     .truncate()
                     .child(c.endpoint_label()),
             )
             .when_some(host, |el, h| el.child("·").child(format!("on {h}")))
             .when_some(version, |el, v| {
-                el.child("·")
-                    .child(div().font_family(kit::MONO).child(format!("v{v}")))
+                el.child("·").child(
+                    div()
+                        .font_family(kit::mono_family(cx))
+                        .child(format!("v{v}")),
+                )
             });
 
         let stat = |value: String, label: &'static str, color: Hsla| {
@@ -375,7 +378,7 @@ impl QmtApp {
                 .items_end()
                 .child(
                     div()
-                        .font_family(kit::MONO)
+                        .font_family(kit::mono_family(cx))
                         .text_sm()
                         .font_semibold()
                         .text_color(color)
@@ -1083,7 +1086,7 @@ impl QmtApp {
                         .min_w_0()
                         .text_sm()
                         .truncate()
-                        .when(mono, |el| el.font_family(kit::MONO))
+                        .when(mono, |el| el.font_family(kit::mono_family(cx)))
                         .child(value),
                 )
         };
@@ -1340,7 +1343,7 @@ impl QmtApp {
                                     .child(
                                         div()
                                             .text_xs()
-                                            .font_family(kit::MONO)
+                                            .font_family(kit::mono_family(cx))
                                             .text_color(p.dim)
                                             .truncate()
                                             .child(last.map_or_else(

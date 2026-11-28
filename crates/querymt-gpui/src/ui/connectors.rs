@@ -52,7 +52,7 @@ pub(super) fn oauth_flow_box(
         .bg(subtle(p).1)
         .child(
             div()
-                .text_size(px(11.8))
+                .text_size(kit::rpx(11.8))
                 .text_color(p.muted)
                 .child(if flow.needs_code {
                     "A browser window opened. After approving, paste the callback URL or code here."
@@ -243,7 +243,7 @@ impl QmtApp {
                                     .child(
                                         div()
                                             .truncate()
-                                            .text_size(px(13.4))
+                                            .text_size(kit::rpx(13.4))
                                             .font_semibold()
                                             .text_color(p.text)
                                             .child(server.mcp_server().to_string()),
@@ -251,7 +251,7 @@ impl QmtApp {
                                     .child(
                                         div()
                                             .mt(px(3.2))
-                                            .text_size(px(12.))
+                                            .text_size(kit::rpx(12.))
                                             .text_color(p.muted)
                                             .child(if connected {
                                                 "Signed in"

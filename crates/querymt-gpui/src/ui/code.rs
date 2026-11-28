@@ -218,6 +218,8 @@ fn code_card(
     flat: bool,
     theme: &Arc<HighlightTheme>,
     p: &Palette,
+    mono: &SharedString,
+    scale: f32,
 ) -> (AnyElement, usize) {
     let lines = HighlightedLines::new(text, lang, theme);
     let shown = lines.len().min(clamp);
@@ -228,7 +230,8 @@ fn code_card(
         .max()
         .map_or(1, |n| n.to_string().len())
         .max(2);
-    let gutter = px(width as f32 * 7.5 + 16.);
+    // The digits are as wide as the code size makes them.
+    let gutter = px(width as f32 * 7.5 * scale + 16.);
     let rows = (0..shown).map(|ix| {
         h_flex()
             .w_full()
@@ -276,10 +279,12 @@ fn code_card(
                 .w_full()
                 .when(!flat, |el| el.py_2())
                 // Flat: fixed rows so the attached card's scroll height maps to lines.
-                .when(flat, |el| el.py_1p5().line_height(px(18.)))
+                .when(flat, |el| {
+                    el.py_1p5().line_height(kit::mono_px_at(scale, 18.))
+                })
                 .when(!numbered, |el| el.pl_3())
-                .font_family(kit::MONO)
-                .text_xs()
+                .font_family(mono.clone())
+                .text_size(kit::mono_px_at(scale, 12.))
                 .children(rows),
         )
         .into_any_element();
@@ -300,6 +305,7 @@ pub fn read_line_count(output: &str) -> usize {
 
 /// `flat` renders only the code, borderless, to fill a card attached to the
 /// tool header (the tool's own notes like "(File has more lines…)" are dropped).
+#[allow(clippy::too_many_arguments)]
 pub fn read_output(
     id: &str,
     output: &str,
@@ -308,6 +314,8 @@ pub fn read_output(
     flat: bool,
     theme: &Arc<HighlightTheme>,
     p: &Palette,
+    mono: &SharedString,
+    scale: f32,
 ) -> Div {
     let segments = segments(output);
     // A header naming a file sets the language of the code that follows it.
@@ -337,8 +345,8 @@ pub fn read_output(
                 if !flat {
                     body = body.child(
                         pad(div())
-                            .text_xs()
-                            .font_family(kit::MONO)
+                            .text_size(kit::mono_px_at(scale, 12.))
+                            .font_family(mono.clone())
                             .text_color(p.dim)
                             .truncate()
                             .child(text.clone()),
@@ -355,6 +363,8 @@ pub fn read_output(
                     flat,
                     theme,
                     p,
+                    mono,
+                    scale,
                 );
                 budget -= shown;
                 // Flat: separate the code of several files/ranges with a rule.

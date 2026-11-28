@@ -116,7 +116,7 @@ fn card_btn(
         .border_color(border)
         .bg(bg)
         .text_color(fg)
-        .text_size(px(13.1))
+        .text_size(kit::rpx(13.1))
         .font_weight(FontWeight(550.))
         .child(label.into())
         .map(|el| {
@@ -203,7 +203,7 @@ fn option_row(
                 .gap(px(2.))
                 .child(
                     div()
-                        .text_size(px(14.))
+                        .text_size(kit::rpx(14.))
                         .font_weight(if custom {
                             FontWeight(450.)
                         } else {
@@ -227,7 +227,7 @@ fn or_divider(t: &Tones, p: &Palette) -> Div {
         .child(div().flex_1().h(px(1.)).bg(t.subtle))
         .child(
             div()
-                .text_size(px(11.2))
+                .text_size(kit::rpx(11.2))
                 .font_medium()
                 .text_color(p.dim)
                 .child("OR"),
@@ -449,7 +449,7 @@ impl RequestCards {
             let text = format!("{}{}", field.label, if field.required { " *" } else { "" });
             if flat {
                 div()
-                    .text_size(px(12.8))
+                    .text_size(kit::rpx(12.8))
                     .font_semibold()
                     .text_color(p.text)
                     .child(text)
@@ -764,7 +764,7 @@ impl RequestCards {
                 .px(px(12.))
                 .rounded(px(8.))
                 .bg(t.pill)
-                .text_size(px(12.))
+                .text_size(kit::rpx(12.))
                 .font_weight(FontWeight(550.))
                 .text_color(p.text)
                 .cursor_pointer()
@@ -859,8 +859,9 @@ impl RequestCards {
                         .bg(p.bg)
                         .border_1()
                         .border_color(p.border)
-                        .font_family(kit::MONO)
-                        .text_xs()
+                        // A code block (the command asked about): the code size.
+                        .font_family(kit::mono_family(cx))
+                        .text_size(kit::mono_px(cx, 12.))
                         .child(summary.clone())
                         .into_any_element(),
                 );

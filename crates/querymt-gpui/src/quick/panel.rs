@@ -39,6 +39,12 @@ use crate::ui::{Density, RunLabels, SessionPane, SessionPaneEvent, SmoothScroll,
 /// Width of the panel window.
 pub(crate) const WIDTH: f32 = 680.;
 /// Height of a new quick chat: its bar, one line of text (design D15).
+///
+/// This and the other text-sized constants below (`BAR_TEXT`, `BAR_LINE`,
+/// `LABEL_TEXT`, `LABEL_HEIGHT`, `HEADER_HEIGHT`, `PICKER_CHROME`,
+/// `PICKER_ROW`) are design pixels at the default 16 px rem. Drawing lays them
+/// out with [`kit::rpx`]; the estimates made before a layout multiply them by
+/// [`kit::rem_scale`].
 pub(super) const BAR_HEIGHT: f32 = 64.;
 /// Size of the text typed into the bar.
 const BAR_TEXT: f32 = 18.;
@@ -302,8 +308,12 @@ fn window_kinds(_compositor: &str) -> Vec<WindowKind> {
 }
 
 /// The height the panel opens at.
-fn initial_height(session: bool) -> f32 {
-    if session { MIN_HEIGHT } else { BAR_HEIGHT }
+fn initial_height(session: bool, scale: f32) -> f32 {
+    if session {
+        MIN_HEIGHT
+    } else {
+        BAR_HEIGHT * scale
+    }
 }
 
 /// The panel's height in the window as the window is now: once GPUI has
@@ -432,7 +442,7 @@ pub(super) fn open_window(
     cx: &mut App,
 ) -> Result<(AnyWindowHandle, Entity<QuickPanel>)> {
     let mut last = None;
-    let height = initial_height(resume.session.is_some());
+    let height = initial_height(resume.session.is_some(), kit::rem_scale(cx));
     for kind in window_kinds(cx.compositor_name()) {
         let movable = movable(&kind);
         let positions = store.read(cx).prefs.quick.positions.clone();
@@ -477,7 +487,7 @@ impl QuickPanel {
         let chrome =
             chrome::install(window, !cx.reduce_motion(), palette(cx).dark).within_frame(window, cx);
         let hud = hud_palette(palette(cx), chrome.glass);
-        let height = initial_height(session.is_some());
+        let height = initial_height(session.is_some(), kit::rem_scale(cx));
         // The window was opened at the panel's size; a frame drawn inside it
         // needs the window larger by the frame.
         if chrome.framed {
@@ -923,15 +933,20 @@ impl QuickPanel {
     pub(crate) fn new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Back to the bar, shown once the window has the bar's height.
         self.settling = None;
-        self.resize_then(BAR_HEIGHT, window, cx, |this, window, cx| {
-            this.launching = None;
-            this.open_after_launch = false;
-            this.error = None;
-            this.picks.mode = None;
-            this.pane.update(cx, |pane, cx| pane.clear(cx));
-            // Closes any sheet and focuses the composer.
-            this.switch_sheet(Sheet::None, window, cx);
-        });
+        self.resize_then(
+            BAR_HEIGHT * kit::rem_scale(cx),
+            window,
+            cx,
+            |this, window, cx| {
+                this.launching = None;
+                this.open_after_launch = false;
+                this.error = None;
+                this.picks.mode = None;
+                this.pane.update(cx, |pane, cx| pane.clear(cx));
+                // Closes any sheet and focuses the composer.
+                this.switch_sheet(Sheet::None, window, cx);
+            },
+        );
         cx.notify();
     }
 
@@ -962,14 +977,19 @@ impl QuickPanel {
         };
         // What is open takes the conversation's place, under the header; in a
         // new quick chat it lies above the bar, which holds the border.
-        let around = if shown { HEADER_HEIGHT + BORDER } else { bar };
+        let scale = kit::rem_scale(cx);
+        let around = if shown {
+            HEADER_HEIGHT * scale + BORDER
+        } else {
+            bar
+        };
         let placed = |measured: Option<f32>, estimate: f32| match measured {
             Some(h) => h.ceil() + around,
-            None => estimate + if shown { 0. } else { BAR_HEIGHT },
+            None => estimate + if shown { 0. } else { BAR_HEIGHT * scale },
         };
         let sessions = if self.sheet == Sheet::Sessions {
             let (search, rows) = (self.list_search_h.get(), self.list_rows_h.get());
-            let estimate = picker_height(self.picker_layout(cx), self.picker_rows(cx).len());
+            let estimate = picker_height(self.picker_layout(cx), self.picker_rows(cx).len(), scale);
             placed((rows > 0.).then_some(search + rows), estimate)
         } else {
             self.list_search_h.set(0.);
@@ -1168,6 +1188,7 @@ impl QuickPanel {
             self.height_floor(cx),
             self.display_height(window, cx),
             pane.session().is_some(),
+            kit::rem_scale(cx),
         );
         ((wanted - self.height).abs() >= 0.5).then_some(wanted)
     }
@@ -1728,7 +1749,7 @@ impl QuickPanel {
             .id("quick-header")
             .debug_selector(|| "quick-header".into())
             .flex_none()
-            .h(px(HEADER_HEIGHT))
+            .h(kit::rpx(HEADER_HEIGHT))
             .px_3()
             .gap_1()
             .items_center()
@@ -1814,7 +1835,7 @@ impl QuickPanel {
                                 el.child(
                                     div()
                                         .debug_selector(|| "quick-context-percent".into())
-                                        .font_family(kit::MONO)
+                                        .font_family(kit::mono_family(cx))
                                         .text_xs()
                                         .text_color(colour)
                                         .child(format!("{:.0}%", fraction * 100.)),
@@ -1851,7 +1872,7 @@ impl QuickPanel {
                 .debug_selector(move || id.into())
                 .occlude()
                 .flex_none()
-                .h(px(LABEL_HEIGHT))
+                .h(kit::rpx(LABEL_HEIGHT))
                 .px(px(LABEL_PAD))
                 .items_center()
                 .rounded(px(6.))
@@ -2478,7 +2499,7 @@ impl QuickPanel {
                 .debug_selector(move || id.into())
                 .occlude()
                 .flex_none()
-                .h(px(LABEL_HEIGHT))
+                .h(kit::rpx(LABEL_HEIGHT))
                 .gap_1()
                 .px(px(LABEL_PAD))
                 .items_center()
@@ -2527,7 +2548,7 @@ impl QuickPanel {
                             .id("quick-agent")
                             .debug_selector(|| "quick-agent".into())
                             .flex_none()
-                            .h(px(LABEL_HEIGHT))
+                            .h(kit::rpx(LABEL_HEIGHT))
                             .px(px(LABEL_PAD))
                             .flex()
                             .items_center()
@@ -2647,13 +2668,13 @@ impl QuickPanel {
                     // The kit's input paints in the app theme's foreground
                     // (gpui-kit 0.11), which is dark in a light app theme.
                     .text_color(p.text)
-                    .text_size(px(BAR_TEXT))
-                    .line_height(px(BAR_LINE)),
+                    .text_size(kit::rpx(BAR_TEXT))
+                    .line_height(kit::rpx(BAR_LINE)),
             );
         // The input owns the width; the launch spinner is at its trailing end.
         let input_row = h_flex()
             .w_full()
-            .min_h(px(BAR_LINE))
+            .min_h(kit::rpx(BAR_LINE))
             .items_center()
             .gap_2()
             .child(input)
@@ -2675,11 +2696,11 @@ impl QuickPanel {
         let label_row = h_flex()
             .w_full()
             .ml(px(BAR_TEXT_INSET - LABEL_PAD))
-            .h(px(LABEL_HEIGHT))
+            .h(kit::rpx(LABEL_HEIGHT))
             .items_center()
             .gap(px(2.))
-            .text_size(px(LABEL_TEXT))
-            .line_height(px(LABEL_HEIGHT))
+            .text_size(kit::rpx(LABEL_TEXT))
+            .line_height(kit::rpx(LABEL_HEIGHT))
             .children(labels)
             .child(div().flex_1().min_w_0())
             .child(picker_button);
@@ -2696,7 +2717,7 @@ impl QuickPanel {
                 cx.listener(|this, _, window, _| this.start_drag(window)),
             )
             .w_full()
-            .min_h(px(BAR_HEIGHT - 2.))
+            .min_h(kit::rpx(BAR_HEIGHT - 2.))
             .pt(px(7.))
             .pb(px(5.))
             .gap(px(2.))
@@ -3176,13 +3197,18 @@ pub(super) fn fitted_height(
     floor: f32,
     display: f32,
     shown: bool,
+    scale: f32,
 ) -> f32 {
     let cap = (display * DISPLAY_SHARE).clamp(MIN_HEIGHT, MAX_HEIGHT);
     // An overlay is never clipped, even on a small display.
     let floor = floor.min(display * OVERLAY_SHARE);
     let limit = cap.max(floor);
     // What this state is at least tall, and what steps count from.
-    let least = if shown { MIN_HEIGHT } else { BAR_HEIGHT };
+    let least = if shown {
+        MIN_HEIGHT
+    } else {
+        BAR_HEIGHT * scale
+    };
     let wanted = if shown {
         current + overflow.max(0.)
     } else {
@@ -3456,12 +3482,16 @@ fn live_bar_element(bar: &LiveBar, ix: usize, look: RowLook, p: &Palette) -> Div
 /// Height the open session picker needs besides the conversation: its
 /// chrome and `rows` sessions, in a column (list) or two (grid). Always room
 /// for one, for the empty message.
-pub(super) fn picker_height(layout: PickerLayout, rows: usize) -> f32 {
+///
+/// `scale` is the rem size over 16 px ([`kit::rem_scale`]): the chrome and
+/// list rows are sized to their text, so they grow with it. The grid's cards
+/// are fixed-size tiles and do not.
+pub(super) fn picker_height(layout: PickerLayout, rows: usize, scale: f32) -> f32 {
     let rows = rows.max(1);
     match layout {
-        PickerLayout::List => PICKER_CHROME + rows as f32 * PICKER_ROW,
+        PickerLayout::List => (PICKER_CHROME + rows as f32 * PICKER_ROW) * scale,
         PickerLayout::Grid => {
-            PICKER_CHROME + rows.div_ceil(GRID_COLUMNS) as f32 * (GRID_CARD + GRID_GAP)
+            PICKER_CHROME * scale + rows.div_ceil(GRID_COLUMNS) as f32 * (GRID_CARD + GRID_GAP)
         }
     }
 }

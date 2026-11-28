@@ -182,7 +182,7 @@ pub(super) fn section(text: &'static str, p: &Palette) -> Div {
         .px_2()
         .pt_3()
         .pb_1()
-        .text_size(px(11.))
+        .text_size(kit::rpx(11.))
         .font_medium()
         .text_color(p.dim)
         .child(text.to_uppercase())
@@ -492,7 +492,7 @@ impl QmtApp {
                         .pt_3()
                         .pb_1()
                         .pr_2()
-                        .text_size(px(11.))
+                        .text_size(kit::rpx(11.))
                         .text_color(p.dim)
                         .child(open_total.to_string()),
                 )

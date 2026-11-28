@@ -924,7 +924,7 @@ impl QmtApp {
             Level::Debug | Level::Trace => p.muted,
             _ => p.text,
         };
-        let row = row_shell(("log-row", seq), open, tint, &p)
+        let row = row_shell(("log-row", seq), open, tint, &p, cx)
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_log_row(ix, seq, cx)))
             .child(time_cell(e.at_ms, &p))
             .child(
@@ -998,6 +998,7 @@ impl QmtApp {
             open,
             failed.then(|| p.danger.opacity(0.07)),
             &p,
+            cx,
         )
         .on_click(cx.listener(move |this, _, _, cx| this.toggle_log_row(ix, seq, cx)))
         .child(time_cell(e.at_ms, &p))
@@ -1119,6 +1120,7 @@ impl QmtApp {
                         None,
                         false,
                         &p,
+                        cx,
                     ))
                 })
                 .child(body_block(
@@ -1129,6 +1131,7 @@ impl QmtApp {
                     Some(request.2),
                     false,
                     &p,
+                    cx,
                 ))
                 .when_some(
                     reply.zip(reply_text),
@@ -1141,6 +1144,7 @@ impl QmtApp {
                             Some(raw),
                             error,
                             &p,
+                            cx,
                         ))
                     },
                 )
@@ -1169,6 +1173,7 @@ fn row_shell(
     open: bool,
     tint: Option<Hsla>,
     p: &Palette,
+    cx: &App,
 ) -> Stateful<Div> {
     let hover = p.card_hover;
     h_flex()
@@ -1180,7 +1185,7 @@ fn row_shell(
         .py(px(2.))
         .rounded(px(6.))
         .cursor_pointer()
-        .font_family(kit::MONO)
+        .font_family(kit::mono_family(cx))
         .text_xs()
         .when_some(tint, |el, t| el.bg(t))
         .when(open, |el| el.bg(p.card))
@@ -1199,6 +1204,7 @@ fn time_cell(at_ms: f64, p: &Palette) -> Div {
 
 /// One message of an opened event: a title, the JSON, and a copy button
 /// that takes the message as kept.
+#[allow(clippy::too_many_arguments)]
 fn body_block(
     id: (&'static str, u64),
     title: String,
@@ -1207,6 +1213,7 @@ fn body_block(
     raw: Option<String>,
     error: bool,
     p: &Palette,
+    cx: &App,
 ) -> Div {
     v_flex()
         .gap_1()
@@ -1229,8 +1236,8 @@ fn body_block(
                 .p_2()
                 .rounded(px(6.))
                 .bg(p.card)
-                .font_family(kit::MONO)
-                .text_xs()
+                .font_family(kit::mono_family(cx))
+                .text_size(kit::mono_px(cx, 12.))
                 .text_color(p.text)
                 .child(text),
         )

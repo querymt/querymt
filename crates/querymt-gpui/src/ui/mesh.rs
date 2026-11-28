@@ -174,7 +174,7 @@ impl QmtApp {
                         .text_lg()
                         .font_semibold()
                         .text_color(color)
-                        .when(mono, |el| el.font_family(kit::MONO))
+                        .when(mono, |el| el.font_family(kit::mono_family(cx)))
                         .child(value),
                 )
         };
@@ -187,7 +187,7 @@ impl QmtApp {
             h_flex()
                 .gap_1p5()
                 .child(div().font_semibold().text_color(p.muted).child(label))
-                .child(div().font_family(kit::MONO).child(value))
+                .child(div().font_family(kit::mono_family(cx)).child(value))
         };
         let summary = v_flex()
             .gap_2()
@@ -266,7 +266,7 @@ impl QmtApp {
                             .gap_1p5()
                             .child(kit::dot(if ok { p.success } else { p.warn }).size(px(6.)))
                             .child(div().font_semibold().text_color(p.muted).child("Relay"))
-                            .child(div().font_family(kit::MONO).child(host))
+                            .child(div().font_family(kit::mono_family(cx)).child(host))
                     })),
             );
 
@@ -281,7 +281,7 @@ impl QmtApp {
                         .min_w_0()
                         .child(
                             div()
-                                .text_size(px(13.4))
+                                .text_size(kit::rpx(13.4))
                                 .font_semibold()
                                 .child("Show remote sessions"),
                         )
@@ -380,7 +380,9 @@ impl QmtApp {
                                         .text_xs()
                                         .text_color(p.muted)
                                         .child(
-                                            div().font_family(kit::MONO).child(short_peer(&n.id)),
+                                            div()
+                                                .font_family(kit::mono_family(cx))
+                                                .child(short_peer(&n.id)),
                                         )
                                         .child(kit::copy_button(
                                             kit::keyed("copy-node", n.id.clone()),
@@ -427,7 +429,7 @@ impl QmtApp {
                                 .min_w_0()
                                 .child(
                                     div()
-                                        .text_size(px(13.4))
+                                        .text_size(kit::rpx(13.4))
                                         .font_semibold()
                                         .child("Invite created"),
                                 )
@@ -435,7 +437,7 @@ impl QmtApp {
                                     div()
                                         .mt(px(3.2))
                                         .text_xs()
-                                        .font_family(kit::MONO)
+                                        .font_family(kit::mono_family(cx))
                                         .text_color(p.muted)
                                         .truncate()
                                         .child(url.clone()),
@@ -549,7 +551,9 @@ impl QmtApp {
                                         .text_xs()
                                         .text_color(p.muted)
                                         .child(
-                                            div().font_family(kit::MONO).child(short_peer(&i.id)),
+                                            div()
+                                                .font_family(kit::mono_family(cx))
+                                                .child(short_peer(&i.id)),
                                         )
                                         .child(kit::copy_button(
                                             kit::keyed("copy-invite-id", id.clone()),
