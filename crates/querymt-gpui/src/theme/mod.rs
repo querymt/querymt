@@ -9,7 +9,7 @@ use gpui_kit::component::{Theme, ThemeMode, ThemeRegistry};
 use gpui_kit::{App, Global, Hsla, px, rgb, rgba};
 
 pub use accent::{Accent, Appearance, Preset};
-pub use catalogue::{ThemeId, syntax};
+pub use catalogue::{ThemeId, midpoint, syntax};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Palette {

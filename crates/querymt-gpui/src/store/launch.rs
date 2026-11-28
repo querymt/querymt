@@ -578,6 +578,22 @@ pub(crate) fn add_models_for_test(store: &mut AgentsStore, models: Value) {
         .extend(super::parse_models(&json!({ "models": models })));
 }
 
+/// The fixture agent's mesh: `(id, label)` per node.
+#[cfg(test)]
+pub(crate) fn set_mesh_nodes_for_test(store: &mut AgentsStore, nodes: &[(&str, &str)]) {
+    let rt = store.runtime.get_mut("test-agent").expect("fixture agent");
+    rt.mesh_nodes = nodes
+        .iter()
+        .map(|(id, label)| super::MeshNode {
+            id: (*id).into(),
+            label: (*label).into(),
+            active_sessions: 0,
+            capabilities: vec![],
+            transport: "iroh".into(),
+        })
+        .collect();
+}
+
 #[cfg(test)]
 mod tests {
     // Not `super::*`: GPUI's prelude brings its own `test` attribute.

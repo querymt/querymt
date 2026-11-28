@@ -715,7 +715,13 @@ pub fn page(content: impl IntoIterator<Item = AnyElement>) -> Div {
 /// Desktop `--subtle-border` / `--subtle-surface`.
 pub fn subtle(p: &Palette) -> (Hsla, Hsla) {
     if p.dark {
-        (hsla(0., 0., 1., 0.075), rgb(0x222222).into())
+        // Desktop's `#222222` sits halfway between the built-in dark `bg`
+        // (#1b1b1b) and `card` (#292929); deriving it keeps other themes'
+        // tiles and row hovers in their own hue instead of neutral grey.
+        (
+            hsla(0., 0., 1., 0.075),
+            crate::theme::midpoint(p.bg, p.card),
+        )
     } else {
         (
             Hsla::from(rgb(0x241f31)).opacity(0.09),
@@ -1077,69 +1083,116 @@ fn boot_mark_nodes() -> [Point<f32>; 18] {
 }
 
 /// The desktop Start page's static mark, with themed peers and an accent-colored Q.
-pub fn boot_mark(size: f32, p: &Palette) -> impl IntoElement {
-    let nodes = boot_mark_nodes();
-    let p = *p;
-    canvas(
-        |_, _, _| {},
-        move |bounds, _, window, _| {
-            // Match the SVG's -164 -164 328 328 viewbox and brand rotation.
-            let scale = f32::from(bounds.size.width) / 328.;
-            let (sin, cos) = 14.906_842_f32.to_radians().sin_cos();
-            let transform = |pt: Point<f32>| {
-                bounds.center()
-                    + point(
-                        px((pt.x * cos - pt.y * sin) * scale),
-                        px((pt.x * sin + pt.y * cos) * scale),
-                    )
-            };
-            for (i, a) in nodes.iter().enumerate() {
-                for b in &nodes[i + 1..] {
-                    if (a.x - b.x).hypot(a.y - b.y) < 65. {
-                        let mut link = PathBuilder::stroke(px(1.4 * scale));
-                        link.move_to(transform(*a));
-                        link.line_to(transform(*b));
-                        if let Ok(path) = link.build() {
-                            window.paint_path(path, p.border_strong.opacity(0.6));
-                        }
+/// One paint layer of the boot mark, served as an SVG asset under `path`.
+/// GPUI draws SVGs as alpha masks in a single tint, so the multi-colour mark
+/// is a stack of masks painted bottom-up (the order of `ALL`).
+#[derive(Clone, Copy)]
+enum BootMarkLayer {
+    Links,
+    Peers,
+    PeerEdges,
+    Logo,
+}
+
+impl BootMarkLayer {
+    const ALL: [Self; 4] = [Self::Links, Self::Peers, Self::PeerEdges, Self::Logo];
+
+    fn path(self) -> &'static str {
+        match self {
+            Self::Links => "brand/boot-mark-links.svg",
+            Self::Peers => "brand/boot-mark-peers.svg",
+            Self::PeerEdges => "brand/boot-mark-peer-edges.svg",
+            Self::Logo => "brand/boot-mark-logo.svg",
+        }
+    }
+
+    fn tint(self, p: &Palette) -> Hsla {
+        match self {
+            Self::Links => p.border_strong.opacity(0.6),
+            Self::Peers => p.card_hover,
+            Self::PeerEdges => p.border_strong,
+            Self::Logo => p.accent,
+        }
+    }
+
+    /// The layer's SVG: same viewbox, rotation and geometry as BootMark.svelte.
+    fn svg(self) -> String {
+        use std::fmt::Write as _;
+        let nodes = boot_mark_nodes();
+        let polygon = |out: &mut String, center: Point<f32>, hex: &[(f32, f32); 6]| {
+            let points: Vec<String> = hex
+                .iter()
+                .map(|(x, y)| format!("{:.3},{:.3}", center.x + x, center.y + y))
+                .collect();
+            let _ = write!(out, r#"<polygon points="{}"/>"#, points.join(" "));
+        };
+        let mut body = String::new();
+        let attrs = match self {
+            Self::Links => {
+                for (i, a) in nodes.iter().enumerate() {
+                    for b in nodes[i + 1..]
+                        .iter()
+                        .filter(|b| (a.x - b.x).hypot(a.y - b.y) < 65.)
+                    {
+                        let _ = write!(
+                            body,
+                            r#"<line x1="{:.3}" y1="{:.3}" x2="{:.3}" y2="{:.3}"/>"#,
+                            a.x, a.y, b.x, b.y
+                        );
                     }
                 }
+                r##"fill="none" stroke="#fff" stroke-width="1.4""##
             }
-            // Opaque hexagons cover the links, matching BootMark's paint order.
-            for (i, center) in nodes.iter().enumerate() {
-                let logo = i < 7;
-                let vertices = if logo {
-                    &BOOT_MARK_LOGO_HEX
+            Self::Peers | Self::PeerEdges => {
+                for center in &nodes[7..] {
+                    polygon(&mut body, *center, &BOOT_MARK_PEER_HEX);
+                }
+                if matches!(self, Self::Peers) {
+                    r##"fill="#fff""##
                 } else {
-                    &BOOT_MARK_PEER_HEX
-                };
-                let mut fill = PathBuilder::fill();
-                let mut stroke = PathBuilder::stroke(px(scale));
-                for (j, &(x, y)) in vertices.iter().enumerate() {
-                    let pt = transform(*center + point(x, y));
-                    if j == 0 {
-                        fill.move_to(pt);
-                        stroke.move_to(pt);
-                    } else {
-                        fill.line_to(pt);
-                        stroke.line_to(pt);
-                    }
-                }
-                fill.close();
-                if let Ok(path) = fill.build() {
-                    window.paint_path(path, if logo { p.accent } else { p.card_hover });
-                }
-                if !logo {
-                    stroke.close();
-                    if let Ok(path) = stroke.build() {
-                        window.paint_path(path, p.border_strong);
-                    }
+                    r##"fill="none" stroke="#fff" stroke-width="1""##
                 }
             }
-        },
-    )
-    .flex_none()
-    .size(px(size))
+            Self::Logo => {
+                for center in &nodes[..7] {
+                    polygon(&mut body, *center, &BOOT_MARK_LOGO_HEX);
+                }
+                r##"fill="#fff""##
+            }
+        };
+        format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="-164 -164 328 328"><g transform="rotate(14.90684242)" {attrs}>{body}</g></svg>"#
+        )
+    }
+}
+
+/// Bytes of a boot-mark layer asset, for the app's `AssetSource`.
+pub fn boot_mark_asset(path: &str) -> Option<&'static [u8]> {
+    static LAYERS: std::sync::LazyLock<[(&'static str, String); 4]> =
+        std::sync::LazyLock::new(|| BootMarkLayer::ALL.map(|layer| (layer.path(), layer.svg())));
+    LAYERS
+        .iter()
+        .find(|(p, _)| *p == path)
+        .map(|(_, svg)| svg.as_bytes())
+}
+
+/// The desktop Start page's static mark, with themed peers and an accent-colored Q.
+/// Rasterised from SVG layers (like the mobile app) rather than painted as
+/// canvas paths, so edges are antialiased and the hairline links stay visible.
+pub fn boot_mark(size: f32, p: &Palette) -> impl IntoElement {
+    div()
+        .flex_none()
+        .relative()
+        .size(px(size))
+        .children(BootMarkLayer::ALL.map(|layer| {
+            svg()
+                .path(layer.path())
+                .absolute()
+                .top_0()
+                .left_0()
+                .size(px(size))
+                .text_color(layer.tint(p))
+        }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1797,6 +1850,47 @@ mod tests {
             [5, 5, 5, 5, 5, 5, 4, 3, 4, 3, 4, 3, 4, 3, 4, 3, 4, 3]
         );
         assert_eq!(degrees.iter().sum::<usize>() / 2, 36);
+    }
+
+    #[test]
+    fn boot_mark_layers_are_served_as_svg_assets() {
+        let text = |path: &str| {
+            std::str::from_utf8(super::boot_mark_asset(path).expect(path))
+                .unwrap()
+                .to_owned()
+        };
+        let count = |svg: &str, tag: &str| svg.matches(tag).count();
+        assert_eq!(count(&text("brand/boot-mark-links.svg"), "<line "), 36);
+        assert_eq!(count(&text("brand/boot-mark-peers.svg"), "<polygon "), 11);
+        assert_eq!(
+            count(&text("brand/boot-mark-peer-edges.svg"), "<polygon "),
+            11
+        );
+        assert_eq!(count(&text("brand/boot-mark-logo.svg"), "<polygon "), 7);
+        assert!(super::boot_mark_asset("brand/boot-mark-nope.svg").is_none());
+    }
+
+    #[test]
+    fn subtle_surface_keeps_the_desktop_grey_and_follows_other_themes() {
+        let dark = crate::theme::Palette::dark();
+        let (_, surface) = super::subtle(&dark);
+        let expected: gpui_kit::Hsla = gpui_kit::rgb(0x222222).into();
+        let (a, b) = (
+            gpui_kit::Rgba::from(surface),
+            gpui_kit::Rgba::from(expected),
+        );
+        assert!(
+            (a.r - b.r).abs() < 0.003 && (a.g - b.g).abs() < 0.003 && (a.b - b.b).abs() < 0.003
+        );
+        // A tinted theme's surface is tinted, not the built-in grey.
+        let teal = crate::theme::Palette {
+            bg: gpui_kit::rgb(0x002b36).into(),
+            card: gpui_kit::rgb(0x073642).into(),
+            ..dark
+        };
+        let (_, surface) = super::subtle(&teal);
+        let s = gpui_kit::Rgba::from(surface);
+        assert!(s.b > s.r + 0.1, "{s:?}");
     }
 }
 

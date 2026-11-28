@@ -1990,6 +1990,25 @@ impl AgentsStore {
         self.runtime.get(id)
     }
 
+    /// Display name of the mesh node serving `m` on `agent`: the catalog's
+    /// label, else the mesh's label of that node, else the short peer id
+    /// (as the Mesh page shows it). `None` for the agent's own models.
+    pub fn model_node_name(&self, agent: &str, m: &Model) -> Option<String> {
+        let id = m.node_id.as_deref()?;
+        m.node
+            .as_deref()
+            .filter(|label| !label.is_empty() && *label != id)
+            .map(str::to_owned)
+            .or_else(|| {
+                self.runtime(agent)?
+                    .mesh_nodes
+                    .iter()
+                    .find(|n| n.id == id && !n.label.is_empty())
+                    .map(|n| n.label.clone())
+            })
+            .or_else(|| Some(crate::util::short_peer(id)))
+    }
+
     pub fn state(&self, id: &str) -> ConnState {
         self.runtime
             .get(id)

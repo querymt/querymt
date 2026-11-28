@@ -14,13 +14,7 @@ use crate::util::now_ms;
 pub const INVITE_TTLS: [(&str, &str); 3] =
     [("1h", "1 hour"), ("24h", "24 hours"), ("168h", "7 days")];
 
-/// `12D3KooWPtRj...unWZUT62`
-pub fn short_peer(id: &str) -> String {
-    if id.len() <= 24 {
-        return id.to_string();
-    }
-    format!("{}...{}", &id[..12], &id[id.len() - 8..])
-}
+pub use crate::util::short_peer;
 
 fn epoch_ms(t: f64) -> f64 {
     if t > 1e12 { t } else { t * 1000. }

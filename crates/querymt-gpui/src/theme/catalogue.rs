@@ -270,7 +270,7 @@ fn opaque(fg: Hsla, bg: Hsla) -> Hsla {
 }
 
 /// The per-channel sRGB average of two opaque colours.
-fn midpoint(a: Hsla, b: Hsla) -> Hsla {
+pub fn midpoint(a: Hsla, b: Hsla) -> Hsla {
     let (a, b) = (Rgba::from(a), Rgba::from(b));
     Rgba {
         r: (a.r + b.r) / 2.,
