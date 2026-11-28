@@ -2557,6 +2557,7 @@ the raw versus effective argument rules.</p>
 <a id="__codelineno-13-11" name="__codelineno-13-11"></a><span class="w">  </span><span class="p">}</span>
 <a id="__codelineno-13-12" name="__codelineno-13-12"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
+<p>The <code>pre_delegation</code> command input includes the <code>delegate</code> call's fields (<code>target_agent_id</code>, <code>objective</code>, <code>context</code>, <code>constraints</code>, <code>expected_output</code>) and <code>handoff_from</code>: the earlier delegation whose worktree the delegate takes over by ownership handoff, or <code>null</code>. <code>handoff_from</code> is read-only. A hook can block a handoff delegation but <code>updated_delegation</code> cannot change it, and a handoff always runs isolated whatever <code>updated_delegation.isolation</code> says.</p>
 <p><code>pre_delegation</code> is the only delegation hook that can change behavior. If it blocks, QueryMT rewrites the delegate tool result so the model sees <code>Delegation blocked by hook: ...</code> instead of the original queued message.</p>
 <h3 id="delegation_start-planning-context">delegation_start planning context</h3>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-14-1">1</a></span>

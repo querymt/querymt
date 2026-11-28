@@ -1651,6 +1651,23 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="1. Delegation Request">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#running-in-an-earlier-delegates-worktree-handoff_from" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Running in an earlier delegate's worktree: <code>handoff_from</code>
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
         
           <li class="md-nav__item">
@@ -2888,7 +2905,7 @@ notification as an invalidation hint and call <code>querymt/agents/list</code> f
 <h2 id="delegation-lifecycle">Delegation Lifecycle</h2>
 <h3 id="1-delegation-request">1. Delegation Request</h3>
 <p>The planner decides to delegate and creates a delegation request.</p>
-<p>If hooks are enabled, <code>pre_delegation</code> runs before the delegation is recorded. It can block the delegation entirely or rewrite fields such as <code>target_agent_id</code>, <code>objective</code>, <code>context</code>, <code>constraints</code>, <code>expected_output</code>, and <code>isolation</code>.</p>
+<p>If hooks are enabled, <code>pre_delegation</code> runs before the delegation is recorded. It can block the delegation entirely or rewrite fields such as <code>target_agent_id</code>, <code>objective</code>, <code>context</code>, <code>constraints</code>, <code>expected_output</code>, and <code>isolation</code>. The hook input also carries the request's <code>handoff_from</code> (or <code>null</code>); it is read-only.</p>
 <p>The planner-side tool result is updated when a delegation is blocked, so the model sees <code>Delegation blocked by hook: ...</code> instead of a misleading queued message.</p>
 <p>The delegation request shape is:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-15-1"> 1</a></span>
@@ -2917,6 +2934,16 @@ notification as an invalidation hint and call <code>querymt/agents/list</code> f
 </code></pre></div></td></tr></table></div>
 <p><code>isolation</code> is the resolved execution-workspace policy: <code>shared</code> (legacy behavior — the delegate runs in the parent's checkout) or <code>isolated</code> (a private managed Git worktree seeded from the parent's current code state; see <a href="../worktrees/">Git Worktree Workspaces</a>). The <code>delegate</code> tool accepts an optional <code>isolation</code> argument (<code>inherit</code> | <code>isolated</code> | <code>shared</code>); <code>inherit</code> resolves from the parent session — isolated parents isolate every delegate by default, local parents keep shared execution. Explicit <code>shared</code> overrides on isolated parents are disclosed as shared execution, and a requested isolation that cannot be satisfied fails the delegation instead of falling back to sharing.</p>
 <p>Each <code>[[delegates]]</code> entry may also set <code>isolation = "inherit" | "isolated" | "shared"</code> (default <code>inherit</code>) — the configured analogue of the tool argument. Precedence is: an explicit non-<code>inherit</code> value on the <code>delegate</code> tool call, then the target delegate's configured value, then inheritance from the parent session's execution mode. The resolved policy and where it came from (<code>request</code>, <code>delegate_config</code> or <code>inherited</code>) are persisted with the delegation and disclosed in the tool result. <code>isolated</code> requires <code>[agent.workspace] enabled = true</code> and is rejected at load/build time otherwise. See <a href="../worktrees/">Git Worktree Workspaces</a>.</p>
+<h4 id="running-in-an-earlier-delegates-worktree-handoff_from">Running in an earlier delegate's worktree: <code>handoff_from</code></h4>
+<p>The <code>delegate</code> tool also accepts an optional <code>handoff_from</code>: the id of an earlier <strong>isolated</strong> delegation of the same session. The new delegate then runs in <em>that delegation's existing worktree</em>, with its edits present, instead of a new or shared checkout. Ownership of the worktree moves to the new delegate session before it runs (the same compare-and-swap transfer as <code>/worktree handoff</code>), the previous owner becomes read-only (<code>owner_transferred</code>), and no worktree is allocated: files, branch, index, baseline and earlier results are unchanged. This is how a <code>reviewer</code> takes over a <code>coder</code>'s work and fixes it in place.</p>
+<ul>
+<li><code>handoff_from</code> is a string and cannot be combined with <code>isolation = "shared"</code> (rejected as an invalid request; nothing is queued). It always resolves to isolated execution.</li>
+<li>The delegation <strong>fails before the delegate runs</strong>, leaving ownership, files and the previous owner's access unchanged and allocating nothing, when the id is unknown (error names the id), was not made by this session (<code>not_parent_session</code>), has no isolated worktree (<code>no_isolated_workspace</code>, for example a shared delegation), the worktree is not ready (<code>workspace_not_ready</code>), its owner has a running turn or queued input, or its delegation has not ended yet (verification, summary and result capture run after the delegate's turn) (<code>owner_active</code>; the owner is never interrupted), or is not hosted locally (<code>owner_not_local</code>). The failure text names the code.</li>
+<li>A worktree keeps the name of the delegation that created it. Pass that id (the first one) as <code>handoff_from</code> for every later round, and to <code>accept_delegation_result</code>; the id of a delegation that itself ran by handoff has no worktree of its own. The completion text of a delegate that ran by handoff tells you which id to accept with. Acceptance requires the run that published the result to be complete, so the latest result of a completed reviewer is accepted even if the coder that created the worktree failed or was cancelled.</li>
+<li>The delegate session starts without copied history (pass what it needs in <code>context</code>). It is a delegate of the requesting session (fork origin <code>delegation</code>), hidden from listings like every delegate.</li>
+<li><code>handoff_from</code> is carried on the <code>delegation_requested</code> event and, read-only, in the <code>pre_delegation</code> hook input. A hook can block a handoff but cannot redirect it. The tool result discloses that the delegate runs in the existing worktree of that delegation.</li>
+</ul>
+<p>See <a href="../worktrees/#delegating-to-a-successor-handoff_from">Delegating to a successor</a> for the sequence and failure handling.</p>
 <h3 id="2-session-creation">2. Session Creation</h3>
 <p>The orchestrator creates a new session for the delegate:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-16-1">1</a></span>

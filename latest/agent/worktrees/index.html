@@ -1614,6 +1614,34 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#delegation-startup-spans" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Delegation startup spans
+      </span>
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Delegation startup spans">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#what-baseline-capture-reads" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        What baseline capture reads
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#resuming-and-loading" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
@@ -1686,6 +1714,17 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#delegating-to-a-successor-handoff_from" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Delegating to a successor (<code>handoff_from</code>)
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -1710,6 +1749,23 @@
       </span>
     </span>
   </a>
+  
+    <nav class="md-nav" aria-label="Undo, snapshots, and workspace references">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#linked-snapshot-store-of-a-managed-workspace" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Linked snapshot store of a managed workspace
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
   
 </li>
       
@@ -2876,6 +2932,139 @@ boundary can be replayed from the recorded state instead of guessing:</p>
   provisioned and durably bound workspace becomes runnable, and a pending
   isolated fork still cannot load or resume as local execution.</li>
 </ul>
+<h2 id="delegation-startup-spans">Delegation startup spans</h2>
+<p>Starting an isolated delegate has no hidden time: every phase between the
+<code>delegate</code> tool call and the delegate's first prompt is a named <code>tracing</code> span,
+exported with the rest of your OpenTelemetry traces. Each span records the
+counts that explain its duration, so a slow start can be read off the trace.
+There are no per-file spans.</p>
+<pre class="mermaid"><code>flowchart TD
+  H[delegation.orchestrator.handle_event]
+  H --&gt; CL[delegation.claim]
+  H --&gt; QW[delegation.queue_wait]
+  H --&gt; EX[delegation.execute]
+  EX --&gt; AD[delegation.admission]
+  EX --&gt; RP[delegation.resolve_parent]
+  EX --&gt; AW[delegation.allocate_workspace]
+  EX --&gt; SH[delegation.start_hook]
+  EX --&gt; CS[delegation.create_session]
+  EX --&gt; SU[delegation.summarize]
+  EX --&gt; IP[delegation.inject_planning_context]
+  AW --&gt; LW[worktree.lock.wait]
+  AW --&gt; CA[worktree.capture]
+  CA --&gt; CM[worktree.capture.manifest]
+  AW --&gt; PR[worktree.provision]
+  PR --&gt; LW2[worktree.lock.wait]
+  PR --&gt; CO[worktree.checkout]</code></pre>
+<p><code>delegation.queue_wait</code> is a sibling of <code>delegation.execute</code>, not a child: the
+parallel slot is acquired before execution starts. <code>worktree.*</code> spans nest under
+whichever span is active when the worktree service runs, normally
+<code>delegation.allocate_workspace</code>. The tree above shows one run; a lock wait
+appears wherever a lock is taken (batch lock and mutation gate during baseline
+capture, admin lock during provisioning).</p>
+<table>
+<thead>
+<tr>
+<th>Span</th>
+<th>Parent</th>
+<th>Fields</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>delegation.claim</code></td>
+<td><code>delegation.orchestrator.handle_event</code></td>
+<td><code>attempts</code>: claim attempts</td>
+</tr>
+<tr>
+<td><code>delegation.queue_wait</code></td>
+<td><code>delegation.orchestrator.handle_event</code></td>
+<td>— (the duration is the wait for a <code>max_parallel</code> slot)</td>
+</tr>
+<tr>
+<td><code>delegation.admission</code></td>
+<td><code>delegation.execute</code></td>
+<td><code>authority</code>: <code>local</code>, or <code>peer</code> for a delegation admitted for a remote peer (the <code>remote</code> feature)</td>
+</tr>
+<tr>
+<td><code>delegation.resolve_parent</code></td>
+<td><code>delegation.execute</code></td>
+<td><code>bound</code>; only present for a fresh isolated delegation</td>
+</tr>
+<tr>
+<td><code>delegation.allocate_workspace</code></td>
+<td><code>delegation.execute</code></td>
+<td><code>workspace_id</code>, <code>handoff</code> (<code>true</code> when the delegate takes over an existing workspace)</td>
+</tr>
+<tr>
+<td><code>delegation.start_hook</code></td>
+<td><code>delegation.execute</code></td>
+<td><code>contexts</code>: contexts returned by the <code>delegation_start</code> hook</td>
+</tr>
+<tr>
+<td><code>delegation.create_session</code></td>
+<td><code>delegation.execute</code></td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>delegation.summarize</code></td>
+<td><code>delegation.execute</code></td>
+<td><code>history_messages</code>, <code>summary_bytes</code>, <code>strategy</code>, <code>outcome</code> (<code>injected</code>, <code>rejected</code>, <code>timeout</code> or <code>skipped</code>)</td>
+</tr>
+<tr>
+<td><code>delegation.inject_planning_context</code></td>
+<td><code>delegation.execute</code></td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>worktree.lock.wait</code></td>
+<td>the caller</td>
+<td><code>lock</code> (<code>batch</code>, <code>admin</code> or <code>gate</code>), <code>checkout</code> (gate only: the checkout the gate guards), <code>polls</code>; the duration is the time spent waiting</td>
+</tr>
+<tr>
+<td><code>worktree.capture</code></td>
+<td>the caller</td>
+<td><code>attempts</code>, <code>files_read</code>, <code>bytes_read</code>, <code>objects_written</code>, <code>reused_index_entries</code>, <code>racy_rehashed</code></td>
+</tr>
+<tr>
+<td><code>worktree.capture.manifest</code></td>
+<td><code>worktree.capture</code></td>
+<td><code>paths</code>: paths fingerprinted</td>
+</tr>
+<tr>
+<td><code>worktree.provision</code></td>
+<td>the caller</td>
+<td><code>workspace_id</code></td>
+</tr>
+<tr>
+<td><code>worktree.checkout</code></td>
+<td><code>worktree.provision</code></td>
+<td><code>files</code>: files checked out</td>
+</tr>
+</tbody>
+</table>
+<p><code>delegation.summarize</code> records an <code>outcome</code> so a summary that was discarded (for
+example cut off by its token limit) is visible in the trace. Spans of a
+long-running parent can reach the trace backend after their children, so a
+running session may show children whose parent span has not been exported yet.</p>
+<h3 id="what-baseline-capture-reads">What baseline capture reads</h3>
+<p>A <code>current_working_tree</code> baseline (always used for delegates) reads only what
+changed. A tracked file whose stat data matches its real-index entry, and which
+is not racily clean, reuses the entry's object id and is not opened. Modified
+and untracked files, entries with special index flags, files whose
+attributes or configuration convert content, and anything else that cannot be
+proven unchanged are read. An index entry is reused only when its blob's size
+equals the file's size, so blobs normalised under earlier settings (for example
+a <code>core.autocrlf</code> that has since been turned off) are read again. An object the
+repository already holds is not written again. The baseline still contains the raw working bytes and on-disk
+modes.</p>
+<p>Validation compares fingerprints (HEAD, index entries and the stat data of
+captured and untracked paths) before and after the capture instead of capturing
+again, so an attempt makes one capture. <code>worktree.capture</code> reports how much was
+read (<code>files_read</code>, <code>bytes_read</code>), how much was written (<code>objects_written</code>),
+how many files were not opened (<code>reused_index_entries</code>) and how many recently
+modified files were re-hashed (<code>racy_rehashed</code>). A repository that applies line-ending
+conversion to most files reads most files and sees little speed-up.</p>
 <h2 id="resuming-and-loading">Resuming and loading</h2>
 <p>A session's workspace binding is persisted independently of conversation
 contents. Resume/load always resolve that binding first:</p>
@@ -3078,6 +3267,52 @@ before using handoff. Profile runtimes built from one <code>AgentInfra</code> sh
 event fanout and storage journal, so announcements reach connections served by
 the root agent; runtimes given separate fanouts are only forwarded if they are
 registered as event sources.</p>
+<h3 id="delegating-to-a-successor-handoff_from">Delegating to a successor (<code>handoff_from</code>)</h3>
+<p>An orchestrating session can also hand a worktree to a <strong>delegate</strong>: the
+<code>delegate</code> tool's <code>handoff_from</code> argument names an earlier isolated delegation
+of the same session, and the new delegate session becomes the owner of <em>that</em>
+delegation's worktree (see <a href="../delegation/">Delegation</a>). It uses the same
+ordering as <code>/worktree handoff</code> (stop the idle owner, take the exclusive
+activity lease, create the successor behind its startup barrier, transfer with
+one compare-and-swap, release), with these differences:</p>
+<ul>
+<li>the successor is a delegate session: parent is the delegating session, fork
+  origin <code>delegation</code>, no copied history, hidden from listings;</li>
+<li>ownership moves <strong>before</strong> the delegate's actor starts, and the previous
+  owner's stream records <code>worktree_ownership_transferred</code> (no summary);</li>
+<li>a failed start (also one after the delegate's actor started) never fails the
+  workspace: ownership goes back to the previous owner, which is writable again
+  and can be handed off later, and the successor is discarded; if that is
+  refused too, the successor keeps the workspace and <code>recover</code> resolves it;</li>
+<li>a delegation holds its delegate's worktree until it reports its terminal
+  state, not only while the delegate's turn runs: verification, the summary
+  read and the result capture happen after the turn. Until then a handoff (by
+  <code>handoff_from</code> or <code>/worktree handoff</code>), archive, removal or snapshot merge of
+  that worktree is refused with <code>owner_active</code> and changes nothing;</li>
+<li>the worktree stays recorded under the delegation that created it, so results
+  of every owner are accepted with that one id.</li>
+</ul>
+<pre class="mermaid"><code>sequenceDiagram
+  participant P as Orchestrator session
+  participant O as Delegation orchestrator
+  participant W as Worktree ops
+  participant C as Coder session (owner)
+  participant R as Reviewer session
+  P-&gt;&gt;O: delegate(reviewer, handoff_from=D1)
+  O-&gt;&gt;W: find D1's worktree, check it was made by P
+  O-&gt;&gt;W: begin_handoff: stop idle owner, hold exclusive lease
+  W-&gt;&gt;C: unload (refused with owner_active while it runs)
+  O-&gt;&gt;R: create session behind startup barrier
+  W-&gt;&gt;W: transfer owner C to R, release lease
+  O-&gt;&gt;C: record worktree_ownership_transferred
+  R-&gt;&gt;R: start actor, run, edit files in place
+  O-&gt;&gt;W: publish result R2 on the worktree
+  O--&gt;&gt;P: completed, accept_delegation_result(D1, R2)
+  P-&gt;&gt;W: accept_delegation_result(D1, R2): one commit, coder + reviewer changes</code></pre>
+<p>Delegates read <code>.agents</code> (skills, commands, <code>AGENTS.md</code>) from <strong>their own
+checkout</strong>, so a worktree delegate sees the files committed or present in its
+baseline. A gitignored <code>.agents/</code> directory is not in a delegate's baseline and
+is therefore not visible to delegates.</p>
 <h2 id="archiving-from-any-session">Archiving from any session</h2>
 <p><code>archive</code> permanently retires execution in a managed checkout while preserving
 the conversation history and the durable binding. It works from the owning
@@ -3177,6 +3412,50 @@ delegation, and the worktree command surface keep working without a
 snapshot backend, and undo reports its usual unavailable-backend behavior
 rather than substituting workspace Git refs as undo history. Enabling
 isolation never silently enables snapshots when they were disabled.</p>
+<h3 id="linked-snapshot-store-of-a-managed-workspace">Linked snapshot store of a managed workspace</h3>
+<p>The snapshot store of a managed workspace is <em>linked</em> to its source
+repository, so the first snapshot of a fresh workspace does not copy the
+baseline again. The source already holds every baseline object, and
+<code>refs/qmt/baselines/&lt;workspace-id&gt;</code> keeps them reachable. Two files in the
+workspace's snapshot store record the link:</p>
+<ul>
+<li><code>objects/info/alternates</code> lists the source repository's object directory
+  (<code>&lt;common dir&gt;/objects</code>), once. Git reads objects through it, so the store
+  stays a plain Git object store that <code>git</code> can open.</li>
+<li><code>qmt-baseline</code> names the workspace's baseline commit. Both files are
+  replaced atomically.</li>
+</ul>
+<p>A linked store skips writing an object only when it is already in the store
+itself or is reachable from the <code>qmt-baseline</code> commit's tree. Everything else
+is written into the store's own <code>objects/</code>, even when the source repository
+happens to hold it: content the delegate staged or committed in its linked
+worktree is not pinned by anything and could disappear when the workspace
+branch is deleted and the source pruned, which would make undo and snapshot
+garbage collection fail. Only the baseline is trusted.</p>
+<p><strong>Large files are always stored.</strong> A file at or above the large-file
+threshold (16 MiB) is copied into the store even when the baseline holds it,
+so restoring it streams from a loose object instead of loading a packed
+source object into memory.</p>
+<p>The runtime links the store before any snapshot is taken, when a managed
+session is created, handed off, forked, <strong>loaded or resumed</strong>. Existing
+stores of managed workspaces are therefore linked the next time their session
+is loaded or resumed; objects they already wrote stay valid. Linking is best
+effort and never blocks the session:</p>
+<ul>
+<li>the store stays <strong>unlinked</strong> (self-contained) when the source repository
+  uses a different object format, for example SHA-256 against a SHA-1 store
+  (the mismatch is logged at debug level), or when the source object
+  directory is missing;</li>
+<li>a store that is busy with an in-flight snapshot or restore is skipped and
+  linked on a later load or resume;</li>
+<li>sessions that are not bound to a managed workspace never link, and keep a
+  self-contained store.</li>
+</ul>
+<p>Removing the source repository already breaks a managed workspace, and it
+also removes the objects a linked store reads. Reading such a snapshot then
+fails with the usual "object not found" error naming the snapshot. An
+<code>alternates</code> file left behind by an older or rolled-back build is harmless:
+it only adds a read source, and the store's own objects are unaffected.</p>
 <h2 id="accepting-a-delegate-result">Accepting a delegate result</h2>
 <p>A session that has reviewed an isolated delegate's retained result accepts it
 with the <code>accept_delegation_result</code> tool (<code>delegation_id</code> and the reviewed
@@ -3205,6 +3484,16 @@ runtime code, not a prompt:</p>
 <li>A refusal or conflict is final for that result. Delegate the underlying change
   again from the current state rather than patching by hand.</li>
 </ul>
+<p>A delegate that ran by <a href="#delegating-to-a-successor-handoff_from">handoff</a> in
+an earlier delegate's worktree publishes its own result on that worktree.
+Accept it with the <strong>worktree's original delegation id</strong> (the one that created
+it) and the new result commit: the delta is still <code>baseline → result</code>, so it
+contains the earlier owners' edits as well as the new owner's. Each retained
+result records the delegation whose completion published it, and acceptance
+requires <em>that</em> run to be complete: a result published by a completed reviewer
+is accepted even when the coder that created the worktree failed or was
+cancelled. A result published without a delegation (<code>/worktree publish</code>, a
+merge snapshot) is judged on the worktree's own delegation, as before.</p>
 <h3 id="how-an-acceptance-runs">How an acceptance runs</h3>
 <p>No Git executable is involved. The whole transaction runs under the requesting
 session's checkout mutation gate (a checkout-keyed gate under the storage root

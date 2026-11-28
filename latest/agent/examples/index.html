@@ -1862,6 +1862,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#coder_teamtoml-orchestrator-coder-and-reviewer-in-one-worktree" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        <code>coder_team.toml</code> — Orchestrator, coder and reviewer in one worktree
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#multi_agenttoml-agent-delegates" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
@@ -2966,6 +2977,49 @@ The <code>dashboard</code> feature embeds QueryMT Desktop web (<code>crates/quer
 <p>Use this profile when you want config-level hook commands to inspect shell calls, automate approval decisions, or request one extra step at turn completion.</p>
 <h3 id="trading_analysttoml-trading_desktoml-guarded-stock-trading"><code>trading_analyst.toml</code> / <code>trading_desk.toml</code> — Guarded stock trading</h3>
 <p>Two profiles for Interactive Brokers' hosted MCP server. The analyst logs in with only the <code>mcp.read</code> scope, researches and writes small scripts and order tickets. The desk has the order scope but no shell, file-write or web tools, starts in <code>plan</code> mode, and runs <code>examples/hooks/trading/order_guard.py</code> before every order (risk limits, kill switch, build-mode-only, limit orders only) and asks you to confirm each order. Use a paper account first; see the header comments in both files for setup.</p>
+<h3 id="coder_teamtoml-orchestrator-coder-and-reviewer-in-one-worktree"><code>coder_team.toml</code> — Orchestrator, coder and reviewer in one worktree</h3>
+<p>The <code>coder-team</code> profile (embedded in <code>qmtcode</code>, profile id <code>coder-team</code>) is a coding team that reviews its own work before anything is merged. It turns on <code>[dotagents]</code> and <code>[agent.workspace]</code> (<code>baseline = "current_working_tree"</code>, so delegates start from your current edits) and has four roles:</p>
+<table>
+<thead>
+<tr>
+<th>Member</th>
+<th>Isolation</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>orchestrator</td>
+<td>-</td>
+<td>Plan mode, read-only tools plus <code>delegate</code> and <code>accept_delegation_result</code>. Explores, plans, delegates and merges; never edits or runs commands.</td>
+</tr>
+<tr>
+<td><code>coder</code></td>
+<td>isolated</td>
+<td>Implements the task in its own private Git worktree.</td>
+</tr>
+<tr>
+<td><code>reviewer</code></td>
+<td>isolated</td>
+<td>Runs with <code>handoff_from</code> set to the coder's delegation, so it takes over the <strong>coder's worktree</strong>, reviews the work against the objective, runs the project's checks, fixes what it finds in place and ends with <code>VERDICT: PASS</code> or <code>VERDICT: FAIL</code>. Replies <code>BLOCKED</code> if it does not see the described work.</td>
+</tr>
+<tr>
+<td><code>explorer</code></td>
+<td>shared</td>
+<td>Read-only code search and explanation in the orchestrator's checkout.</td>
+</tr>
+</tbody>
+</table>
+<p>The review loop the orchestrator follows:</p>
+<pre class="mermaid"><code>flowchart TD
+  A[Explore and plan] --&gt; B[delegate coder: delegation D1]
+  B --&gt; C[delegate reviewer, handoff_from D1]
+  C --&gt; D{VERDICT}
+  D -- FAIL --&gt; E[delegate coder, handoff_from D1, with the findings]
+  E --&gt; C
+  D -- PASS --&gt; F[accept_delegation_result D1, latest result]
+  F --&gt; G[One commit on your branch, after you approve]</code></pre>
+<p><code>accept_delegation_result</code> is listed in <code>[agent.permissions] always_ask</code>, so every merge asks you first. The worktree stays named by the coder's delegation, so every round and the merge use that one id, and the merge contains the coder's and the reviewer's changes. Delegates read <code>.agents</code> from their own checkout: a gitignored <code>.agents/</code> directory is not in a delegate's baseline. Because delegates start from your current edits, a merge that touches a file you had already changed (uncommitted) when the coder was delegated is refused with <code>baseline_local_edits</code>: the result cannot be separated from your edit. Commit or stash such edits before delegating; after this refusal, commit them and delegate the task again. See <a href="../delegation/#running-in-an-earlier-delegates-worktree-handoff_from">Delegation</a> and <a href="../worktrees/#delegating-to-a-successor-handoff_from">Git Worktree Workspaces</a>.</p>
 <h3 id="multi_agenttoml-agent-delegates"><code>multi_agent.toml</code> — Agent + delegates</h3>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-19-1"> 1</a></span>
 <span class="normal"><a href="#__codelineno-19-2"> 2</a></span>
