@@ -231,9 +231,64 @@
   shared read-only `explorer`. `[dotagents]` and `[agent.workspace]` are on.
   Embedded in `qmtcode` next to `coder-delegate` and selectable there; the
   mobile catalog does not include it.
+- **Additive Rust API for baseline capture statistics and linked snapshot
+  stores (not breaking).** `querymt_agent_services::worktree::CaptureStats`
+  (`files_read`, `bytes_read`, `objects_written`, `reused_index_entries`) is
+  returned by the new provided method
+  `RepositoryOps::capture_working_state_with_stats`, whose default calls
+  `capture_working_state` and returns zero statistics, so existing implementors
+  compile unchanged. The new provided method
+  `SnapshotBackend::link_object_source(worktree, objects_dir, baseline_commit)`
+  is a no-op by default; `GitSnapshotBackend` implements it. `CapturedWorkingState`
+  gains no fields and no existing signature changes.
 
 ### Behavior changes
 
+- **Isolated delegation starts faster, and its startup is traceable.** The
+  time between the `delegate` tool and the delegate's first prompt (3.4 s on a
+  1,934-file checkout in one trace, none of it visible) is cut and attributed:
+  - Baseline capture reads only what changed. A tracked file whose stat data
+    matches its index entry, and that is not racily clean, reuses the entry's
+    object id and is not read; modified, flagged, converted and untracked files
+    are still read. A blob is hashed before it is written and an object the
+    repository holds is not written again. The baseline still holds raw
+    working bytes and on-disk modes.
+  - Capture validation compares stat fingerprints (HEAD, index entries and the
+    stat data of captured and untracked paths) and re-hashes recently modified
+    files, so an attempt makes one capture instead of three. A change to HEAD,
+    the index or a captured path during capture is still detected and retried
+    or rejected as before.
+  - The snapshot store of a managed workspace is linked to its source
+    repository (below), so the first snapshot does not rewrite the baseline.
+  - Lock-file and gate filesystem work no longer runs on the Tokio worker
+    threads.
+  - New spans, each with the counts that explain its duration:
+    `delegation.claim` (`attempts`), `delegation.queue_wait`,
+    `delegation.admission` (`authority`), `delegation.resolve_parent` (`bound`),
+    `delegation.allocate_workspace` (`workspace_id`, `handoff`),
+    `delegation.start_hook` (`contexts`), `worktree.lock.wait` (`lock`,
+    `checkout`, `polls`), `worktree.capture` (`attempts`, `files_read`,
+    `bytes_read`, `objects_written`, `reused_index_entries`, `racy_rehashed`),
+    `worktree.capture.manifest` (`paths`), `worktree.provision`
+    (`workspace_id`) and `worktree.checkout` (`files`).
+    `delegation.summarize` now records `history_messages`, `summary_bytes`,
+    `strategy` and an `outcome` (`injected`, `rejected`, `timeout`,
+    `skipped`). See `docs/docs/agent/worktrees.md`.
+  No configuration key, tool argument, ACP shape, session database schema or
+  stored format changes; baselines, results and undo behave as before.
+- **Snapshot stores of managed workspaces gain `objects/info/alternates` and
+  `qmt-baseline` (not breaking).** The store lists its source repository's
+  object directory as an alternate and names the workspace's baseline commit in
+  `qmt-baseline`; it stays a plain Git object store that `git` can read. Only
+  objects reachable from the baseline are deduplicated against the source;
+  everything else, including content the delegate staged or committed and every
+  file of 16 MiB or more, is written to the store itself. The store is linked
+  when a managed session is created, handed off, forked, loaded or resumed, so
+  existing managed workspaces are linked the next time their session is loaded
+  or resumed; objects already in the store stay valid. A store stays
+  self-contained when the source uses a different object format (SHA-256), and
+  a busy store is linked on a later load. Sessions without a managed workspace
+  are unchanged.
 - **The `coder-team` profile no longer writes a planning summary before each
   delegation.** Its `[agent.delegation.summary]` is kept but set to
   `enabled = false`. The summary was an extra LLM call on every delegation's

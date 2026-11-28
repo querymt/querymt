@@ -585,6 +585,83 @@ Recovery behavior depends on how far the interrupted allocation got:
   provisioned and durably bound workspace becomes runnable, and a pending
   isolated fork still cannot load or resume as local execution.
 
+## Delegation startup spans
+
+Starting an isolated delegate has no hidden time: every phase between the
+`delegate` tool call and the delegate's first prompt is a named `tracing` span,
+exported with the rest of your OpenTelemetry traces. Each span records the
+counts that explain its duration, so a slow start can be read off the trace.
+There are no per-file spans.
+
+```mermaid
+flowchart TD
+  H[delegation.orchestrator.handle_event]
+  H --> CL[delegation.claim]
+  H --> QW[delegation.queue_wait]
+  H --> EX[delegation.execute]
+  EX --> AD[delegation.admission]
+  EX --> RP[delegation.resolve_parent]
+  EX --> AW[delegation.allocate_workspace]
+  EX --> SH[delegation.start_hook]
+  EX --> CS[delegation.create_session]
+  EX --> SU[delegation.summarize]
+  EX --> IP[delegation.inject_planning_context]
+  AW --> LW[worktree.lock.wait]
+  AW --> CA[worktree.capture]
+  CA --> CM[worktree.capture.manifest]
+  AW --> PR[worktree.provision]
+  PR --> LW2[worktree.lock.wait]
+  PR --> CO[worktree.checkout]
+```
+
+`delegation.queue_wait` is a sibling of `delegation.execute`, not a child: the
+parallel slot is acquired before execution starts. `worktree.*` spans nest under
+whichever span is active when the worktree service runs, normally
+`delegation.allocate_workspace`. The tree above shows one run; a lock wait
+appears wherever a lock is taken (batch lock and mutation gate during baseline
+capture, admin lock during provisioning).
+
+| Span | Parent | Fields |
+|---|---|---|
+| `delegation.claim` | `delegation.orchestrator.handle_event` | `attempts`: claim attempts |
+| `delegation.queue_wait` | `delegation.orchestrator.handle_event` | — (the duration is the wait for a `max_parallel` slot) |
+| `delegation.admission` | `delegation.execute` | `authority`: `local`, or `peer` for a delegation admitted for a remote peer (the `remote` feature) |
+| `delegation.resolve_parent` | `delegation.execute` | `bound`; only present for a fresh isolated delegation |
+| `delegation.allocate_workspace` | `delegation.execute` | `workspace_id`, `handoff` (`true` when the delegate takes over an existing workspace) |
+| `delegation.start_hook` | `delegation.execute` | `contexts`: contexts returned by the `delegation_start` hook |
+| `delegation.create_session` | `delegation.execute` | — |
+| `delegation.summarize` | `delegation.execute` | `history_messages`, `summary_bytes`, `strategy`, `outcome` (`injected`, `rejected`, `timeout` or `skipped`) |
+| `delegation.inject_planning_context` | `delegation.execute` | — |
+| `worktree.lock.wait` | the caller | `lock` (`batch`, `admin` or `gate`), `checkout` (gate only: the checkout the gate guards), `polls`; the duration is the time spent waiting |
+| `worktree.capture` | the caller | `attempts`, `files_read`, `bytes_read`, `objects_written`, `reused_index_entries`, `racy_rehashed` |
+| `worktree.capture.manifest` | `worktree.capture` | `paths`: paths fingerprinted |
+| `worktree.provision` | the caller | `workspace_id` |
+| `worktree.checkout` | `worktree.provision` | `files`: files checked out |
+
+`delegation.summarize` records an `outcome` so a summary that was discarded (for
+example cut off by its token limit) is visible in the trace. Spans of a
+long-running parent can reach the trace backend after their children, so a
+running session may show children whose parent span has not been exported yet.
+
+### What baseline capture reads
+
+A `current_working_tree` baseline (always used for delegates) reads only what
+changed. A tracked file whose stat data matches its real-index entry, and which
+is not racily clean, reuses the entry's object id and is not opened. Modified
+and untracked files, entries with special index flags, files whose
+attributes or configuration convert content, and anything else that cannot be
+proven unchanged are read. An object the repository already holds is not
+written again. The baseline still contains the raw working bytes and on-disk
+modes.
+
+Validation compares fingerprints (HEAD, index entries and the stat data of
+captured and untracked paths) before and after the capture instead of capturing
+again, so an attempt makes one capture. `worktree.capture` reports how much was
+read (`files_read`, `bytes_read`), how much was written (`objects_written`),
+how many files were not opened (`reused_index_entries`) and how many recently
+modified files were re-hashed (`racy_rehashed`). A repository that applies line-ending
+conversion to most files reads most files and sees little speed-up.
+
 ## Resuming and loading
 
 A session's workspace binding is persisted independently of conversation
@@ -956,6 +1033,54 @@ delegation, and the worktree command surface keep working without a
 snapshot backend, and undo reports its usual unavailable-backend behavior
 rather than substituting workspace Git refs as undo history. Enabling
 isolation never silently enables snapshots when they were disabled.
+
+### Linked snapshot store of a managed workspace
+
+The snapshot store of a managed workspace is *linked* to its source
+repository, so the first snapshot of a fresh workspace does not copy the
+baseline again. The source already holds every baseline object, and
+`refs/qmt/baselines/<workspace-id>` keeps them reachable. Two files in the
+workspace's snapshot store record the link:
+
+- `objects/info/alternates` lists the source repository's object directory
+  (`<common dir>/objects`), once. Git reads objects through it, so the store
+  stays a plain Git object store that `git` can open.
+- `qmt-baseline` names the workspace's baseline commit. Both files are
+  replaced atomically.
+
+A linked store skips writing an object only when it is already in the store
+itself or is reachable from the `qmt-baseline` commit's tree. Everything else
+is written into the store's own `objects/`, even when the source repository
+happens to hold it: content the delegate staged or committed in its linked
+worktree is not pinned by anything and could disappear when the workspace
+branch is deleted and the source pruned, which would make undo and snapshot
+garbage collection fail. Only the baseline is trusted.
+
+**Large files are always stored.** A file at or above the large-file
+threshold (16 MiB) is copied into the store even when the baseline holds it,
+so restoring it streams from a loose object instead of loading a packed
+source object into memory.
+
+The runtime links the store before any snapshot is taken, when a managed
+session is created, handed off, forked, **loaded or resumed**. Existing
+stores of managed workspaces are therefore linked the next time their session
+is loaded or resumed; objects they already wrote stay valid. Linking is best
+effort and never blocks the session:
+
+- the store stays **unlinked** (self-contained) when the source repository
+  uses a different object format, for example SHA-256 against a SHA-1 store
+  (the mismatch is logged at debug level), or when the source object
+  directory is missing;
+- a store that is busy with an in-flight snapshot or restore is skipped and
+  linked on a later load or resume;
+- sessions that are not bound to a managed workspace never link, and keep a
+  self-contained store.
+
+Removing the source repository already breaks a managed workspace, and it
+also removes the objects a linked store reads. Reading such a snapshot then
+fails with the usual "object not found" error naming the snapshot. An
+`alternates` file left behind by an older or rolled-back build is harmless:
+it only adds a read source, and the store's own objects are unaffected.
 
 ## Accepting a delegate result
 
