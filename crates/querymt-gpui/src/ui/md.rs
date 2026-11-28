@@ -718,9 +718,11 @@ fn inline_code_style(p: &Palette) -> StyleRefinement {
     } else {
         (rgba(0x5e5c641a), rgb(0x3d3846))
     };
+    // The desktop greys belong to the built-in themes; others keep their text.
+    let builtin = p.theme == crate::theme::ThemeId::of_builtin(p.dark);
     StyleRefinement::default()
         .bg(Hsla::from(bg))
-        .text_color(Hsla::from(fg))
+        .text_color(if builtin { Hsla::from(fg) } else { p.text })
         .rounded(px(6.))
         .px(px(5.))
 }

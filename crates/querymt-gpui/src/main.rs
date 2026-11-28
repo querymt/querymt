@@ -118,6 +118,9 @@ impl<A: AssetSource> AssetSource for AppAssets<A> {
             "brand/querymt-dark.svg" => return Ok(Some(Cow::Borrowed(BRAND_DARK_SVG))),
             _ => {}
         }
+        if let Some(bytes) = ui::kit::boot_mark_asset(path) {
+            return Ok(Some(Cow::Borrowed(bytes)));
+        }
         if let Some(id) = path
             .strip_prefix("providers/")
             .and_then(|p| p.strip_suffix(".svg"))
