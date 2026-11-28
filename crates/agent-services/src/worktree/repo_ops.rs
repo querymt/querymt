@@ -827,7 +827,11 @@ impl RepositoryOps for GixRepoOps {
         let common_dir = common_dir.to_path_buf();
         let path = path.to_path_buf();
         let full = full_branch_name(branch);
-        tokio::task::spawn_blocking(move || {
+        // Spans do not follow `spawn_blocking`; the closure gets a clone so
+        // `files` can be recorded from the blocking thread.
+        let span = tracing::info_span!("worktree.checkout", files = tracing::field::Empty);
+        let checkout_span = span.clone();
+        let work = tokio::task::spawn_blocking(move || {
             let repo = open_repo(&common_dir)?;
 
             // gix 0.90 copies the source worktree's active sparse-checkout
@@ -863,9 +867,10 @@ impl RepositoryOps for GixRepoOps {
 
             let head = gix::worktree::add::Head::Attached(full);
             let interrupt = std::sync::atomic::AtomicBool::new(false);
-            let (child, _outcome) = repo
+            let (child, outcome) = repo
                 .add_worktree(&path, head, gix::progress::Discard, &interrupt)
                 .map_err(native_err)?;
+            checkout_span.record("files", outcome.files_updated as i64);
 
             // Post-check on the actual child, independent of which source
             // gix copied from or which config file carries the setting.
@@ -888,9 +893,8 @@ impl RepositoryOps for GixRepoOps {
                 return Err(err);
             }
             Ok(())
-        })
-        .await
-        .map_err(native_err)?
+        });
+        tracing::Instrument::instrument(async { work.await.map_err(native_err)? }, span).await
     }
 
     async fn remove_worktree(

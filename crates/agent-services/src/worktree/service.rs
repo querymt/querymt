@@ -709,10 +709,25 @@ impl WorkspaceService {
         crate::worktree::placement::ensure_local_filesystem_execution(parent_cwd)?;
         crate::worktree::placement::ensure_local_filesystem_execution(&self.storage_root)?;
 
-        let resolved = resolve_repository(parent_cwd)?;
-        let relative =
-            crate::worktree::identity::relative_cwd(&resolved.checkout.root, parent_cwd)?;
-        let fallback_gate = CheckoutMutationGate::new(&self.storage_root, &resolved.checkout.root)?;
+        // Repository resolution, cwd relativization and the fallback gate's
+        // canonicalization are blocking filesystem work; run them together
+        // off the async workers.
+        let (resolved, relative, fallback_gate) = {
+            let parent_cwd = parent_cwd.to_path_buf();
+            let storage_root = self.storage_root.clone();
+            tokio::task::spawn_blocking(move || -> WorktreeResult<_> {
+                let resolved = resolve_repository(&parent_cwd)?;
+                let relative =
+                    crate::worktree::identity::relative_cwd(&resolved.checkout.root, &parent_cwd)?;
+                let fallback_gate =
+                    CheckoutMutationGate::new(storage_root, &resolved.checkout.root)?;
+                Ok((resolved, relative, fallback_gate))
+            })
+            .await
+            .map_err(|err| {
+                WorktreeError::InvalidOperation(format!("repository resolution task failed: {err}"))
+            })??
+        };
         let parent_gate = Some(parent_gate.unwrap_or(&fallback_gate));
 
         // Delegates always start from the parent's current working state:
@@ -728,7 +743,7 @@ impl WorkspaceService {
             "{}.lock",
             querymt_agent_core::hash::RapidHash::new(batch_key.as_bytes()).to_hex()
         ));
-        crate::worktree::lock::with_lock_file(&lock_path, async {
+        crate::worktree::lock::with_lock_file(&lock_path, "batch", None, async {
             let existing = match delegation_batch_id.as_deref() {
                 Some(batch) => self.registry.list_workspaces_by_batch(batch).await?,
                 None => Vec::new(),
@@ -988,6 +1003,52 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn contended_gate_is_visible() {
+        use crate::tools::trace_support::genai_trace::{attr, capture};
+        use std::time::Duration;
+
+        let (repo, _storage, svc) = service().await;
+        let gate = CheckoutMutationGate::new(&svc.storage_root, repo.path()).unwrap();
+        let canonical = gate.checkout_root().display().to_string();
+
+        // One holder and one waiter on the same task, so both inherit the
+        // capture subscriber. The waiter starts only once the holder owns
+        // the gate, and the holder keeps it far longer than the waiter's
+        // first `try_lock` takes, so the waiter's acquisition is contended.
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+        let (_, spans) = capture(async {
+            let holder = gate.run(async move {
+                held_tx.send(()).unwrap();
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            });
+            let waiter = async {
+                held_rx.await.unwrap();
+                svc.capture_batch_baseline(
+                    repo.path(),
+                    BaselineMode::CurrentWorkingTree,
+                    Some(&gate),
+                )
+                .await
+                .unwrap()
+            };
+            tokio::join!(holder, waiter)
+        })
+        .await;
+
+        let waited = spans
+            .iter()
+            .filter(|s| s.name == "worktree.lock.wait")
+            .filter(|s| attr(s, "lock").map(|v| v.to_string()).as_deref() == Some("gate"))
+            .filter(|s| attr(s, "checkout").map(|v| v.to_string()).as_deref() == Some(&canonical))
+            .find(|s| matches!(attr(s, "polls"), Some(opentelemetry::Value::I64(n)) if *n > 0))
+            .expect("a contended gate wait span with polls > 0 and the canonical checkout");
+        assert!(
+            waited.end_time.duration_since(waited.start_time).unwrap() > Duration::ZERO,
+            "the wait span covers the time spent waiting"
+        );
+    }
 
     #[tokio::test]
     async fn delegation_cancellation_before_provisioning_creates_no_workspace() {
