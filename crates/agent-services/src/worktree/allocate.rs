@@ -28,6 +28,7 @@ use crate::worktree::identity::{ResolvedRepository, ensure_relative_cwd_exists};
 use crate::worktree::repo_ops::{RepositoryOps, validate_ref_name};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tracing::Instrument;
 
 /// Where the baseline of a recovered workspace came from.
 ///
@@ -303,6 +304,37 @@ impl WorkspaceAllocator {
     /// 4. validate the session-relative cwd exists in the checkout.
     #[allow(clippy::too_many_arguments)]
     async fn provision(
+        &self,
+        id: &WorkspaceId,
+        source: &ResolvedRepository,
+        relative_cwd: &Path,
+        base_ref: Option<&str>,
+        baseline_mode: BaselineMode,
+        preset_baseline: Option<&Baseline>,
+        branch: &ManagedBranch,
+        checkout_path: &Path,
+        mutation_gate: Option<&CheckoutMutationGate>,
+    ) -> WorktreeResult<()> {
+        // Opened when the future first runs, i.e. after the administration
+        // lock is held, so the span excludes the lock wait.
+        let span = tracing::info_span!("worktree.provision", workspace_id = %id);
+        self.provision_steps(
+            id,
+            source,
+            relative_cwd,
+            base_ref,
+            baseline_mode,
+            preset_baseline,
+            branch,
+            checkout_path,
+            mutation_gate,
+        )
+        .instrument(span)
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn provision_steps(
         &self,
         id: &WorkspaceId,
         source: &ResolvedRepository,
@@ -961,6 +993,43 @@ mod tests {
             stored.repository.common_dir, resolved.identity.common_dir,
             "project identity groups workspaces by canonical common dir"
         );
+    }
+
+    #[tokio::test]
+    async fn provision_spans_record_workspace_and_files() {
+        use crate::tools::trace_support::genai_trace::{attr, capture};
+        use crate::worktree::test_support::{commit_files, init_repo};
+
+        let files = [("a.txt", "a"), ("b.txt", "b"), ("c/d.txt", "d")];
+        let repo = init_repo();
+        commit_files(repo.path(), "init", &files);
+        materialize(repo.path(), &files);
+        let storage = TempDir::new().unwrap();
+        let alloc = allocator(storage.path());
+        let resolved = resolve(repo.path());
+
+        let (record, spans) = capture(async {
+            alloc
+                .allocate(&resolved, Path::new(""), None)
+                .await
+                .unwrap()
+        })
+        .await;
+
+        let provision = spans
+            .iter()
+            .find(|s| s.name == "worktree.provision")
+            .expect("worktree.provision span");
+        let checkout = spans
+            .iter()
+            .find(|s| s.name == "worktree.checkout")
+            .expect("worktree.checkout span");
+        assert_eq!(
+            attr(provision, "workspace_id").map(|v| v.to_string()),
+            Some(record.id.to_string())
+        );
+        assert_eq!(checkout.parent_span_id, provision.span_context.span_id());
+        assert_eq!(attr(checkout, "files"), Some(&opentelemetry::Value::I64(3)));
     }
 
     #[tokio::test]

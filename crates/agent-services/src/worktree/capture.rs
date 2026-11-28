@@ -22,15 +22,24 @@
 //! user commit identity and never runs commit hooks. Ref creation for the
 //! baseline lives with the caller (section 3.3).
 
+use crate::worktree::capture_scan::{
+    Fingerprints, Verification, changed_during_capture_detail, fingerprint_source,
+    verify_captured_tree,
+};
 use crate::worktree::error::{WorktreeError, WorktreeResult};
-use crate::worktree::repo_ops::{BASELINE_COMMIT_MESSAGE, CapturedWorkingState, RepositoryOps};
+use crate::worktree::repo_ops::{CapturedWorkingState, RepositoryOps, native_err};
 use std::path::Path;
+use std::time::SystemTime;
+use tracing::Instrument;
 
 /// Result of capturing a checkout's working state.
 ///
 /// Re-exported from the typed operations layer; fields and semantics are
 /// identical.
 pub use crate::worktree::repo_ops::CapturedWorkingState as CapturedState;
+
+/// What one capture did; see [`RepositoryOps::capture_working_state_with_stats`].
+pub use crate::worktree::repo_ops::CaptureStats;
 
 /// Author/committer identity for QueryMT's private commits. Private
 /// commits never require the user's commit identity and never invoke user
@@ -53,15 +62,23 @@ impl Default for CaptureRetryPolicy {
 
 /// Validate-then-capture-then-validate with bounded retry.
 ///
-/// The source manifest (HEAD, index entries and working tree) is captured before and after
-/// each capture attempt. A mismatch means an external writer changed the
-/// source mid-capture — external editors do not honor QueryMT's cooperative
-/// gate — so the capture is retried against fresh state, and after the
-/// bounded attempts it fails explicitly instead of launching child
-/// workspaces from a known-inconsistent baseline. This is not a
-/// transactional snapshot against arbitrary hostile writers: a write that
-/// lands after the post-manifest is undetectable; the documented limitation
-/// is surfaced through capture diagnostics instead (design decision 4).
+/// The source manifest (HEAD, index entries and stat fingerprints of every
+/// tracked and non-ignored untracked path) is taken before and after each
+/// capture attempt. A mismatch means an external writer changed the source
+/// mid-capture — external editors do not honor QueryMT's cooperative gate —
+/// so the capture is retried against fresh state, and after the bounded
+/// attempts it fails explicitly instead of launching child workspaces from a
+/// known-inconsistent baseline. An attempt is also rejected when the captured
+/// tree's paths differ from the observed ones or when a captured file
+/// modified within the racy window of the attempt's start no longer hashes
+/// to its captured content. This is not a transactional snapshot against
+/// arbitrary hostile writers: a write that lands after the last observation
+/// of a path (its post-manifest fingerprint, or its re-hash when racy) is
+/// undetectable; the documented limitation is surfaced through capture
+/// diagnostics instead (design decision 4).
+///
+/// Records a `worktree.capture` span (and one `worktree.capture.manifest`
+/// span per manifest) with the attempt count and the summed [`CaptureStats`].
 pub async fn capture_working_state_validated(
     ops: &dyn RepositoryOps,
     checkout_root: &Path,
@@ -69,33 +86,142 @@ pub async fn capture_working_state_validated(
     commit_message: &str,
 ) -> WorktreeResult<CapturedWorkingState> {
     let attempts = policy.max_attempts.max(1);
+    let span = tracing::info_span!(
+        "worktree.capture",
+        attempts = tracing::field::Empty,
+        files_read = tracing::field::Empty,
+        bytes_read = tracing::field::Empty,
+        objects_written = tracing::field::Empty,
+        reused_index_entries = tracing::field::Empty,
+        racy_rehashed = tracing::field::Empty,
+    );
+    let mut totals = CaptureTotals::default();
+    let outcome = run_attempts(ops, checkout_root, attempts, commit_message, &mut totals)
+        .instrument(span.clone())
+        .await;
+    span.record("attempts", totals.attempts);
+    span.record("files_read", totals.stats.files_read);
+    span.record("bytes_read", totals.stats.bytes_read);
+    span.record("objects_written", totals.stats.objects_written);
+    span.record("reused_index_entries", totals.stats.reused_index_entries);
+    span.record("racy_rehashed", totals.racy_rehashed);
+    outcome
+}
+
+/// Counters summed over the attempts of one validated capture.
+#[derive(Default)]
+struct CaptureTotals {
+    attempts: u64,
+    stats: CaptureStats,
+    racy_rehashed: u64,
+}
+
+async fn run_attempts(
+    ops: &dyn RepositoryOps,
+    checkout_root: &Path,
+    attempts: u32,
+    commit_message: &str,
+    totals: &mut CaptureTotals,
+) -> WorktreeResult<CapturedWorkingState> {
     let mut last_diagnostic = String::new();
     for attempt in 0..attempts {
+        totals.attempts += 1;
+        validate_supported_layout(ops, checkout_root).await?;
+        let capture_start = SystemTime::now();
         let before = source_manifest(ops, checkout_root).await?;
-        let captured = capture_working_state(ops, checkout_root, commit_message).await?;
+        let (captured, stats) = match ops
+            .capture_working_state_with_stats(checkout_root, commit_message)
+            .await
+        {
+            Ok(done) => done,
+            // A file that vanished or changed between its two reads.
+            Err(err) => match changed_during_capture_detail(&err) {
+                Some(detail) => {
+                    last_diagnostic = format!(
+                        "source changed during capture (attempt {attempt}/{attempts}): {detail}"
+                    );
+                    continue;
+                }
+                None => return Err(err),
+            },
+        };
+        totals.stats.add(&stats);
         let after = source_manifest(ops, checkout_root).await?;
-        if before == after && captured.source_head == before.0 && captured.tree == before.1 {
-            return Ok(captured);
+        if before != after || captured.source_head != before.head {
+            last_diagnostic = format!(
+                "source changed during capture (attempt {attempt}/{attempts}): HEAD or the observed working state was concurrently modified"
+            );
+            continue;
         }
-        last_diagnostic = format!(
-            "source changed during capture (attempt {attempt}/{attempts}): HEAD or the observed working state was concurrently modified"
-        );
+        let verification = verify(checkout_root, &captured.tree, &after, capture_start).await?;
+        totals.racy_rehashed += verification.rehashed;
+        match verification.mismatch {
+            None => return Ok(captured),
+            Some(reason) => {
+                last_diagnostic = format!(
+                    "source changed during capture (attempt {attempt}/{attempts}): {reason}"
+                );
+            }
+        }
     }
     Err(WorktreeError::InvalidOperation(format!(
         "{last_diagnostic}; refusing to launch from a known-inconsistent baseline"
     )))
 }
 
-/// Content manifest of the source: HEAD, private working tree and real index entries.
+async fn verify(
+    checkout_root: &Path,
+    tree: &str,
+    after: &SourceManifest,
+    capture_start: SystemTime,
+) -> WorktreeResult<Verification> {
+    let checkout = checkout_root.to_path_buf();
+    let tree = tree.to_string();
+    let paths = after.paths.clone();
+    tokio::task::spawn_blocking(move || {
+        verify_captured_tree(&checkout, &tree, &paths, capture_start)
+    })
+    .await
+    .map_err(native_err)?
+}
+
+/// What validation compares before and after a capture attempt: HEAD, the
+/// real index entries and the stat fingerprints of every tracked and
+/// non-ignored untracked path. Unlike a content manifest it reads no file.
+///
+/// HEAD and the index manifest come through [`RepositoryOps`]; the
+/// fingerprints and the racy re-hash ([`verify`]) open the checkout with
+/// `gix` directly, because they describe the on-disk source rather than a
+/// repository operation. A `RepositoryOps` test double used with the
+/// validated capture must therefore point at a real checkout.
+#[derive(Debug, PartialEq, Eq)]
+struct SourceManifest {
+    head: String,
+    index: Vec<u8>,
+    paths: Fingerprints,
+}
+
 async fn source_manifest(
     ops: &dyn RepositoryOps,
     checkout_root: &Path,
-) -> WorktreeResult<(String, String, Vec<u8>)> {
-    // A private tree records contents, modes, symlink targets and untracked
-    // files. Status labels cannot detect edits to an already-dirty path.
-    let state = capture_working_state(ops, checkout_root, BASELINE_COMMIT_MESSAGE).await?;
-    let index = ops.index_manifest(checkout_root).await?;
-    Ok((state.source_head, state.tree, index))
+) -> WorktreeResult<SourceManifest> {
+    let span = tracing::info_span!("worktree.capture.manifest", paths = tracing::field::Empty);
+    async {
+        let head = ops.head_commit(checkout_root).await?.ok_or_else(|| {
+            WorktreeError::InvalidOperation(
+                "cannot capture baseline: checkout has no commits (unborn HEAD)".to_string(),
+            )
+        })?;
+        let index = ops.index_manifest(checkout_root).await?;
+        let checkout = checkout_root.to_path_buf();
+        let paths = tokio::task::spawn_blocking(move || fingerprint_source(&checkout))
+            .await
+            .map_err(native_err)??;
+        tracing::Span::current().record("paths", paths.len());
+        Ok(SourceManifest { head, index, paths })
+    }
+    .instrument(span)
+    .await
 }
 
 /// Capture the working state of `checkout_root` into a private tree and
@@ -164,7 +290,9 @@ async fn validate_supported_layout(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::worktree::repo_ops::{CapturedWorkingState, GixRepoOps, RepositoryOps};
+    use crate::worktree::repo_ops::{
+        BASELINE_COMMIT_MESSAGE, CapturedWorkingState, GixRepoOps, RepositoryOps,
+    };
     use std::fs;
     use std::path::PathBuf;
     use std::process::Command;
@@ -183,6 +311,8 @@ mod tests {
             .env("GIT_AUTHOR_EMAIL", "t@example.com")
             .env("GIT_COMMITTER_NAME", "t")
             .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .status()
             .expect("spawn git")
             .success()
@@ -199,6 +329,8 @@ mod tests {
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
             .env_remove("GIT_INDEX_FILE")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .output()
             .expect("spawn git");
         assert!(
@@ -251,6 +383,8 @@ mod tests {
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
             .env_remove("GIT_INDEX_FILE")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .output()
             .unwrap()
             .stdout
@@ -953,6 +1087,8 @@ mod tests {
 
     // -- Validated capture: manifest check + bounded retry ---------------------
 
+    type CaptureHook = Box<dyn Fn(&Path, u32) + Send + Sync>;
+
     /// Typed-ops wrapper that simulates an external editor writing to the
     /// checkout right after the first capture attempt begins (mid-capture).
     /// It delegates to the real native implementation — no argv, no
@@ -962,36 +1098,43 @@ mod tests {
         remaining_mutations: std::sync::atomic::AtomicU32,
         mutations: std::sync::atomic::AtomicU32,
         stage_once: std::sync::atomic::AtomicBool,
+        /// Runs after each capture returns, with the checkout and the
+        /// zero-based capture call index.
+        hook: Option<CaptureHook>,
+        calls: std::sync::atomic::AtomicU32,
     }
 
     impl FlakyWriterOps {
-        fn flaky_once() -> Self {
+        fn new(remaining: u32, stage_once: bool) -> Self {
             Self {
                 inner: GixRepoOps::new(),
-                remaining_mutations: std::sync::atomic::AtomicU32::new(1),
+                remaining_mutations: std::sync::atomic::AtomicU32::new(remaining),
                 mutations: std::sync::atomic::AtomicU32::new(0),
-                stage_once: std::sync::atomic::AtomicBool::new(false),
+                stage_once: std::sync::atomic::AtomicBool::new(stage_once),
+                hook: None,
+                calls: std::sync::atomic::AtomicU32::new(0),
             }
         }
 
+        fn flaky_once() -> Self {
+            Self::new(1, false)
+        }
+
         fn always_flaky() -> Self {
-            Self {
-                inner: GixRepoOps::new(),
-                remaining_mutations: std::sync::atomic::AtomicU32::new(u32::MAX),
-                mutations: std::sync::atomic::AtomicU32::new(0),
-                stage_once: std::sync::atomic::AtomicBool::new(false),
-            }
+            Self::new(u32::MAX, false)
         }
 
         /// No content mutation, but an external writer stages a new tracked
         /// file once — changing the candidate set itself mid-capture.
         fn stage_flaky_once() -> Self {
-            Self {
-                inner: GixRepoOps::new(),
-                remaining_mutations: std::sync::atomic::AtomicU32::new(0),
-                mutations: std::sync::atomic::AtomicU32::new(0),
-                stage_once: std::sync::atomic::AtomicBool::new(true),
-            }
+            Self::new(0, true)
+        }
+
+        /// An external writer acting right after each capture returns.
+        fn with_hook(hook: impl Fn(&Path, u32) + Send + Sync + 'static) -> Self {
+            let mut ops = Self::new(0, false);
+            ops.hook = Some(Box::new(hook));
+            ops
         }
 
         fn mutation_count(&self) -> u32 {
@@ -1039,6 +1182,29 @@ mod tests {
                 run_git_ok(checkout, &["add", "late.txt"]);
             }
             Ok(out)
+        }
+
+        async fn capture_working_state_with_stats(
+            &self,
+            checkout: &Path,
+            commit_message: &str,
+        ) -> WorktreeResult<(CapturedWorkingState, CaptureStats)> {
+            let Some(hook) = &self.hook else {
+                // Mutation-style wrappers act inside `capture_working_state`.
+                return self
+                    .capture_working_state(checkout, commit_message)
+                    .await
+                    .map(|state| (state, CaptureStats::default()));
+            };
+            // Keep the counters: capture through the real implementation,
+            // then let the writer act.
+            let (state, stats) = self
+                .inner
+                .capture_working_state_with_stats(checkout, commit_message)
+                .await?;
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            hook(checkout, call);
+            Ok((state, stats))
         }
 
         async fn resolve_commit(
@@ -1299,8 +1465,8 @@ mod tests {
         assert!(message.contains("known-inconsistent"), "error: {message}");
         assert_eq!(
             git.mutation_count(),
-            6,
-            "all three captures in every attempt raced"
+            2,
+            "the single capture of every attempt raced (manifests no longer capture)"
         );
     }
 
@@ -1319,6 +1485,773 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(captured.commit, captured.source_head);
+    }
+
+    // -- Selective, hash-first capture and stat-fingerprint validation ---------
+
+    use std::collections::HashMap;
+    use std::fs::File;
+    use std::time::Duration;
+
+    /// In-memory record of `tracing` spans and their recorded fields, in
+    /// creation order.
+    #[derive(Clone, Default)]
+    struct SpanLog(std::sync::Arc<std::sync::Mutex<Vec<SpanRecord>>>);
+
+    type SpanRecord = (String, HashMap<String, String>);
+
+    struct SpanIdx(usize);
+    struct Fields<'a>(&'a mut HashMap<String, String>);
+
+    impl tracing::field::Visit for Fields<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for SpanLog
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            id: &tracing::span::Id,
+            ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = HashMap::new();
+            attrs.record(&mut Fields(&mut fields));
+            let mut spans = self.0.lock().unwrap();
+            spans.push((attrs.metadata().name().to_string(), fields));
+            ctx.span(id)
+                .unwrap()
+                .extensions_mut()
+                .insert(SpanIdx(spans.len() - 1));
+        }
+
+        fn on_record(
+            &self,
+            id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let span = ctx.span(id).unwrap();
+            let idx = span.extensions().get::<SpanIdx>().unwrap().0;
+            values.record(&mut Fields(&mut self.0.lock().unwrap()[idx].1));
+        }
+    }
+
+    impl SpanLog {
+        fn install() -> (Self, tracing::subscriber::DefaultGuard) {
+            use tracing_subscriber::layer::SubscriberExt;
+            let log = Self::default();
+            let subscriber = tracing_subscriber::registry().with(log.clone());
+            (log, tracing::subscriber::set_default(subscriber))
+        }
+
+        /// The recorded fields of the only span called `name`.
+        fn only(&self, name: &str) -> HashMap<String, String> {
+            let spans = self.0.lock().unwrap();
+            let mut found = spans.iter().filter(|(n, _)| n == name);
+            let (_, fields) = found.next().unwrap_or_else(|| panic!("no `{name}` span"));
+            assert!(found.next().is_none(), "more than one `{name}` span");
+            fields.clone()
+        }
+
+        fn count(&self, name: &str) -> usize {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(n, _)| n == name)
+                .count()
+        }
+    }
+
+    fn set_mtime(path: &Path, age_secs: u64) {
+        set_mtime_to(path, SystemTime::now() - Duration::from_secs(age_secs));
+    }
+
+    fn set_mtime_to(path: &Path, mtime: SystemTime) {
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+    }
+
+    /// Move the mtimes of every regular file below `dir` (but `.git`) back.
+    fn age_tree(dir: &Path, age_secs: u64) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let kind = entry.file_type().unwrap();
+            if kind.is_dir() {
+                if entry.file_name() != ".git" {
+                    age_tree(&path, age_secs);
+                }
+            } else if kind.is_file() {
+                set_mtime(&path, age_secs);
+            }
+        }
+    }
+
+    fn write_file(repo: &Path, rel: &str, content: &str) {
+        let path = repo.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+
+    /// A repository with `files` committed, all mtimes an hour old, so the
+    /// index was written in a later tick than any file and no entry is racy.
+    fn aged_repo(files: &[(&str, &str)]) -> TempDir {
+        let repo = init_repo();
+        for (rel, content) in files {
+            write_file(repo.path(), rel, content);
+        }
+        age_tree(repo.path(), 3600);
+        commit_all(repo.path(), "init");
+        repo
+    }
+
+    async fn capture_stats(ops: &GixRepoOps, root: &Path) -> (CapturedState, CaptureStats) {
+        ops.capture_working_state_with_stats(root, BASELINE_COMMIT_MESSAGE)
+            .await
+            .unwrap()
+    }
+
+    fn blob_bytes(repo: &Path, tree: &str, path: &str) -> Vec<u8> {
+        blob_of_oid(repo, &blob_of(repo, tree, path))
+    }
+
+    fn loose_object_count(repo: &Path) -> u64 {
+        out_git(repo, &["count-objects"])
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    async fn validated(ops: &dyn RepositoryOps, root: &Path) -> WorktreeResult<CapturedState> {
+        capture_working_state_validated(
+            ops,
+            root,
+            CaptureRetryPolicy::default(),
+            BASELINE_COMMIT_MESSAGE,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn clean_checkout_reads_no_file_content() {
+        let repo = aged_repo(&[("a.txt", "one"), ("dir/b.txt", "two"), ("c.txt", "three")]);
+
+        let (captured, stats) = capture_stats(&GixRepoOps::new(), repo.path()).await;
+
+        assert_eq!(stats.files_read, 0);
+        assert_eq!(stats.bytes_read, 0);
+        assert_eq!(stats.reused_index_entries, 3);
+        assert_eq!(captured.commit, head(repo.path()));
+        assert!(!captured.created_commit);
+    }
+
+    #[tokio::test]
+    async fn one_edited_file_is_the_only_file_read() {
+        let files: Vec<(String, String)> = (0..20)
+            .map(|i| (format!("d{}/f{i}.txt", i % 4), format!("content {i}")))
+            .collect();
+        let borrowed: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(p, c)| (p.as_str(), c.as_str()))
+            .collect();
+        let repo = aged_repo(&borrowed);
+        write_file(repo.path(), "d3/f7.txt", "edited content");
+
+        let (captured, stats) = capture_stats(&GixRepoOps::new(), repo.path()).await;
+
+        assert_eq!(stats.files_read, 1);
+        assert_eq!(stats.bytes_read, "edited content".len() as u64);
+        assert_eq!(stats.reused_index_entries, 19);
+        assert_eq!(
+            blob_bytes(repo.path(), &captured.tree, "d3/f7.txt"),
+            b"edited content"
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_then_edited_file_keeps_working_contents() {
+        let repo = aged_repo(&[("file.txt", "base"), ("other.txt", "other")]);
+        write_file(repo.path(), "file.txt", "staged");
+        run_git_ok(repo.path(), &["add", "file.txt"]);
+        write_file(repo.path(), "file.txt", "working");
+        let index_before = fs::read(repo.path().join(".git/index")).unwrap();
+
+        let (captured, stats) = capture_stats(&GixRepoOps::new(), repo.path()).await;
+
+        assert_eq!(
+            blob_bytes(repo.path(), &captured.tree, "file.txt"),
+            b"working"
+        );
+        assert_eq!(stats.files_read, 1);
+        assert_eq!(
+            fs::read(repo.path().join(".git/index")).unwrap(),
+            index_before,
+            "the real index is byte-for-byte unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn racily_clean_entry_is_read() {
+        let repo = init_repo();
+        run_git_ok(repo.path(), &["config", "core.trustctime", "false"]);
+        write_file(repo.path(), "racy.txt", "aaaa");
+        write_file(repo.path(), "calm.txt", "calm");
+        set_mtime(&repo.path().join("racy.txt"), 3600);
+        set_mtime(&repo.path().join("calm.txt"), 7200);
+        commit_all(repo.path(), "init");
+        // The index was written no later than the recorded mtime ...
+        let recorded = fs::metadata(repo.path().join("racy.txt"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        File::options()
+            .write(true)
+            .open(repo.path().join(".git/index"))
+            .unwrap()
+            .set_modified(recorded)
+            .unwrap();
+        // ... and the file is rewritten with the same size and mtime.
+        write_file(repo.path(), "racy.txt", "bbbb");
+        File::options()
+            .write(true)
+            .open(repo.path().join("racy.txt"))
+            .unwrap()
+            .set_modified(recorded)
+            .unwrap();
+
+        let (captured, stats) = capture_stats(&GixRepoOps::new(), repo.path()).await;
+
+        assert_eq!(blob_bytes(repo.path(), &captured.tree, "racy.txt"), b"bbbb");
+        assert_eq!(stats.files_read, 1);
+        assert_eq!(
+            stats.reused_index_entries, 1,
+            "only the calm entry is reused"
+        );
+    }
+
+    #[tokio::test]
+    async fn assume_unchanged_file_edited_is_captured() {
+        let repo = aged_repo(&[("au.txt", "aaaa"), ("other.txt", "other")]);
+        run_git_ok(repo.path(), &["config", "core.trustctime", "false"]);
+        run_git_ok(
+            repo.path(),
+            &["update-index", "--assume-unchanged", "au.txt"],
+        );
+        // Same size and mtime: only the flag can reveal the edit.
+        let recorded = fs::metadata(repo.path().join("au.txt"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        write_file(repo.path(), "au.txt", "bbbb");
+        File::options()
+            .write(true)
+            .open(repo.path().join("au.txt"))
+            .unwrap()
+            .set_modified(recorded)
+            .unwrap();
+
+        let (captured, stats) = capture_stats(&GixRepoOps::new(), repo.path()).await;
+
+        assert_eq!(blob_bytes(repo.path(), &captured.tree, "au.txt"), b"bbbb");
+        assert_eq!(stats.files_read, 1);
+    }
+
+    #[tokio::test]
+    async fn intent_to_add_file_is_read() {
+        let repo = aged_repo(&[("base.txt", "base")]);
+        write_file(repo.path(), "added.txt", "has content");
+        run_git_ok(repo.path(), &["add", "-N", "added.txt"]);
+
+        let (captured, stats) = capture_stats(&GixRepoOps::new(), repo.path()).await;
+
+        assert_eq!(
+            blob_bytes(repo.path(), &captured.tree, "added.txt"),
+            b"has content"
+        );
+        assert_eq!(stats.files_read, 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_replaced_by_a_symlink_is_read() {
+        let repo = aged_repo(&[("f.txt", "12345"), ("target.txt", "t")]);
+        fs::remove_file(repo.path().join("f.txt")).unwrap();
+        std::os::unix::fs::symlink("target.txt", repo.path().join("f.txt")).unwrap();
+
+        let (captured, stats) = capture_stats(&GixRepoOps::new(), repo.path()).await;
+
+        let listing = tree_paths(repo.path(), &captured.tree);
+        assert!(listing.contains(&("f.txt".to_string(), "120000".to_string())));
+        assert_eq!(
+            blob_bytes(repo.path(), &captured.tree, "f.txt"),
+            b"target.txt"
+        );
+        assert_eq!(stats.files_read, 1);
+    }
+
+    #[tokio::test]
+    async fn untracked_files_are_captured_when_status_hides_them() {
+        let repo = aged_repo(&[("tracked.txt", "t")]);
+        run_git_ok(repo.path(), &["config", "status.showUntrackedFiles", "no"]);
+        write_file(repo.path(), "new/untracked.txt", "fresh");
+
+        let (captured, stats) = capture_stats(&GixRepoOps::new(), repo.path()).await;
+
+        assert_eq!(
+            blob_bytes(repo.path(), &captured.tree, "new/untracked.txt"),
+            b"fresh"
+        );
+        assert_eq!(stats.files_read, 1);
+    }
+
+    #[tokio::test]
+    async fn crlf_converted_file_keeps_working_bytes() {
+        let repo = init_repo();
+        write_file(repo.path(), ".gitattributes", "*.txt text eol=crlf\n");
+        write_file(repo.path(), "a.txt", "one\r\ntwo\r\n");
+        write_file(repo.path(), "plain.bin", "bin");
+        age_tree(repo.path(), 3600);
+        commit_all(repo.path(), "init");
+        // The index holds the LF-normalized blob, the file the CRLF bytes.
+        assert_eq!(blob_bytes(repo.path(), "HEAD", "a.txt"), b"one\ntwo\n");
+
+        let (captured, stats) = capture_stats(&GixRepoOps::new(), repo.path()).await;
+
+        assert_eq!(
+            blob_bytes(repo.path(), &captured.tree, "a.txt"),
+            b"one\r\ntwo\r\n"
+        );
+        assert_eq!(stats.files_read, 1, "only the converted file is read");
+    }
+
+    #[tokio::test]
+    async fn index_blob_normalised_under_earlier_settings_is_read() {
+        let repo = init_repo();
+        run_git_ok(repo.path(), &["config", "core.autocrlf", "true"]);
+        write_file(repo.path(), "a.txt", "one\r\ntwo\r\n");
+        write_file(repo.path(), "plain.txt", "plain");
+        // Aged before staging, so the entries are stat-clean and not racy.
+        age_tree(repo.path(), 3600);
+        commit_all(repo.path(), "init");
+        assert_eq!(blob_bytes(repo.path(), "HEAD", "a.txt"), b"one\ntwo\n");
+        // The setting no longer applies: nothing converts a.txt any more, yet
+        // its entry still matches the file's stat data.
+        run_git_ok(repo.path(), &["config", "core.autocrlf", "false"]);
+
+        let (captured, stats) = capture_stats(&GixRepoOps::new(), repo.path()).await;
+
+        assert_eq!(
+            blob_bytes(repo.path(), &captured.tree, "a.txt"),
+            b"one\r\ntwo\r\n"
+        );
+        assert_eq!(stats.files_read, 1, "only the normalised file is read");
+        assert_eq!(stats.reused_index_entries, 1);
+    }
+
+    #[tokio::test]
+    async fn repeated_delegation_from_the_same_dirty_state() {
+        let repo = aged_repo(&[("a.txt", "one"), ("dir/b.txt", "two")]);
+        write_file(repo.path(), "a.txt", "dirty a");
+        write_file(repo.path(), "dir/b.txt", "dirty b");
+        let ops = GixRepoOps::new();
+
+        let (first, first_stats) = capture_stats(&ops, repo.path()).await;
+        let objects_after_first = loose_object_count(repo.path());
+        let (second, second_stats) = capture_stats(&ops, repo.path()).await;
+
+        assert!(first_stats.objects_written >= 4, "{first_stats:?}");
+        assert_eq!(second.tree, first.tree);
+        // Only the baseline commit, which carries the capture time, may be new.
+        assert!(second_stats.objects_written <= 1, "{second_stats:?}");
+        assert!(loose_object_count(repo.path()) - objects_after_first <= 1);
+    }
+
+    #[tokio::test]
+    async fn new_untracked_file_is_written_once() {
+        let repo = aged_repo(&[("a.txt", "one")]);
+        write_file(repo.path(), "new.txt", "a brand new file");
+        let blob = out_git(repo.path(), &["hash-object", "new.txt"])
+            .trim()
+            .to_string();
+        assert!(!run_git(repo.path(), &["cat-file", "-e", &blob]));
+        let ops = GixRepoOps::new();
+
+        let (first, first_stats) = capture_stats(&ops, repo.path()).await;
+        let (_, second_stats) = capture_stats(&ops, repo.path()).await;
+
+        // The new blob, the changed root tree and the baseline commit.
+        assert_eq!(first_stats.objects_written, 3, "{first_stats:?}");
+        assert!(run_git(repo.path(), &["cat-file", "-e", &blob]));
+        assert_eq!(
+            blob_bytes(repo.path(), &first.tree, "new.txt"),
+            b"a brand new file"
+        );
+        assert!(second_stats.objects_written <= 1, "{second_stats:?}");
+    }
+
+    #[tokio::test]
+    async fn repeated_delegation_with_a_large_dirty_file_writes_nothing() {
+        let repo = aged_repo(&[("small.txt", "small"), ("big.bin", "x")]);
+        let big: String = (0..4096)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
+        write_file(repo.path(), "big.bin", &big);
+        let capture = || {
+            crate::worktree::repo_ops::capture_with_threshold(
+                repo.path(),
+                BASELINE_COMMIT_MESSAGE,
+                1024,
+            )
+        };
+
+        let (first, first_stats) = capture().await.unwrap();
+        let (second, second_stats) = capture().await.unwrap();
+
+        assert!(first_stats.objects_written >= 3, "{first_stats:?}");
+        // New to the repository: hashed, then read again to be written.
+        assert_eq!(first_stats.bytes_read, 2 * big.len() as u64);
+        assert_eq!(
+            blob_bytes(repo.path(), &first.tree, "big.bin"),
+            big.as_bytes()
+        );
+        assert_eq!(second.tree, first.tree);
+        assert!(second_stats.objects_written <= 1, "{second_stats:?}");
+        assert_eq!(second_stats.files_read, 1);
+        assert_eq!(
+            second_stats.bytes_read,
+            big.len() as u64,
+            "hashed once, never re-read"
+        );
+    }
+
+    /// Tree of the working state built by reading every candidate file raw
+    /// into a private index with its disk mode.
+    #[cfg(unix)]
+    fn full_read_tree(root: &Path) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let repo = gix::open(root).unwrap();
+        let listing = out_git(root, &["ls-files", "-z", "-c", "-o", "--exclude-standard"]);
+        let candidates: std::collections::BTreeSet<&str> =
+            listing.split('\0').filter(|p| !p.is_empty()).collect();
+        let mut index = gix::index::State::new(gix::hash::Kind::Sha1);
+        let mut kept = std::collections::HashSet::new();
+        for path in candidates {
+            let abs = root.join(path);
+            let Ok(md) = fs::symlink_metadata(&abs) else {
+                continue;
+            };
+            if md.is_dir() {
+                continue;
+            }
+            let (bytes, mode) = if md.file_type().is_symlink() {
+                (
+                    fs::read_link(&abs)
+                        .unwrap()
+                        .into_os_string()
+                        .into_encoded_bytes(),
+                    gix::index::entry::Mode::SYMLINK,
+                )
+            } else if md.permissions().mode() & 0o111 != 0 {
+                (
+                    fs::read(&abs).unwrap(),
+                    gix::index::entry::Mode::FILE_EXECUTABLE,
+                )
+            } else {
+                (fs::read(&abs).unwrap(), gix::index::entry::Mode::FILE)
+            };
+            let id = repo.write_blob(&bytes).unwrap().detach();
+            index.dangerously_push_entry(
+                gix::index::entry::Stat::default(),
+                id,
+                gix::index::entry::Flags::empty(),
+                mode,
+                path.into(),
+            );
+            kept.insert(gix::bstr::BString::from(path));
+        }
+        index.sort_entries();
+        crate::worktree::repo_ops::write_tree_from_index(&repo, &index, &kept)
+            .unwrap()
+            .to_string()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn selective_capture_matches_a_full_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let repo = init_repo();
+        let root = repo.path();
+        write_file(root, ".gitignore", "*.log\n");
+        for (rel, content) in [
+            ("del.txt", "to delete"),
+            ("edit.txt", "to edit"),
+            ("run.sh", "#!/bin/sh\n"),
+            ("au.txt", "assume"),
+            ("keep.txt", "keep"),
+            ("target.txt", "target"),
+        ] {
+            write_file(root, rel, content);
+        }
+        fs::set_permissions(root.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink("target.txt", root.join("link")).unwrap();
+        age_tree(root, 3600);
+        commit_all(root, "init");
+
+        fs::remove_file(root.join("del.txt")).unwrap();
+        write_file(root, "edit.txt", "edited content");
+        write_file(root, "staged.txt", "staged only");
+        run_git_ok(root, &["add", "staged.txt"]);
+        run_git_ok(root, &["update-index", "--assume-unchanged", "au.txt"]);
+        write_file(root, "au.txt", "assume edited");
+        write_file(root, "new.txt", "untracked");
+        write_file(root, "ignored.log", "ignored");
+
+        let (captured, stats) = capture_stats(&GixRepoOps::new(), root).await;
+
+        assert!(stats.reused_index_entries > 0, "{stats:?}");
+        assert_eq!(captured.tree, full_read_tree(root));
+
+        // Git's own `add -A`, with the assume-unchanged bit cleared in a
+        // temporary copy of the index.
+        let temp = TempDir::new().unwrap();
+        let index_file = temp.path().join("index");
+        fs::copy(root.join(".git/index"), &index_file).unwrap();
+        let git_with_index = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("GIT_INDEX_FILE", &index_file)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+            String::from_utf8(out.stdout).unwrap()
+        };
+        git_with_index(&["update-index", "--no-assume-unchanged", "au.txt"]);
+        git_with_index(&["add", "-A"]);
+        assert_eq!(captured.tree, git_with_index(&["write-tree"]).trim());
+    }
+
+    #[tokio::test]
+    async fn quiet_checkout_needs_one_attempt() {
+        let repo = aged_repo(&[
+            ("a.txt", "one"),
+            ("b.txt", "two"),
+            ("c.txt", "three"),
+            ("d.txt", "four"),
+        ]);
+        // Changed files keep old mtimes, outside the racy window.
+        write_file(repo.path(), "a.txt", "edited a");
+        write_file(repo.path(), "b.txt", "edited b");
+        write_file(repo.path(), "new.txt", "untracked");
+        for name in ["a.txt", "b.txt", "new.txt"] {
+            set_mtime(&repo.path().join(name), 7200);
+        }
+        let (log, _guard) = SpanLog::install();
+
+        let captured = validated(&GixRepoOps::new(), repo.path()).await.unwrap();
+
+        let span = log.only("worktree.capture");
+        assert_eq!(span["attempts"], "1");
+        assert_eq!(span["racy_rehashed"], "0");
+        assert_eq!(span["files_read"], "3");
+        assert_eq!(span["reused_index_entries"], "2");
+        assert_eq!(log.count("worktree.capture.manifest"), 2);
+        assert_eq!(
+            log.0
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(n, _)| n == "worktree.capture.manifest")
+                .unwrap()
+                .1["paths"],
+            "5"
+        );
+        assert_eq!(
+            blob_bytes(repo.path(), &captured.tree, "a.txt"),
+            b"edited a"
+        );
+    }
+
+    /// Delegating from `repo` through a `WorkspaceService` whose writer acts
+    /// on every capture fails with the bounded-attempts error and leaves no
+    /// workspace record, checkout, worktree registration or ref behind.
+    async fn assert_delegation_fails_without_allocating(repo: &Path, always: FlakyWriterOps) {
+        use crate::worktree::WorkspaceService;
+        use querymt_agent_sqlite::repo_workspace::SqliteWorkspaceRepository;
+        use std::sync::Arc;
+
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        querymt_agent_sqlite::session::schema::init_schema(&mut conn).unwrap();
+        let registry = Arc::new(SqliteWorkspaceRepository::new(Arc::new(
+            parking_lot::Mutex::new(conn),
+        )));
+        let storage = TempDir::new().unwrap();
+        let svc = WorkspaceService::new(Arc::new(always), registry, storage.path());
+        let state = |repo: &Path| {
+            (
+                out_git(repo, &["for-each-ref"]),
+                out_git(repo, &["worktree", "list", "--porcelain"]),
+            )
+        };
+        let before = state(repo);
+
+        let err = svc
+            .allocate_for_delegation("parent", None, repo, None, "delegate", Some("batch".into()))
+            .await
+            .unwrap_err();
+
+        let message = err.to_string();
+        assert!(
+            message.contains("source changed during capture")
+                && message.contains("known-inconsistent"),
+            "{message}"
+        );
+        assert!(svc.registry().list_workspaces().await.unwrap().is_empty());
+        assert_eq!(state(repo), before, "no ref or worktree was created");
+        let leftovers: Vec<_> = fs::read_dir(storage.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name != "batch-locks" && name != "gates")
+            .collect();
+        assert!(leftovers.is_empty(), "no checkout dir: {leftovers:?}");
+    }
+
+    /// The second attempt is the only one that can succeed when the writer
+    /// acts on the first capture only; a writer acting on every capture
+    /// exhausts the attempts without a baseline or a workspace.
+    async fn assert_retried_then_bounded_failure(
+        repo: &Path,
+        once: FlakyWriterOps,
+        always: FlakyWriterOps,
+        expected_path: &str,
+        expected_content: &[u8],
+    ) {
+        let (log, guard) = SpanLog::install();
+        let captured = validated(&once, repo).await.unwrap();
+        assert_eq!(log.only("worktree.capture")["attempts"], "2");
+        assert_eq!(
+            blob_bytes(repo, &captured.tree, expected_path),
+            expected_content
+        );
+        drop(guard);
+
+        assert_delegation_fails_without_allocating(repo, always).await;
+    }
+
+    #[tokio::test]
+    async fn external_edit_to_an_already_dirty_file_during_capture() {
+        let repo = aged_repo(&[("f.txt", "base"), ("g.txt", "g")]);
+        write_file(repo.path(), "f.txt", "dirty one");
+        let edit = |root: &Path, call: u32| {
+            write_file(
+                root,
+                "f.txt",
+                &format!("dirty {}", "x".repeat(call as usize + 3)),
+            );
+        };
+        assert_retried_then_bounded_failure(
+            repo.path(),
+            FlakyWriterOps::with_hook(move |root, call| {
+                if call == 0 {
+                    edit(root, 7)
+                }
+            }),
+            FlakyWriterOps::with_hook(edit),
+            "f.txt",
+            b"dirty xxxxxxxxxx",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn untracked_file_created_during_capture() {
+        let repo = aged_repo(&[("f.txt", "base")]);
+        assert_retried_then_bounded_failure(
+            repo.path(),
+            FlakyWriterOps::with_hook(|root, call| {
+                if call == 0 {
+                    write_file(root, "late.txt", "appeared");
+                }
+            }),
+            FlakyWriterOps::with_hook(|root, call| {
+                write_file(root, &format!("late-{call}.txt"), "appeared");
+            }),
+            "late.txt",
+            b"appeared",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn same_size_rewrite_after_the_read_is_detected() {
+        let repo = aged_repo(&[("f.txt", "aaaa"), ("g.txt", "g")]);
+        run_git_ok(repo.path(), &["config", "core.trustctime", "false"]);
+        // Dirty with the same size. Its mtime lies in the future, so it stays
+        // inside the racy window of every attempt however slow the test runs.
+        write_file(repo.path(), "f.txt", "bbbb");
+        let mtime = SystemTime::now() + Duration::from_secs(3600);
+        set_mtime_to(&repo.path().join("f.txt"), mtime);
+        // Rewritten with the same size after the read, previous mtime restored:
+        // inode, size and mtime are unchanged, so only the re-hash can tell.
+        let rewrite = move |root: &Path, content: &str| {
+            write_file(root, "f.txt", content);
+            set_mtime_to(&root.join("f.txt"), mtime);
+        };
+        let (log, guard) = SpanLog::install();
+        let ops = FlakyWriterOps::with_hook(move |root, call| {
+            if call == 0 {
+                rewrite(root, "cccc");
+            }
+        });
+
+        let captured = validated(&ops, repo.path()).await.unwrap();
+
+        let span = log.only("worktree.capture");
+        assert_eq!(span["attempts"], "2");
+        // One re-hash per attempt: the first attempt passed the fingerprint
+        // comparison and only its re-hash rejected it.
+        assert_eq!(span["racy_rehashed"], "2");
+        assert_eq!(blob_bytes(repo.path(), &captured.tree, "f.txt"), b"cccc");
+        drop(guard);
+
+        let always = FlakyWriterOps::with_hook(move |root, call| {
+            rewrite(root, if call % 2 == 0 { "dddd" } else { "eeee" });
+        });
+        assert_delegation_fails_without_allocating(repo.path(), always).await;
+    }
+
+    #[tokio::test]
+    async fn capture_span_explains_a_slow_capture() {
+        let repo = aged_repo(&[("seed.txt", "seed")]);
+        let block = "x".repeat(100 * 1024);
+        for i in 0..100 {
+            let rel = format!("bulk/{i:03}.bin");
+            write_file(repo.path(), &rel, &block);
+            set_mtime(&repo.path().join(rel), 3600);
+        }
+        let (log, _guard) = SpanLog::install();
+
+        validated(&GixRepoOps::new(), repo.path()).await.unwrap();
+
+        let span = log.only("worktree.capture");
+        assert_eq!(span["attempts"], "1");
+        assert_eq!(span["files_read"], "100");
+        assert_eq!(span["bytes_read"], "10240000");
     }
 
     /// Silence unused-variable lint for helpers used only under cfg(unix).

@@ -47,6 +47,7 @@ async fn delegation_hooks_disclose_parent_and_execute_in_allocated_child() {
             constraints: None,
             expected_output: None,
             isolation: crate::worktree::DelegationIsolation::Isolated,
+            handoff_from: Some("earlier-delegation".into()),
         })
         .await
         .unwrap();
@@ -55,6 +56,7 @@ async fn delegation_hooks_disclose_parent_and_execute_in_allocated_child() {
             .unwrap();
     assert_eq!(pre["parent_session_id"], "parent");
     assert_eq!(pre["parent_cwd"], pre["cwd"]);
+    assert_eq!(pre["handoff_from"], "earlier-delegation");
     assert!(!child.path().join("hook-input.json").exists());
     hooks
         .run_delegation_start(DelegationStartRequest {

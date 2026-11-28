@@ -3,9 +3,9 @@
 
 use super::super::backend::{SnapshotError, SnapshotId, SnapshotResult, io_err};
 use super::gc::note_captured;
+use super::sink::ObjectSink;
 use super::snapshot_id;
 use super::{GitSnapshotBackend, SnapshotLock};
-use gix::objs::Write as _;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -185,39 +185,6 @@ pub(super) fn is_vanished(err: &ignore::Error) -> bool {
         .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
 }
 
-/// Reader that fails with `UnexpectedEof` (and remembers it) if the source
-/// ends before the declared number of bytes was produced.
-pub(super) struct ExactReader<R> {
-    inner: R,
-    remaining: u64,
-    shrank: bool,
-}
-
-impl<R: std::io::Read> ExactReader<R> {
-    fn new(inner: R, expected: u64) -> Self {
-        Self {
-            inner,
-            remaining: expected,
-            shrank: false,
-        }
-    }
-}
-
-impl<R: std::io::Read> std::io::Read for ExactReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        if n == 0 && self.remaining > 0 && !buf.is_empty() {
-            self.shrank = true;
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "file shrank while being snapshotted",
-            ));
-        }
-        self.remaining -= n as u64;
-        Ok(n)
-    }
-}
-
 impl GitSnapshotBackend {
     pub(super) fn load_stat_cache(repo: &gix::Repository) -> StatCache {
         let path = repo.git_dir().join(STAT_CACHE_FILE);
@@ -257,7 +224,7 @@ impl GitSnapshotBackend {
     ///
     /// This constructs a `gix_object::Tree` with proper `Entry` objects and writes it to the ODB.
     pub(super) fn build_tree_from_entries(
-        repo: &gix::Repository,
+        sink: &ObjectSink<'_>,
         entries: &[(String, gix::ObjectId, bool)],
     ) -> SnapshotResult<gix::ObjectId> {
         // Group entries by top-level directory component
@@ -283,7 +250,7 @@ impl GitSnapshotBackend {
 
         // Add subdirectory trees (recurse)
         for (dir_name, sub_entries) in &subdirs {
-            let sub_tree_id = Self::build_tree_from_entries(repo, sub_entries)?;
+            let sub_tree_id = Self::build_tree_from_entries(sink, sub_entries)?;
             tree_entries.push(gix::objs::tree::Entry {
                 mode: gix::objs::tree::EntryKind::Tree.into(),
                 filename: dir_name.as_str().into(),
@@ -312,11 +279,7 @@ impl GitSnapshotBackend {
             entries: tree_entries,
         };
 
-        let tree_id = repo.write_object(&tree).map_err(|e| {
-            SnapshotError::Repository(format!("Failed to write tree object: {}", e))
-        })?;
-
-        Ok(tree_id.detach())
+        sink.write_object(&tree)
     }
 
     /// Stage all files from the worktree and create a snapshot commit.
@@ -339,6 +302,7 @@ impl GitSnapshotBackend {
         // Held until the commit is written: the GC sweep needs the exclusive
         // lock, so it cannot delete blobs this snapshot has not committed yet.
         let _lock = SnapshotLock::shared(repo.git_dir())?;
+        let sink = ObjectSink::new(&repo, self.limits.stream_bytes);
         let mut stats = SnapshotStats::default();
         let head_tree = repo.head_commit().ok().and_then(|c| c.tree().ok());
         let mut newly_large: Vec<(String, u64)> = Vec::new();
@@ -408,7 +372,7 @@ impl GitSnapshotBackend {
                 && let Some(cached) = previous_cache.entries.get(&rel_str)
                 && cached.stamp == stamp
                 && let Ok(oid) = gix::ObjectId::from_hex(cached.oid.as_bytes())
-                && repo.has_object(oid)
+                && sink.contains(oid, size)
             {
                 stats.cached_files += 1;
                 next_cache.entries.insert(rel_str.clone(), cached.clone());
@@ -416,7 +380,7 @@ impl GitSnapshotBackend {
                 continue;
             }
 
-            let captured = match self.capture_file(&repo, path, ListedFile { size, stamp }) {
+            let captured = match self.capture_file(&sink, path, ListedFile { size, stamp }) {
                 Ok(captured) => captured,
                 Err(SnapshotError::Io { op, source, .. })
                     if matches!(op, "read" | "copy")
@@ -476,7 +440,7 @@ impl GitSnapshotBackend {
         entries.sort_by(|a, b| a.0.cmp(&b.0));
 
         // Build tree from entries
-        let tree_id = Self::build_tree_from_entries(&repo, &entries)?;
+        let tree_id = Self::build_tree_from_entries(&sink, &entries)?;
 
         stats.newly_large_files = newly_large.len();
         let (named, remaining) = large_file_warnings(&newly_large);
@@ -507,13 +471,60 @@ impl GitSnapshotBackend {
         }
         let parent_ids: Vec<gix::ObjectId> = head.iter().map(|c| c.id().detach()).collect();
 
-        // Create commit using repo.commit() which reads author/committer from config
-        // (we set user.name and user.email in the git config during init)
-        let commit_id = repo
-            .commit("HEAD", message, tree_id, parent_ids)
-            .map_err(|e| SnapshotError::Repository(format!("Failed to create commit: {}", e)))?;
+        let commit_id = Self::write_snapshot_commit(&repo, &sink, message, tree_id, parent_ids)?;
 
-        Ok((snapshot_id(commit_id.detach()), stats))
+        Ok((snapshot_id(commit_id), stats))
+    }
+
+    /// Write the snapshot commit through the sink, then point HEAD at it with a
+    /// separate ref edit (`Repository::commit` would write the object through
+    /// the alternates-aware path). Author and committer come from the store's
+    /// config (`user.name`/`user.email` are set during init).
+    fn write_snapshot_commit(
+        repo: &gix::Repository,
+        sink: &ObjectSink<'_>,
+        message: &str,
+        tree: gix::ObjectId,
+        parents: Vec<gix::ObjectId>,
+    ) -> SnapshotResult<gix::ObjectId> {
+        use gix::bstr::ByteSlice as _;
+        use gix::refs::transaction::{PreviousValue, RefEdit};
+
+        let author = repo
+            .author()
+            .ok_or_else(|| SnapshotError::Repository("Author identity is not configured".into()))?
+            .map_err(|e| SnapshotError::Repository(format!("Invalid author identity: {e}")))?;
+        let committer = repo
+            .committer()
+            .ok_or_else(|| {
+                SnapshotError::Repository("Committer identity is not configured".into())
+            })?
+            .map_err(|e| SnapshotError::Repository(format!("Invalid committer identity: {e}")))?;
+        let commit = gix::objs::Commit {
+            tree,
+            parents: parents.iter().copied().collect(),
+            author: author.into(),
+            committer: committer.into(),
+            encoding: None,
+            message: message.into(),
+            extra_headers: Vec::new(),
+        };
+        let commit_id = sink.write_object(&commit)?;
+
+        let expected = match parents.first() {
+            Some(parent) => PreviousValue::MustExistAndMatch(gix::refs::Target::Object(*parent)),
+            None => PreviousValue::MustNotExist,
+        };
+        let head: gix::refs::FullName = "HEAD"
+            .try_into()
+            .map_err(|e| SnapshotError::Repository(format!("Invalid reference name HEAD: {e}")))?;
+        let log_message =
+            gix::reference::log::message("commit", message.as_bytes().as_bstr(), parents.len());
+        repo.edit_reference(
+            RefEdit::update(head, commit_id, expected, log_message).with_deref(true),
+        )
+        .map_err(|e| SnapshotError::Repository(format!("Failed to update HEAD: {e}")))?;
+        Ok(commit_id)
     }
 
     /// Capture the current content of `path` as a blob.
@@ -522,17 +533,19 @@ impl GitSnapshotBackend {
     /// streamed, it is captured from a point-in-time copy instead.
     pub(super) fn capture_file(
         &self,
-        repo: &gix::Repository,
+        sink: &ObjectSink<'_>,
         path: &Path,
         listed: ListedFile,
     ) -> SnapshotResult<Captured> {
-        match Self::write_file_blob(repo, path, listed, self.limits.stream_bytes)? {
+        match Self::write_file_blob(sink, path, listed, self.limits.stream_bytes)? {
             CaptureOutcome::Stored { oid, bytes } => Ok(Captured {
                 oid,
                 bytes,
                 copied: false,
             }),
-            CaptureOutcome::Changed => Self::capture_from_copy(repo, path),
+            CaptureOutcome::Changed => {
+                Self::capture_from_copy(sink, path, self.limits.stream_bytes)
+            }
         }
     }
 
@@ -545,9 +558,13 @@ impl GitSnapshotBackend {
     /// being written can be torn, so the source is stat-ed before and after:
     /// a copy made while the file changed is discarded and retried, and the
     /// capture fails if the file never holds still.
-    fn capture_from_copy(repo: &gix::Repository, path: &Path) -> SnapshotResult<Captured> {
+    fn capture_from_copy(
+        sink: &ObjectSink<'_>,
+        path: &Path,
+        stream_bytes: u64,
+    ) -> SnapshotResult<Captured> {
         const COPY_ATTEMPTS: usize = 3;
-        let git_dir = repo.git_dir();
+        let git_dir = sink.git_dir();
         let dir = tempfile::Builder::new()
             .prefix(COPY_DIR_PREFIX)
             .tempdir_in(git_dir)
@@ -571,9 +588,20 @@ impl GitSnapshotBackend {
                 path.display()
             )));
         }
-        let file = fs::File::open(&copy).map_err(io_err("read", &copy))?;
+        let mut file = fs::File::open(&copy).map_err(io_err("read", &copy))?;
         let size = file.metadata().map_err(io_err("read", &copy))?.len();
-        match Self::write_stream_blob(repo, file, size)? {
+        // The rule is by size, as for any other file: a large copy streams and
+        // is always written, a small one follows the sink's normal rule.
+        let oid = if size >= stream_bytes {
+            sink.write_stream_blob(file, size)?
+        } else {
+            let mut content = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
+            std::io::Read::read_to_end(&mut file, &mut content).map_err(io_err("read", &copy))?;
+            (content.len() as u64 == size)
+                .then(|| sink.write_blob(&content))
+                .transpose()?
+        };
+        match oid {
             Some(oid) => Ok(Captured {
                 oid,
                 bytes: size,
@@ -594,7 +622,7 @@ impl GitSnapshotBackend {
     /// short or the file no longer matches the listing, so the caller must not
     /// trust it.
     pub(super) fn write_file_blob(
-        repo: &gix::Repository,
+        sink: &ObjectSink<'_>,
         path: &Path,
         listed: ListedFile,
         stream_bytes: u64,
@@ -607,20 +635,17 @@ impl GitSnapshotBackend {
             if !matches_listing(&after, &listed) || content.len() as u64 != listed.size {
                 return Ok(CaptureOutcome::Changed);
             }
-            return repo
-                .write_blob(&content)
-                .map(|id| CaptureOutcome::Stored {
-                    oid: id.detach(),
-                    bytes: content.len() as u64,
-                })
-                .map_err(|e| SnapshotError::Repository(format!("Failed to write blob: {e}")));
+            return sink.write_blob(&content).map(|oid| CaptureOutcome::Stored {
+                oid,
+                bytes: content.len() as u64,
+            });
         }
 
         let file = fs::File::open(path).map_err(io_err("read", path))?;
         // Declare the size of the opened file so the declared length matches
         // what is read; the object is only published on success.
         let size = file.metadata().map_err(io_err("read", path))?.len();
-        let Some(oid) = Self::write_stream_blob(repo, file, size)? else {
+        let Some(oid) = sink.write_stream_blob(file, size)? else {
             return Ok(CaptureOutcome::Changed);
         };
         // A size or stamp change catches growth and in-place rewrites too.
@@ -631,36 +656,5 @@ impl GitSnapshotBackend {
         } else {
             CaptureOutcome::Changed
         })
-    }
-
-    /// Stream exactly `size` bytes from `source` into a blob. `Ok(None)` if the
-    /// source ended early.
-    ///
-    /// Unlike `write_blob`, the loose-object writer compresses before checking
-    /// whether the object already exists, so this is only used for large files
-    /// that missed the stat cache.
-    pub(super) fn write_stream_blob(
-        repo: &gix::Repository,
-        source: impl std::io::Read,
-        size: u64,
-    ) -> SnapshotResult<Option<gix::ObjectId>> {
-        // Large blobs rarely compress; storing them as zlib "stored" blocks
-        // keeps the object readable by git at the cost of a copy, not a deflate.
-        let store = gix::odb::loose::Store::at_opts(
-            repo.git_dir().join("objects"),
-            repo.object_hash(),
-            gix::odb::loose::Options {
-                compression: gix::zlib::Compression::NONE,
-                alloc_limit_bytes: None,
-            },
-        );
-        let mut reader = ExactReader::new(source.take(size), size);
-        match store.write_stream(gix::objs::Kind::Blob, size, &mut reader) {
-            Ok(oid) => Ok(Some(oid)),
-            Err(_) if reader.shrank => Ok(None),
-            Err(e) => Err(SnapshotError::Repository(format!(
-                "Failed to write blob: {e}"
-            ))),
-        }
     }
 }

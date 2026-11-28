@@ -1,5 +1,6 @@
 use super::capture::*;
 use super::gc::{collect_garbage, collect_garbage_with, dir_size};
+use super::sink::ObjectSink;
 use super::*;
 use std::fs;
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -819,8 +820,13 @@ fn test_streamed_blob_matches_in_memory_hash() {
     let CaptureOutcome::Stored {
         oid: streamed,
         bytes,
-    } = GitSnapshotBackend::write_file_blob(&repo, &path, listed, Limits::default().stream_bytes)
-        .unwrap()
+    } = GitSnapshotBackend::write_file_blob(
+        &ObjectSink::new(&repo, Limits::default().stream_bytes),
+        &path,
+        listed,
+        Limits::default().stream_bytes,
+    )
+    .unwrap()
     else {
         panic!("file is stable");
     };
@@ -1113,7 +1119,7 @@ fn file_that_shrinks_during_capture_is_captured() {
     stamp.size += 512;
     let captured = backend
         .capture_file(
-            &repo,
+            &ObjectSink::new(&repo, backend.limits.stream_bytes),
             &path,
             ListedFile {
                 size: stamp.size,
@@ -1150,7 +1156,7 @@ fn file_that_grows_during_capture_is_captured_whole() {
     stamp.size = 2048;
     let captured = backend
         .capture_file(
-            &repo,
+            &ObjectSink::new(&repo, backend.limits.stream_bytes),
             &path,
             ListedFile {
                 size: 2048,
@@ -1888,7 +1894,7 @@ fn capture_of_a_missing_file_is_reported_as_a_read_error() {
 
     let error = backend
         .capture_file(
-            &repo,
+            &ObjectSink::new(&repo, backend.limits.stream_bytes),
             &work.path().join("gone.txt"),
             ListedFile {
                 size: 3,
@@ -1920,7 +1926,7 @@ fn stream_capture_reports_the_bytes_it_read() {
     // The listing is stale: the file grew after it was listed.
     let captured = backend
         .capture_file(
-            &repo,
+            &ObjectSink::new(&repo, backend.limits.stream_bytes),
             &path,
             ListedFile {
                 size: 3000,
@@ -2071,7 +2077,7 @@ async fn small_file_that_no_longer_matches_its_listing_is_captured_from_a_copy()
 
     let captured = backend
         .capture_file(
-            &repo,
+            &ObjectSink::new(&repo, backend.limits.stream_bytes),
             &path,
             ListedFile {
                 size: 5,
@@ -2082,4 +2088,435 @@ async fn small_file_that_no_longer_matches_its_listing_is_captured_from_a_copy()
 
     assert!(captured.copied, "a stale listing must not be trusted");
     assert_eq!(captured.bytes, 20);
+}
+
+// ==================== Linked stores (managed workspaces) ====================
+
+mod linked {
+    use super::*;
+    use crate::session::backend::StorageBackend as _;
+    use crate::worktree::GixRepoOps;
+    use crate::worktree::service::{WorkspaceBinding, WorkspaceService};
+    use crate::worktree::test_support::{
+        commit_files, init_repo, materialize, write_index_from_head,
+    };
+    use std::process::Command;
+    use std::sync::Arc;
+
+    /// Run git in `dir` with the user's and the system's configuration
+    /// disabled, and return trimmed stdout.
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = git_raw(dir, args);
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn git_raw(dir: &Path, args: &[&str]) -> std::process::Output {
+        Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .expect("git must be available")
+    }
+
+    /// An allocated isolated delegate workspace and the store of its snapshots.
+    struct Delegate {
+        source: TempDir,
+        _data: TempDir,
+        binding: WorkspaceBinding,
+        backend: GitSnapshotBackend,
+    }
+
+    impl Delegate {
+        fn cwd(&self) -> &Path {
+            &self.binding.effective_cwd
+        }
+
+        fn baseline(&self) -> String {
+            self.binding
+                .record
+                .baseline
+                .as_ref()
+                .unwrap()
+                .baseline_commit
+                .clone()
+        }
+
+        fn source_objects(&self) -> PathBuf {
+            self.binding.record.repository.common_dir.join("objects")
+        }
+
+        fn store_dir(&self) -> PathBuf {
+            self.backend.snapshot_dir(self.cwd()).unwrap()
+        }
+
+        fn repo(&self) -> gix::Repository {
+            repo_for(&self.backend, self.cwd())
+        }
+
+        async fn link(&self) {
+            self.backend
+                .link_object_source(self.cwd(), &self.source_objects(), &self.baseline())
+                .await
+                .unwrap();
+        }
+
+        /// Ids of the objects stored loose in the store's own `objects/`.
+        fn own_objects(&self) -> BTreeSet<gix::ObjectId> {
+            let objects = self.store_dir().join("objects");
+            files_below(&objects)
+                .into_iter()
+                .filter_map(|rel| {
+                    let mut parts = rel.iter();
+                    let (dir, name) = (parts.next()?.to_str()?, parts.next()?.to_str()?);
+                    (dir.len() == 2 && parts.next().is_none())
+                        .then(|| gix::ObjectId::from_hex(format!("{dir}{name}").as_bytes()).ok())?
+                })
+                .collect()
+        }
+
+        fn own_blobs(&self) -> BTreeSet<gix::ObjectId> {
+            let repo = self.repo();
+            self.own_objects()
+                .into_iter()
+                .filter(|id| repo.find_header(*id).unwrap().kind() == gix::objs::Kind::Blob)
+                .collect()
+        }
+
+        fn is_own(&self, id: gix::ObjectId) -> bool {
+            self.own_objects().contains(&id)
+        }
+    }
+
+    /// A source repository with `commits` (each a set of files), an optional
+    /// uncommitted edit of the first file, and a delegate allocated from it.
+    async fn delegate(
+        commits: &[&[(&str, &str)]],
+        dirty: Option<(&str, &str)>,
+        limits: Limits,
+    ) -> Delegate {
+        let source = init_repo();
+        for files in commits {
+            commit_files(source.path(), "commit", files);
+            materialize(source.path(), files);
+        }
+        write_index_from_head(source.path());
+        if let Some((path, content)) = dirty {
+            materialize(source.path(), &[(path, content)]);
+        }
+        let data = TempDir::new().unwrap();
+        let storage = querymt_agent_sqlite::session::sqlite_storage::SqliteStorage::connect(
+            data.path().join("sessions.db"),
+        )
+        .await
+        .unwrap();
+        let svc = WorkspaceService::new(
+            Arc::new(GixRepoOps::new()),
+            storage.workspace_repository().unwrap(),
+            data.path().join("worktrees"),
+        );
+        let binding = svc
+            .allocate_for_delegation(
+                "parent",
+                None,
+                source.path(),
+                None,
+                "delegate",
+                Some("batch".into()),
+            )
+            .await
+            .unwrap();
+        let backend = GitSnapshotBackend::new()
+            .with_snapshot_base(data.path().join("snapshots"))
+            .with_limits(limits);
+        Delegate {
+            source,
+            _data: data,
+            binding,
+            backend,
+        }
+    }
+
+    const FILES: &[(&str, &str)] = &[
+        ("a.txt", "alpha"),
+        ("src/b.txt", "bravo"),
+        ("src/deep/c.txt", "charlie"),
+    ];
+
+    fn alternates(store: &Path) -> Option<String> {
+        fs::read_to_string(store.join("objects/info/alternates")).ok()
+    }
+
+    #[tokio::test]
+    async fn fresh_delegate_workspace_snapshot_writes_no_baseline_content() {
+        let d = delegate(&[FILES], None, Limits::default()).await;
+        d.link().await;
+
+        let (id, stats) = d.backend.create_snapshot(d.cwd(), "snapshot").unwrap();
+        assert_eq!(stats.files, FILES.len(), "every in-scope file is recorded");
+        assert_eq!(
+            stats.hashed_files,
+            FILES.len(),
+            "the fresh checkout is racily clean, so every file is read"
+        );
+        let repo = d.repo();
+        assert_eq!(
+            snapshot_files(&repo, &id),
+            FILES.iter().map(|(p, _)| p.to_string()).collect()
+        );
+        assert!(d.own_blobs().is_empty(), "no baseline blob is written");
+        assert_eq!(
+            d.own_objects(),
+            BTreeSet::from([gix::ObjectId::from_hex(id.as_str().as_bytes()).unwrap()]),
+            "only the snapshot commit is written: unchanged baseline trees are skipped too"
+        );
+    }
+
+    #[tokio::test]
+    async fn content_edited_in_the_workspace_is_stored_in_the_snapshot_store() {
+        let d = delegate(&[FILES], None, Limits::default()).await;
+        d.link().await;
+        d.backend.create_snapshot(d.cwd(), "snapshot").unwrap();
+
+        fs::write(d.cwd().join("src/b.txt"), "edited").unwrap();
+        let (id, _) = d.backend.create_snapshot(d.cwd(), "snapshot").unwrap();
+
+        let edited = blob_id(&d.repo(), &id, "src/b.txt");
+        assert_eq!(d.own_blobs(), BTreeSet::from([edited]));
+        assert_eq!(d.repo().find_object(edited).unwrap().data, b"edited");
+    }
+
+    #[tokio::test]
+    async fn large_baseline_file_is_stored_in_the_snapshot_store() {
+        let big = "x".repeat(4096);
+        let files = [("small.txt", "small"), ("big.txt", big.as_str())];
+        let d = delegate(&[&files], None, small_limits()).await;
+        d.link().await;
+
+        let (id, _) = d.backend.create_snapshot(d.cwd(), "snapshot").unwrap();
+        let repo = d.repo();
+        let big_id = blob_id(&repo, &id, "big.txt");
+        assert!(d.is_own(big_id), "the large blob is in the store itself");
+        assert!(
+            !d.is_own(blob_id(&repo, &id, "small.txt")),
+            "a small baseline blob is not"
+        );
+
+        fs::write(d.cwd().join("big.txt"), "clobbered").unwrap();
+        let restored = d
+            .backend
+            .checkout_paths(&repo, d.cwd(), &id, &[PathBuf::from("big.txt")])
+            .unwrap();
+        assert_eq!(restored.streamed_files, 1);
+        assert_eq!(fs::read_to_string(d.cwd().join("big.txt")).unwrap(), big);
+    }
+
+    #[tokio::test]
+    async fn cached_file_whose_object_only_the_source_holds_is_stored_again() {
+        let d = delegate(&[FILES], None, Limits::default()).await;
+        d.link().await;
+
+        // The source holds this blob, but outside the retained baseline.
+        let file = d.cwd().join("a.txt");
+        fs::write(&file, "staged elsewhere").unwrap();
+        git(d.cwd(), &["add", "a.txt"]);
+        for (path, _) in FILES {
+            backdate(&d.cwd().join(path));
+        }
+        let (id, _) = d.backend.create_snapshot(d.cwd(), "snapshot").unwrap();
+        let blob = blob_id(&d.repo(), &id, "a.txt");
+        assert!(d.is_own(blob));
+
+        // Drop the store's own copy: only the source holds it now.
+        let hex = blob.to_string();
+        fs::remove_file(
+            d.store_dir()
+                .join("objects")
+                .join(&hex[..2])
+                .join(&hex[2..]),
+        )
+        .unwrap();
+        assert!(d.repo().has_object(blob), "the alternate still serves it");
+
+        let (_, stats) = d.backend.create_snapshot(d.cwd(), "snapshot").unwrap();
+        assert_eq!(stats.cached_files, FILES.len() - 1);
+        assert_eq!(stats.hashed_files, 1, "the cached entry is not trusted");
+        assert!(d.is_own(blob), "the blob is stored in the store again");
+    }
+
+    /// A snapshot per version of a scratch file, so a GC sweep has work.
+    async fn pile_up_snapshots(d: &Delegate, count: usize) {
+        for i in 0..count {
+            fs::write(d.cwd().join("scratch.txt"), format!("version {i}")).unwrap();
+            d.backend.track(d.cwd()).await.unwrap();
+        }
+    }
+
+    fn fsck(store: &Path) {
+        // `fsck` of a bare store whose config carries `core.worktree`.
+        let out = git_raw(store, &["--git-dir", ".", "fsck", "--connectivity-only"]);
+        assert!(
+            out.status.success(),
+            "git fsck failed: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    async fn collect_everything_but_the_last(d: &Delegate) {
+        let result = d.backend.gc(d.cwd(), &keep_last(1)).await.unwrap();
+        assert!(result.deleted_objects > 0, "a sweep ran: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn undo_after_the_source_branch_moves() {
+        let d = delegate(
+            &[&[("a.txt", "one")], &[("a.txt", "two"), ("b.txt", "b")]],
+            Some(("a.txt", "parent dirty")),
+            Limits::default(),
+        )
+        .await;
+        d.link().await;
+        let (first, _) = d.backend.create_snapshot(d.cwd(), "snapshot").unwrap();
+        pile_up_snapshots(&d, 12).await;
+
+        let source = d.source.path();
+        git(source, &["reset", "--hard", "HEAD~1"]);
+        git(source, &["reflog", "expire", "--expire=now", "--all"]);
+        git(source, &["gc", "--prune=now", "-q"]);
+
+        fs::write(d.cwd().join("a.txt"), "clobbered").unwrap();
+        d.backend.restore(d.cwd(), &first).await.unwrap();
+        assert_eq!(
+            fs::read_to_string(d.cwd().join("a.txt")).unwrap(),
+            "parent dirty"
+        );
+        assert_eq!(fs::read_to_string(d.cwd().join("b.txt")).unwrap(), "b");
+
+        fsck(&d.store_dir());
+        collect_everything_but_the_last(&d).await;
+    }
+
+    #[tokio::test]
+    async fn content_committed_in_the_workspace_survives_source_pruning() {
+        let d = delegate(&[FILES], None, Limits::default()).await;
+        d.link().await;
+
+        fs::write(d.cwd().join("new.txt"), "committed in the workspace").unwrap();
+        git(d.cwd(), &["add", "new.txt"]);
+        git(d.cwd(), &["commit", "-q", "-m", "delegate work"]);
+        let blob = git(d.cwd(), &["rev-parse", "HEAD:new.txt"]);
+        let (id, _) = d.backend.create_snapshot(d.cwd(), "snapshot").unwrap();
+        pile_up_snapshots(&d, 12).await;
+
+        // Drop the branch and every other reference to the commit.
+        let branch = d.binding.record.branch.as_str().to_string();
+        git(d.cwd(), &["checkout", "-q", "--detach", &d.baseline()]);
+        git(d.source.path(), &["branch", "-D", &branch]);
+        git(
+            d.source.path(),
+            &["reflog", "expire", "--expire=now", "--all"],
+        );
+        git(d.source.path(), &["gc", "--prune=now", "-q"]);
+        assert!(
+            !git_raw(d.source.path(), &["cat-file", "-e", &blob])
+                .status
+                .success(),
+            "the source no longer holds the committed blob"
+        );
+
+        d.backend.restore(d.cwd(), &id).await.unwrap();
+        assert_eq!(
+            fs::read_to_string(d.cwd().join("new.txt")).unwrap(),
+            "committed in the workspace"
+        );
+        fsck(&d.store_dir());
+        collect_everything_but_the_last(&d).await;
+    }
+
+    #[tokio::test]
+    async fn source_repository_with_a_different_object_format() {
+        let source = TempDir::new().unwrap();
+        let init = git_raw(source.path(), &["init", "-q", "--object-format=sha256"]);
+        if !init.status.success() {
+            eprintln!("skipped: this git cannot create SHA-256 repositories");
+            return;
+        }
+        git(source.path(), &["config", "user.email", "t@example.com"]);
+        git(source.path(), &["config", "user.name", "t"]);
+        git(
+            source.path(),
+            &["commit", "-q", "--allow-empty", "-m", "init"],
+        );
+        let baseline = git(source.path(), &["rev-parse", "HEAD"]);
+        assert_eq!(baseline.len(), 64, "a SHA-256 commit id");
+
+        let work = TempDir::new().unwrap();
+        let base = TempDir::new().unwrap();
+        fs::write(work.path().join("a.txt"), "alpha").unwrap();
+        let backend = GitSnapshotBackend::new().with_snapshot_base(base.path());
+        backend
+            .link_object_source(work.path(), &source.path().join(".git/objects"), &baseline)
+            .await
+            .unwrap();
+
+        let store = backend.snapshot_dir(work.path()).unwrap();
+        assert_eq!(alternates(&store), None, "no alternates entry");
+        assert!(!store.join(super::super::sink::BASELINE_FILE).exists());
+        let id = backend.track(work.path()).await.unwrap();
+        let repo = repo_for(&backend, work.path());
+        assert_eq!(snapshot_files(&repo, &id), BTreeSet::from(["a.txt".into()]));
+        assert!(
+            repo.find_object(blob_id(&repo, &id, "a.txt")).is_ok()
+                && files_below(&store.join("objects"))
+                    .iter()
+                    .any(|p| p.components().count() == 2),
+            "the content is written to the store itself"
+        );
+    }
+
+    #[tokio::test]
+    async fn link_object_source_is_idempotent() {
+        let d = delegate(&[FILES], None, Limits::default()).await;
+        d.link().await;
+        d.link().await;
+
+        let wanted = d.source_objects().to_string_lossy().into_owned();
+        let text = alternates(&d.store_dir()).expect("alternates written");
+        assert_eq!(text.lines().collect::<Vec<_>>(), [wanted.as_str()]);
+        assert_eq!(
+            fs::read_to_string(d.store_dir().join("qmt-baseline")).unwrap(),
+            format!("{}\n", d.baseline())
+        );
+    }
+
+    #[tokio::test]
+    async fn link_object_source_skips_a_store_that_stays_busy() {
+        let d = delegate(&[FILES], None, Limits::default()).await;
+        d.backend.open_or_init(d.cwd()).unwrap();
+        // An in-flight snapshot holds the shared lock past the bounded wait.
+        let busy = SnapshotLock::shared(&d.store_dir()).unwrap();
+        d.link().await;
+        assert!(
+            alternates(&d.store_dir()).is_none(),
+            "a busy store stays unlinked"
+        );
+        assert!(!d.store_dir().join("qmt-baseline").exists());
+
+        drop(busy);
+        d.link().await;
+        assert!(
+            alternates(&d.store_dir()).is_some(),
+            "linked once it is free"
+        );
+    }
 }

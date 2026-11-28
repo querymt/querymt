@@ -627,6 +627,52 @@ pub trait HandoffHost: OwnerHost {
     async fn discard_successor(&self, successor: &str);
 }
 
+/// A handoff that has stopped the owner and holds the checkout's exclusive
+/// activity lease, waiting for its successor session.
+///
+/// Created by [`WorktreeOps::begin_handoff`]. Dropping it without
+/// [`Self::commit`] releases the lease and leaves ownership unchanged.
+#[must_use = "dropping a pending handoff abandons it"]
+pub struct PendingHandoff {
+    record: WorkspaceRecord,
+    previous: String,
+    lease: crate::worktree::gate::CheckoutActivityLease,
+}
+
+impl PendingHandoff {
+    /// The workspace record read under the lease.
+    pub fn record(&self) -> &WorkspaceRecord {
+        &self.record
+    }
+
+    /// The session that owns the workspace until the handoff commits.
+    pub fn previous(&self) -> &str {
+        &self.previous
+    }
+
+    /// Transfer ownership to `successor` with one compare-and-swap and release
+    /// the lease. The successor must already exist behind its startup barrier.
+    ///
+    /// # Errors
+    /// `not_owner` when the owner changed, `workspace_not_ready` when the
+    /// workspace left the ready state; ownership is unchanged and the lease is
+    /// released.
+    pub async fn commit(
+        self,
+        ops: &WorktreeOps,
+        successor: &str,
+    ) -> Result<WorkspaceRecord, WorktreeOpError> {
+        let moved = ops
+            .service
+            .registry()
+            .transfer_owner(&self.record.id, &self.previous, successor)
+            .await
+            .map_err(handoff_transfer_error)?;
+        drop(self.lease);
+        Ok(moved)
+    }
+}
+
 /// Map a failed ownership compare-and-swap to the documented handoff codes.
 fn handoff_transfer_error(err: crate::session::error::SessionError) -> WorktreeOpError {
     use crate::session::error::SessionError;
@@ -934,6 +980,47 @@ impl WorktreeOps {
         Ok((fresh, lease))
     }
 
+    /// The first half of every ownership handoff: resolve the workspace,
+    /// require an owned local ready workspace, stop its idle owner and take the
+    /// checkout's exclusive activity lease. Nothing is created or changed.
+    ///
+    /// The returned [`PendingHandoff`] owns the lease and the record read
+    /// under it. Pass it to [`PendingHandoff::commit`] once the successor
+    /// session exists behind its startup barrier; dropping it releases the
+    /// lease and leaves the previous owner untouched.
+    ///
+    /// # Errors
+    /// `not_owner`, `workspace_not_ready`, `owner_not_local`, `owner_transferred`
+    /// and `owner_active`; nothing is changed.
+    pub async fn begin_handoff(
+        &self,
+        host: &dyn OwnerHost,
+        target: &WorkspaceTarget,
+    ) -> Result<PendingHandoff, WorktreeOpError> {
+        let record = self.resolve(target).await?;
+        let previous = record.ownership.owner_session_id.clone().ok_or_else(|| {
+            WorktreeOpError::rejected("not_owner", "workspace has no owner session to hand off")
+        })?;
+        if record.lifecycle != WorkspaceLifecycle::Ready {
+            return Err(WorktreeOpError::rejected(
+                "workspace_not_ready",
+                format!("workspace {} is {}", record.id, record.lifecycle),
+            ));
+        }
+        let (record, lease) = self.quiesce(host, record).await?;
+        if record.lifecycle != WorkspaceLifecycle::Ready {
+            return Err(WorktreeOpError::rejected(
+                "workspace_not_ready",
+                format!("workspace {} is {}", record.id, record.lifecycle),
+            ));
+        }
+        Ok(PendingHandoff {
+            record,
+            previous,
+            lease,
+        })
+    }
+
     /// Hand ownership of a ready workspace to a new session in the same
     /// checkout. Files, branch, index and baseline are untouched.
     ///
@@ -973,24 +1060,9 @@ impl WorktreeOps {
         options: HandoffOptions,
     ) -> Result<(WorktreeHandoffResponse, Option<i64>), WorktreeOpError> {
         let HandoffOptions { name, summary } = options;
-        let registry = self.service.registry();
-        let record = self.resolve(target).await?;
-        let previous = record.ownership.owner_session_id.clone().ok_or_else(|| {
-            WorktreeOpError::rejected("not_owner", "workspace has no owner session to hand off")
-        })?;
-        if record.lifecycle != WorkspaceLifecycle::Ready {
-            return Err(WorktreeOpError::rejected(
-                "workspace_not_ready",
-                format!("workspace {} is {}", record.id, record.lifecycle),
-            ));
-        }
-        let (record, lease) = self.quiesce(host, record).await?;
-        if record.lifecycle != WorkspaceLifecycle::Ready {
-            return Err(WorktreeOpError::rejected(
-                "workspace_not_ready",
-                format!("workspace {} is {}", record.id, record.lifecycle),
-            ));
-        }
+        let pending = self.begin_handoff(host, target).await?;
+        let record = pending.record().clone();
+        let previous = pending.previous().to_string();
 
         // Summarize before creating anything: a failure here leaves no trace.
         let summary = if summary {
@@ -1008,17 +1080,13 @@ impl WorktreeOps {
             host.discard_successor(&successor).await;
             return Err(err);
         }
-        let moved = match registry
-            .transfer_owner(&record.id, &previous, &successor)
-            .await
-        {
+        let moved = match pending.commit(self, &successor).await {
             Ok(moved) => moved,
             Err(err) => {
                 host.discard_successor(&successor).await;
-                return Err(handoff_transfer_error(err));
+                return Err(err);
             }
         };
-        drop(lease);
         host.publish_successor(&successor).await.map_err(|err| {
             WorktreeOpError::rejected(
                 "handoff_incomplete",

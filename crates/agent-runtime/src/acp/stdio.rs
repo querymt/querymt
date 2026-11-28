@@ -2705,6 +2705,7 @@ mod stdio_tests {
                         tool_call_id: Some("call-1".into()),
                         batch_id: None,
                         cycle_id: None,
+                        handoff_from: None,
                     },
                 },
             ),

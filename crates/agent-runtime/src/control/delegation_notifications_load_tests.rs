@@ -52,6 +52,7 @@ async fn load_delivers_completion_buffered_before_history_once() {
         tool_call_id: Some("call-1".into()),
         batch_id: None,
         cycle_id: None,
+        handoff_from: None,
     });
     stream.emit(AgentEventKind::SessionForked {
         parent_session_id: session_id.clone(),
@@ -151,6 +152,7 @@ fn live_translator_emits_camel_case_extension_notification() {
             tool_call_id: Some("call-1".into()),
             batch_id: None,
             cycle_id: None,
+            handoff_from: None,
         },
     ));
     let mut translator = crate::acp::shared::AcpLiveEventTranslator::new();
@@ -177,6 +179,7 @@ fn seeding_history_enriches_lifecycle_behind_live_stage_watermark() {
             tool_call_id: Some("call-1".into()),
             batch_id: None,
             cycle_id: None,
+            handoff_from: None,
         },
     );
     requested.session_seq = 1;
@@ -333,6 +336,7 @@ fn seeding_connection_history_preserves_live_delegation_completion() {
                 tool_call_id: Some("call-1".into()),
                 batch_id: None,
                 cycle_id: None,
+                handoff_from: None,
             },
         ),
         event(

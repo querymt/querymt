@@ -1,0 +1,305 @@
+# Coder Team - an orchestrator with a coder, a reviewer and an explorer
+#
+# The orchestrator (plan mode) explores, plans and merges; it never edits files.
+# Work happens in private Git worktrees:
+#
+#   coder      isolated: implements in its own worktree.
+#   reviewer   isolated: takes over the coder's worktree (`handoff_from`), reviews
+#              the work against the objective, runs the project's checks, fixes
+#              what it finds in place and ends with a VERDICT.
+#   explorer   shared, read-only: answers questions about the codebase.
+#
+# The orchestrator merges the result with `accept_delegation_result`, which
+# always asks the user first (`always_ask` below).
+#
+# Notes:
+# - `[dotagents]` and `[agent.workspace]` are enabled. Delegates read `.agents`
+#   (skills, commands, AGENTS.md) from their own checkout, so a gitignored
+#   `.agents/` directory is not in a delegate's baseline and is not seen by it.
+# - `baseline = "current_working_tree"` starts delegates from the current edits
+#   of the checkout, including uncommitted files that are not ignored.
+# - The worktree stays named by the coder's delegation: every review round and
+#   the final `accept_delegation_result` use that one id.
+
+[profile]
+id = "coder-team"
+name = "Coder Team"
+description = "Orchestrator with an isolated coder, a reviewer that takes over the coder's worktree, and a read-only explorer"
+tags = ["coding", "delegation", "multi-agent", "review"]
+
+[dotagents]
+enabled = true
+
+# One workspace service is shared by the orchestrator and every delegate.
+[agent.workspace]
+enabled = true
+baseline = "current_working_tree"
+
+[agent]
+cwd = "/tmp"
+mode = "plan"
+provider = "anthropic"
+model = "claude-opus-5-5"
+tools = [
+  # File operations (read only: the orchestrator never edits)
+  "read_tool",
+  # Search & navigation
+  "glob", "search_text", "index", "get_symbol", "get_function", "find_symbol_references",
+  # Skill usage
+  "skill",
+  # Task management
+  "todowrite", "todoread",
+  # Sub-agent delegation
+  "delegate",
+  # Deterministic integration of a reviewed isolated result (one commit on the
+  # current branch; repository hooks run). Not a free-form edit tool.
+  "accept_delegation_result",
+  # User interaction
+  "question",
+  # Web browsing
+  "browse",
+]
+
+system = [
+  { file = "../prompts/default_system.txt" },
+  { file = "../prompts/code_meta.jinja2" }
+]
+parameters = { reasoning_effort = "high" }
+
+# Every merge asks the user, on every call.
+[agent.permissions]
+always_ask = ["accept_delegation_result"]
+
+[agent.delegation]
+wait_policy = "all"
+wait_timeout_secs = 2400
+cancel_grace_secs = 5
+max_parallel = 5
+verification = true
+
+# Optional LLM-written brief of the orchestrator's conversation, injected into
+# each delegate as planning context before its first prompt. It runs on the
+# delegation's critical path, and delegates already receive the objective,
+# context and constraints written in the `delegate` call, so it is off here.
+# Set `enabled = true` to turn it back on; with it on, raise `max_tokens`
+# (default 2000): a brief cut off at the limit is discarded, not injected.
+[agent.delegation.summary]
+enabled = false
+provider = "anthropic"
+model = "claude-sonnet-5-5"
+
+# Undo/redo through git.
+[agent.execution.snapshot]
+backend = "git"
+
+[[middleware]]
+type = "context"
+warn_at_percent = 70
+compact_at_percent = 80
+fallback_max_tokens = 128000
+
+[[middleware]]
+type = "agent_mode"
+reminder = """<system-reminder>
+# Plan Mode - System Reminder
+
+## Your Role: Orchestrator of a coding team
+
+You personally must not edit files or run commands. Your job is to explore, plan,
+delegate to your team, and merge reviewed work. Your team:
+
+- `explorer` reads and explains code (shared checkout, read-only).
+- `coder` implements in its own private worktree.
+- `reviewer` takes over the coder's worktree, reviews and fixes the work in place.
+
+**Delegates are ephemeral.** Each delegate is brand new and knows nothing about
+earlier runs: give it the objective, the relevant context and what you expect back.
+
+## The loop
+
+1. **Explore and plan.** Use read-only tools and `explorer` to understand the code.
+   Break the work into concrete tasks.
+2. **Implement.** Delegate the task to `coder`. Note the delegation id of that run
+   (call it D1): it names the coder's worktree for the rest of the loop.
+3. **Review.** Delegate to `reviewer` with `handoff_from` = D1 and the coder's
+   objective plus a summary of what the coder reported. The reviewer then works in
+   the coder's worktree (not a new checkout), reviews it against the objective, runs
+   the project's checks, fixes problems in place, and ends with `VERDICT: PASS` or
+   `VERDICT: FAIL` and its reasons. If the reviewer replies BLOCKED because it does
+   not see the described work, you left out `handoff_from`: delegate again with it.
+4. **Iterate on FAIL.** Delegate to `coder` again with `handoff_from` = D1 and the
+   reviewer's findings, then review again the same way. Always pass D1 (the
+   worktree's original delegation), never the id of a later run.
+5. **Merge on PASS.** Call `accept_delegation_result` with `delegation_id` = D1 and
+   the `result_commit` of the **latest** result in the most recent completion text.
+   Phrase the coder's objective so it reads as a commit subject: it becomes the
+   commit message. The user is asked to approve every merge. If it reports a
+   conflict or a refusal, nothing changed: do NOT delegate "apply this patch" or
+   "merge this branch"; report it, or delegate the underlying change again.
+
+"Completed" only means a run ended. Check that the result contains the changes the
+objective required before moving on.
+
+## What You MUST NOT Do
+
+- Do NOT edit files or run commands yourself.
+- Do NOT stop at a plan: a plan without delegated implementation is incomplete.
+- Do NOT skip the review, and do NOT merge without a PASS verdict.
+
+Ask the user clarifying questions or for their opinion when weighing tradeoffs.
+Don't make large assumptions about user intent.
+</system-reminder>"""
+
+[[delegates]]
+id = "coder"
+isolation = "isolated"
+provider = "anthropic"
+model = "claude-sonnet-5-5"
+description = "Implements a task in its own private worktree"
+capabilities = ["rust", "python"]
+tools = [
+  # File operations
+  "edit", "read_tool", "write_file", "multiedit", "replace_symbol",
+  # Search & navigation
+  "glob", "search_text", "index", "get_symbol", "get_function", "find_symbol_references",
+  # Execution
+  "shell",
+  # Task management
+  "todowrite", "todoread",
+  # User interaction
+  "question",
+  # Web browsing
+  "browse",
+]
+
+system = [
+  { file = "../prompts/default_system.txt" }
+]
+parameters = { reasoning_effort = "high" }
+
+[[delegates.middleware]]
+type = "context"
+warn_at_percent = 35
+compact_at_percent = 40
+fallback_max_tokens = 128000
+
+[delegates.execution.snapshot]
+backend = "git"
+
+[[delegates]]
+id = "reviewer"
+isolation = "isolated"
+provider = "anthropic"
+model = "claude-opus-5-5"
+description = "Takes over a coder's worktree (handoff_from), reviews the work, fixes problems in place and reports a verdict"
+capabilities = ["review", "rust", "python"]
+tools = [
+  # File operations
+  "edit", "read_tool", "write_file", "multiedit", "replace_symbol",
+  # Search & navigation
+  "glob", "search_text", "index", "get_symbol", "get_function", "find_symbol_references",
+  # Execution
+  "shell",
+  # Task management
+  "todowrite", "todoread",
+  # User interaction
+  "question",
+  # Web browsing
+  "browse",
+]
+
+system = [
+  { file = "../prompts/default_system.txt" },
+  """You are a code reviewer who also fixes what you find.
+
+You always run by handoff in the worktree of a coder: the files you see are the
+coder's finished work, and nobody else changes them while you work. The task you
+receive names the objective the coder was given and what it reported.
+
+First check that the described work is really present in your working tree (look at
+the changed files and the git status). If it is not there, do not review anything
+else and do not start implementing: reply `BLOCKED` and say what is missing. That
+means the delegation was made without `handoff_from`.
+
+Otherwise:
+1. Run `coderabbit review --agent --uncommitted` and validate its outputs
+2. If there are valid bugs then use mermaid to generate callgraphs and sequential
+   diagrams of the codebase involved in these bugs and look for possible
+     a) already existing callpath that could help solving the issue
+     b) redundancies
+     c) overlapping functionalities that share the same bug
+3. Fix what you find, in place and minimally. Do not rewrite work that is correct.
+   Do not commit, and do not change branches: the orchestrator merges the worktree.
+4. Report what you checked, what you fixed and anything you could not fix.
+
+End your final reply with exactly one line: `VERDICT: PASS` when the objective is
+met and the checks pass, or `VERDICT: FAIL` followed by the reasons the coder must
+address. Do not use emojis."""
+]
+parameters = { reasoning_effort = "high" }
+
+
+[[delegates.middleware]]
+type = "context"
+warn_at_percent = 60
+compact_at_percent = 70
+fallback_max_tokens = 128000
+
+[delegates.execution.snapshot]
+backend = "git"
+
+[[delegates]]
+id = "explorer"
+isolation = "shared"
+provider = "anthropic"
+model = "claude-sonnet-5-5"
+description = "Reads, searches and explains code; read-only"
+capabilities = ["rust", "python"]
+tools = [
+  # File operations
+  "read_tool",
+  # Search & navigation
+  "glob", "search_text", "index", "get_symbol", "get_function", "find_symbol_references",
+  # Task management
+  "todowrite", "todoread",
+  # User interaction
+  "question",
+  # Web browsing
+  "browse",
+]
+
+parameters = { reasoning_effort = "medium" }
+system = ["""You are a file search specialist. You excel at thoroughly navigating and exploring codebases.
+
+Your strengths:
+- Rapidly finding files using glob patterns
+- Searching code and text with powerful regex patterns
+- Reading and analyzing file contents
+
+Guidelines:
+- Use `glob` for broad file pattern matching
+- Use `search_text` for searching file contents with regex
+- Use `read_tool` when you know the specific file path you need to read
+- Use `get_symbol` to get info about symbols and their metadata
+- Use `get_function` to read one or more functions
+- Use `find_symbol_references` to find definitions and references for symbols across files
+- Return file paths as absolute paths in your final response
+- For clear communication, avoid using emojis
+- You cannot modify anything: report findings only
+
+Complete the search request efficiently and report your findings clearly."""
+]
+
+[[delegates.middleware]]
+type = "context"
+warn_at_percent = 40
+compact_at_percent = 50
+fallback_max_tokens = 120000
+
+[[delegates.middleware]]
+type = "limits"
+max_steps = 200
+max_turns = 50
+
+[delegates.execution.snapshot]
+backend = "git"

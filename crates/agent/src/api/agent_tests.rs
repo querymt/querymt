@@ -3945,6 +3945,7 @@ async fn request_delegation_for(
                 tool_call_id: Some("call-1".into()),
                 batch_id: None,
                 cycle_id: None,
+                handoff_from: None,
             },
         )
         .await
@@ -4501,6 +4502,7 @@ async fn parent_clock_keeps_three_shell_delegations_terminal_on_wire() {
                     tool_call_id: Some(format!("dispatch-{target}")),
                     batch_id: None,
                     cycle_id: None,
+                    handoff_from: None,
                 },
             )
             .await

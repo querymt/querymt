@@ -146,9 +146,29 @@ impl DelegationSummarizer {
         .await
     }
 
+    async fn summarize_with_basis(
+        &self,
+        parent_history: &[AgentMessage],
+        delegation_objective: &str,
+        operation: &AttemptOperation,
+        basis: BillingBasis,
+    ) -> SessionResult<String> {
+        // The caller's `delegation.summarize` span, which also reports the
+        // strategy and the failure outcome decided in here.
+        let outer = tracing::Span::current();
+        self.summarize_recording(
+            parent_history,
+            delegation_objective,
+            operation,
+            basis,
+            &outer,
+        )
+        .await
+    }
+
     #[instrument(
         name = "delegation.summarizer.summarize",
-        skip(self, parent_history, delegation_objective, operation, basis),
+        skip(self, parent_history, delegation_objective, operation, basis, outer),
         fields(
             history_messages = parent_history.len(),
             estimated_tokens = tracing::field::Empty,
@@ -158,12 +178,13 @@ impl DelegationSummarizer {
             output_bytes = tracing::field::Empty,
         )
     )]
-    async fn summarize_with_basis(
+    async fn summarize_recording(
         &self,
         parent_history: &[AgentMessage],
         delegation_objective: &str,
         operation: &AttemptOperation,
         basis: BillingBasis,
+        outer: &tracing::Span,
     ) -> SessionResult<String> {
         let span = tracing::Span::current();
 
@@ -171,6 +192,7 @@ impl DelegationSummarizer {
         // its summary is already adequate — skip the LLM call.
         if let Some(summary) = Self::compaction_as_summary(parent_history) {
             span.record("strategy", "compaction");
+            outer.record("strategy", "compaction");
             span.record("output_bytes", summary.len() as u64);
             log::info!("Using existing compaction summary for delegation (skipping LLM call)");
             return Ok(summary);
@@ -185,6 +207,7 @@ impl DelegationSummarizer {
         span.record("estimated_tokens", estimated_tokens as u64);
         if estimated_tokens < self.min_history_tokens {
             span.record("strategy", "raw");
+            outer.record("strategy", "raw");
             log::debug!(
                 "Parent history below summarization threshold ({} tokens < {}), injecting raw history",
                 estimated_tokens,
@@ -196,6 +219,7 @@ impl DelegationSummarizer {
         }
 
         span.record("strategy", "llm");
+        outer.record("strategy", "llm");
 
         // 1. Prepare LLM prompt from parent history
         let input = self.prepare_llm_input(parent_history, delegation_objective);
@@ -246,7 +270,11 @@ impl DelegationSummarizer {
                     basis,
                 )
                 .await
-                .map_err(accounting_failure)?;
+                .map_err(|error| {
+                    // Nothing was dispatched.
+                    outer.record("outcome", "skipped");
+                    accounting_failure(error)
+                })?;
             let collected = tokio::time::timeout(
                 timeout,
                 Self::collect_output(&self.provider, &messages, use_streaming),
@@ -262,10 +290,22 @@ impl DelegationSummarizer {
                         Ok(()) => attempt.settle_output(&output).await,
                         Err(_) => attempt.settle_rejected_output(&output, !completed).await,
                     }
-                    .map_err(accounting_failure)?;
+                    .map_err(|error| {
+                        // A summary that cannot be settled is discarded.
+                        outer.record(
+                            "outcome",
+                            if validation.is_ok() {
+                                "skipped"
+                            } else {
+                                "rejected"
+                            },
+                        );
+                        accounting_failure(error)
+                    })?;
                     match validation {
                         Ok(()) => Ok(output),
                         Err(error) => {
+                            outer.record("outcome", "rejected");
                             genai::llm_error(&error);
                             Err(SessionError::InvalidOperation(format!(
                                 "Delegation summary LLM call failed: {error}"
@@ -274,7 +314,7 @@ impl DelegationSummarizer {
                     }
                 }
                 Ok(Err(failure)) => {
-                    match &failure.output {
+                    let settled = match &failure.output {
                         Some(output) => attempt.settle_rejected_output(output, true).await,
                         None => {
                             attempt
@@ -285,8 +325,9 @@ impl DelegationSummarizer {
                                 )
                                 .await
                         }
-                    }
-                    .map_err(accounting_failure)?;
+                    };
+                    outer.record("outcome", "rejected");
+                    settled.map_err(accounting_failure)?;
                     genai::llm_error(&failure.error);
                     Err(SessionError::InvalidOperation(format!(
                         "Delegation summary LLM call failed: {}",
@@ -300,10 +341,9 @@ impl DelegationSummarizer {
                         kind: querymt::error::TransportErrorKind::Timeout,
                         message: "delegation summary timed out".into(),
                     };
-                    attempt
-                        .settle_error(&timed_out, false, None)
-                        .await
-                        .map_err(accounting_failure)?;
+                    let settled = attempt.settle_error(&timed_out, false, None).await;
+                    outer.record("outcome", "timeout");
+                    settled.map_err(accounting_failure)?;
                     genai::error("timeout");
                     Err(SessionError::InvalidOperation(format!(
                         "Delegation summary generation timed out after {} seconds",

@@ -390,7 +390,7 @@ notification as an invalidation hint and call `querymt/agents/list` for the stat
 
 The planner decides to delegate and creates a delegation request.
 
-If hooks are enabled, `pre_delegation` runs before the delegation is recorded. It can block the delegation entirely or rewrite fields such as `target_agent_id`, `objective`, `context`, `constraints`, `expected_output`, and `isolation`.
+If hooks are enabled, `pre_delegation` runs before the delegation is recorded. It can block the delegation entirely or rewrite fields such as `target_agent_id`, `objective`, `context`, `constraints`, `expected_output`, and `isolation`. The hook input also carries the request's `handoff_from` (or `null`); it is read-only.
 
 The planner-side tool result is updated when a delegation is blocked, so the model sees `Delegation blocked by hook: ...` instead of a misleading queued message.
 
@@ -414,6 +414,18 @@ pub struct Delegation {
 `isolation` is the resolved execution-workspace policy: `shared` (legacy behavior — the delegate runs in the parent's checkout) or `isolated` (a private managed Git worktree seeded from the parent's current code state; see [Git Worktree Workspaces](worktrees.md)). The `delegate` tool accepts an optional `isolation` argument (`inherit` | `isolated` | `shared`); `inherit` resolves from the parent session — isolated parents isolate every delegate by default, local parents keep shared execution. Explicit `shared` overrides on isolated parents are disclosed as shared execution, and a requested isolation that cannot be satisfied fails the delegation instead of falling back to sharing.
 
 Each `[[delegates]]` entry may also set `isolation = "inherit" | "isolated" | "shared"` (default `inherit`) — the configured analogue of the tool argument. Precedence is: an explicit non-`inherit` value on the `delegate` tool call, then the target delegate's configured value, then inheritance from the parent session's execution mode. The resolved policy and where it came from (`request`, `delegate_config` or `inherited`) are persisted with the delegation and disclosed in the tool result. `isolated` requires `[agent.workspace] enabled = true` and is rejected at load/build time otherwise. See [Git Worktree Workspaces](worktrees.md).
+
+#### Running in an earlier delegate's worktree: `handoff_from`
+
+The `delegate` tool also accepts an optional `handoff_from`: the id of an earlier **isolated** delegation of the same session. The new delegate then runs in *that delegation's existing worktree*, with its edits present, instead of a new or shared checkout. Ownership of the worktree moves to the new delegate session before it runs (the same compare-and-swap transfer as `/worktree handoff`), the previous owner becomes read-only (`owner_transferred`), and no worktree is allocated: files, branch, index, baseline and earlier results are unchanged. This is how a `reviewer` takes over a `coder`'s work and fixes it in place.
+
+- `handoff_from` is a string and cannot be combined with `isolation = "shared"` (rejected as an invalid request; nothing is queued). It always resolves to isolated execution.
+- The delegation **fails before the delegate runs**, leaving ownership, files and the previous owner's access unchanged and allocating nothing, when the id is unknown (error names the id), was not made by this session (`not_parent_session`), has no isolated worktree (`no_isolated_workspace`, for example a shared delegation), the worktree is not ready (`workspace_not_ready`), its owner has a running turn or queued input, or its delegation has not ended yet (verification, summary and result capture run after the delegate's turn) (`owner_active`; the owner is never interrupted), or is not hosted locally (`owner_not_local`). The failure text names the code.
+- A worktree keeps the name of the delegation that created it. Pass that id (the first one) as `handoff_from` for every later round, and to `accept_delegation_result`; the id of a delegation that itself ran by handoff has no worktree of its own. The completion text of a delegate that ran by handoff tells you which id to accept with. Acceptance requires the run that published the result to be complete, so the latest result of a completed reviewer is accepted even if the coder that created the worktree failed or was cancelled.
+- The delegate session starts without copied history (pass what it needs in `context`). It is a delegate of the requesting session (fork origin `delegation`), hidden from listings like every delegate.
+- `handoff_from` is carried on the `delegation_requested` event and, read-only, in the `pre_delegation` hook input. A hook can block a handoff but cannot redirect it. The tool result discloses that the delegate runs in the existing worktree of that delegation.
+
+See [Delegating to a successor](worktrees.md#delegating-to-a-successor-handoff_from) for the sequence and failure handling.
 
 ### 2. Session Creation
 

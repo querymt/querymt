@@ -104,6 +104,21 @@ pub trait WorkspaceRepository: Send + Sync {
         to: &str,
     ) -> SessionResult<WorkspaceRecord>;
 
+    /// Undo a [`Self::transfer_owner`] from `previous` to `successor` whose
+    /// successor never ran: ownership returns to `previous` and its
+    /// transferred marker is removed, in one transaction, so `previous` is a
+    /// writable owner again that can be handed off later. Fails with
+    /// [`SessionError::WorkspaceAlreadyOwned`] (changing nothing) when
+    /// `successor` is not the owner or `previous` was not handed to it, and
+    /// with [`SessionError::InvalidOperation`] when the workspace is not
+    /// `ready`.
+    async fn revert_transfer(
+        &self,
+        id: &WorkspaceId,
+        previous: &str,
+        successor: &str,
+    ) -> SessionResult<WorkspaceRecord>;
+
     /// The session `session_id` handed its workspace to, if it was
     /// transferred. Marks the session as a read-only previous owner.
     async fn transferred_to(&self, session_id: &str) -> SessionResult<Option<String>>;

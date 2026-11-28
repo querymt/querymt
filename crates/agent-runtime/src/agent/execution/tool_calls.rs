@@ -1951,6 +1951,21 @@ pub(super) async fn record_tool_side_effects(
             .transpose()
             .unwrap_or_default()
             .unwrap_or_default();
+        // Read-only for hooks: a hook may block a handoff but never redirect
+        // the delegate into another worktree.
+        let handoff_from = args
+            .get("handoff_from")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned);
+        if handoff_from.is_some() && env.restricted_mesh_turn() {
+            result.content = vec![querymt::chat::ToolResultPart::Text {
+                text: "Delegation blocked: handoff_from is not available in a restricted mesh turn, which always runs delegates in the shared checkout.".to_string(),
+            }];
+            result.is_error = false;
+            return Ok(None);
+        }
 
         env.require_turn_authority().await?;
         let pre_hook = config
@@ -1971,6 +1986,7 @@ pub(super) async fn record_tool_side_effects(
                 constraints: constraints.clone(),
                 expected_output: expected_output.clone(),
                 isolation,
+                handoff_from: handoff_from.clone(),
             })
             .await?;
         for notice in pre_hook.notices {
@@ -2000,6 +2016,10 @@ pub(super) async fn record_tool_side_effects(
         let expected_output = updated_expected_output.or(expected_output);
         let requested_isolation = if env.restricted_mesh_turn() {
             crate::worktree::DelegationIsolation::Shared
+        } else if handoff_from.is_some() {
+            // A handoff always continues an isolated worktree, whatever a hook
+            // or the member's configured default would otherwise choose.
+            crate::worktree::DelegationIsolation::Isolated
         } else {
             updated_isolation.unwrap_or(isolation)
         };
@@ -2063,26 +2083,35 @@ pub(super) async fn record_tool_side_effects(
             "expected_output": expected_output,
             "isolation": resolved_isolation_label(resolved_isolation),
             "isolation_source": isolation_source.label(),
+            "handoff_from": handoff_from,
         })) {
             result.tool_arguments = Some(serialized_args);
         }
 
         // Disclose the resolved execution mode: shared execution is never
         // presented as isolated and explicit overrides are visible.
-        result.content.push(querymt::chat::ToolResultPart::Text {
-            text: format!(
-                "Execution workspace ({} policy): {}.",
-                isolation_source.label(),
-                match resolved_isolation {
-                    crate::worktree::ResolvedIsolation::Isolated => {
-                        "isolated (private Git worktree checkout seeded from this session's current code state)"
+        if let Some(source_delegation) = handoff_from.as_deref() {
+            result.content.push(querymt::chat::ToolResultPart::Text {
+                text: format!(
+                    "Execution workspace (handoff): runs in the existing worktree of delegation {source_delegation} (not a new or shared checkout); ownership moves to the new delegate and the previous owner becomes read-only."
+                ),
+            });
+        } else {
+            result.content.push(querymt::chat::ToolResultPart::Text {
+                text: format!(
+                    "Execution workspace ({} policy): {}.",
+                    isolation_source.label(),
+                    match resolved_isolation {
+                        crate::worktree::ResolvedIsolation::Isolated => {
+                            "isolated (private Git worktree checkout seeded from this session's current code state)"
+                        }
+                        crate::worktree::ResolvedIsolation::Shared => {
+                            "shared (this session's checkout; an explicit shared override is disclosed as shared, never isolated)"
+                        }
                     }
-                    crate::worktree::ResolvedIsolation::Shared => {
-                        "shared (this session's checkout; an explicit shared override is disclosed as shared, never isolated)"
-                    }
-                }
-            ),
-        });
+                ),
+            });
+        }
 
         env.require_turn_authority().await?;
         if let Ok(delegation) = turn
@@ -2112,6 +2141,7 @@ pub(super) async fn record_tool_side_effects(
                     tool_call_id: Some(result.call_id.clone()),
                     batch_id: batch_id.map(str::to_owned),
                     cycle_id: Some(env.cycle_accounting.cycle_id().to_string()),
+                    handoff_from: handoff_from.clone(),
                 },
             );
             return Ok(Some(WaitCondition::delegation(delegation.public_id)));

@@ -196,8 +196,108 @@
   sends the todo plan once as a `plan_update` for plan-operations clients.
   Clients that ignore unknown notifications and `_meta` keys see no change.
 
+- **A delegate can run in an earlier delegate's worktree (`handoff_from`).** The
+  `delegate` tool takes an optional `handoff_from`: the id of an earlier isolated
+  delegation of the same session. The new delegate session takes over that
+  delegation's worktree by ownership handoff (the compare-and-swap transfer
+  `/worktree handoff` uses): same checkout, branch, baseline and edits, no
+  worktree allocated, the previous owner becomes read-only (`owner_transferred`)
+  and the new delegate session is a delegate of the requesting session (fork
+  origin `delegation`). A refused handoff (`not_parent_session`,
+  `no_isolated_workspace`, `owner_active`, unknown delegation, owner not local)
+  fails the delegation before the delegate runs and changes nothing; combining it
+  with `isolation = "shared"` is rejected. The worktree keeps the id of the
+  delegation that created it, so `accept_delegation_result` takes that id with
+  the latest result and merges every owner's edits; each retained result
+  records the delegation whose completion published it (new nullable
+  `workspace_results.delegation_id` column, migration
+  `0042_workspace_result_publisher`), and acceptance requires that run to be
+  complete, so a completed reviewer's result is accepted after a failed coder.
+  A delegation holds its delegate's worktree until it reports its terminal
+  state (verification, summary and result capture run after the delegate's
+  turn): a handoff, archive or snapshot merge in that window is refused with
+  `owner_active` instead of unloading the delegate. A delegate successor that
+  fails after ownership moved to it, also after its actor started, returns the
+  worktree to the previous owner, which stays writable. **BREAKING (tool and wire
+  shape, additive):** the `delegate` tool schema, the `delegation_requested`
+  event (`handoff_from`, omitted when unused; older events deserialize without
+  it) and the `pre_delegation` hook input (`handoff_from`, `null` when unused,
+  read-only for hooks) each gain an optional field. querymt-desktop can show
+  "continues delegation X" for events that carry it.
+- **`coder-team` example profile.** An orchestrator in plan mode that explores,
+  delegates and merges (every `accept_delegation_result` asks the user), an
+  isolated `coder`, a `reviewer` that takes over the coder's worktree with
+  `handoff_from`, reviews and fixes in place and ends with a verdict, and a
+  shared read-only `explorer`. `[dotagents]` and `[agent.workspace]` are on.
+  Embedded in `qmtcode` next to `coder-delegate` and selectable there; the
+  mobile catalog does not include it.
+- **Additive Rust API for baseline capture statistics and linked snapshot
+  stores (not breaking).** `querymt_agent_services::worktree::CaptureStats`
+  (`files_read`, `bytes_read`, `objects_written`, `reused_index_entries`) is
+  returned by the new provided method
+  `RepositoryOps::capture_working_state_with_stats`, whose default calls
+  `capture_working_state` and returns zero statistics, so existing implementors
+  compile unchanged. The new provided method
+  `SnapshotBackend::link_object_source(worktree, objects_dir, baseline_commit)`
+  is a no-op by default; `GitSnapshotBackend` implements it. `CapturedWorkingState`
+  gains no fields and no existing signature changes.
+
 ### Behavior changes
 
+- **Isolated delegation starts faster, and its startup is traceable.** The
+  time between the `delegate` tool and the delegate's first prompt (3.4 s on a
+  1,934-file checkout in one trace, none of it visible) is cut and attributed:
+  - Baseline capture reads only what changed. A tracked file whose stat data
+    matches its index entry, and that is not racily clean, reuses the entry's
+    object id and is not read; modified, flagged, converted and untracked files
+    are still read. A blob is hashed before it is written and an object the
+    repository holds is not written again. The baseline still holds raw
+    working bytes and on-disk modes.
+  - Capture validation compares stat fingerprints (HEAD, index entries and the
+    stat data of captured and untracked paths) and re-hashes recently modified
+    files, so an attempt makes one capture instead of three. A change to HEAD,
+    the index or a captured path during capture is still detected and retried
+    or rejected as before.
+  - The snapshot store of a managed workspace is linked to its source
+    repository (below), so the first snapshot does not rewrite the baseline.
+  - Lock-file and gate filesystem work no longer runs on the Tokio worker
+    threads.
+  - New spans, each with the counts that explain its duration:
+    `delegation.claim` (`attempts`), `delegation.queue_wait`,
+    `delegation.admission` (`authority`), `delegation.resolve_parent` (`bound`),
+    `delegation.allocate_workspace` (`workspace_id`, `handoff`),
+    `delegation.start_hook` (`contexts`), `worktree.lock.wait` (`lock`,
+    `checkout`, `polls`), `worktree.capture` (`attempts`, `files_read`,
+    `bytes_read`, `objects_written`, `reused_index_entries`, `racy_rehashed`),
+    `worktree.capture.manifest` (`paths`), `worktree.provision`
+    (`workspace_id`) and `worktree.checkout` (`files`).
+    `delegation.summarize` now records `history_messages`, `summary_bytes`,
+    `strategy` and an `outcome` (`injected`, `rejected`, `timeout`,
+    `skipped`). See `docs/docs/agent/worktrees.md`.
+  No configuration key, tool argument, ACP shape, session database schema or
+  stored format changes; baselines, results and undo behave as before.
+- **Snapshot stores of managed workspaces gain `objects/info/alternates` and
+  `qmt-baseline` (not breaking).** The store lists its source repository's
+  object directory as an alternate and names the workspace's baseline commit in
+  `qmt-baseline`; it stays a plain Git object store that `git` can read. Only
+  objects reachable from the baseline are deduplicated against the source;
+  everything else, including content the delegate staged or committed and every
+  file of 16 MiB or more, is written to the store itself. The store is linked
+  when a managed session is created, handed off, forked, loaded or resumed, so
+  existing managed workspaces are linked the next time their session is loaded
+  or resumed; objects already in the store stay valid. A store stays
+  self-contained when the source uses a different object format (SHA-256), and
+  a busy store is linked on a later load. Sessions without a managed workspace
+  are unchanged.
+- **The `coder-team` profile no longer writes a planning summary before each
+  delegation.** Its `[agent.delegation.summary]` is kept but set to
+  `enabled = false`. The summary was an extra LLM call on every delegation's
+  critical path (12-15 s per delegation in traces), and with the default
+  `max_tokens = 2000` the brief was cut off and discarded, so delegates never
+  received it. Delegates still get the objective, context and constraints
+  written in the `delegate` call, and the result handed back to the
+  orchestrator is unchanged (it never used this summary). Set `enabled = true`
+  in a copy of the profile, with a larger `max_tokens`, to bring it back.
 - **BREAKING (behaviour): a session reads the slash commands of its own
   folder.** Fixes `/` not offering, and `/explain` not running, the
   `.qmt/commands/*.md` of the folder a session was opened in (a `qmtcode`
@@ -1094,6 +1194,13 @@
   way.
 
 ### Fixed
+
+- **Stopping a delegate's session finds it in config-file runs.** The root's
+  idle-unload and busy check looked only in its own registry and the profile
+  runtimes, so a delegate's actor living in its member's registry was reported
+  as not loaded while it was still running. `/worktree handoff`, archive and
+  removal of a delegate-owned worktree now unload (or refuse as `owner_active`)
+  the member's actor first.
 
 - **A failed scheduled run is attributed to its own cycle.** The scheduler now
   names the run it fires, and the run's terminal events (including a failure

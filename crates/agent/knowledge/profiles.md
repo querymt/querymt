@@ -48,7 +48,8 @@ refuses an id that matches more than one entry.
 missing directory yields no profiles; a path that is not a directory is an error. The id is
 `[profile].id` or else the file stem; the name defaults to the id.
 `standard_embedded_profile_catalog_builder` provides the embedded `default` and
-`coder-delegate` profiles with their prompt files inlined.
+`coder-delegate` profiles with their prompt files inlined; `embedded_coder_team_profile_toml`
+adds the `coder-team` one for hosts that offer it (qmtcode does, mobile does not).
 
 ## Fingerprints
 

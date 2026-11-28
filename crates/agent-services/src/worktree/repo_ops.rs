@@ -25,6 +25,12 @@ use gix::objs::tree::EntryKind;
 use gix::refs::Target;
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 
+use crate::worktree::capture_scan::{
+    ConversionDetector, blob_size_matches, changed_during_capture, disk_kind, hash_file_stream,
+    index_kind, mark_uptodate, open_real_index, read_err, reuse_predicate,
+    walk_untracked_and_ignored,
+};
+
 /// A linked-worktree registration observed in the shared repository.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisteredWorktree {
@@ -226,6 +232,18 @@ pub trait RepositoryOps: Send + Sync {
         commit_message: &str,
     ) -> WorktreeResult<CapturedWorkingState>;
 
+    /// Like [`capture_working_state`](Self::capture_working_state), also
+    /// returning what the capture did. The default delegates and reports
+    /// zero counters, so implementors that do not measure keep working.
+    async fn capture_working_state_with_stats(
+        &self,
+        checkout: &Path,
+        commit_message: &str,
+    ) -> WorktreeResult<(CapturedWorkingState, CaptureStats)> {
+        let state = self.capture_working_state(checkout, commit_message).await?;
+        Ok((state, CaptureStats::default()))
+    }
+
     /// Deterministic manifest of the real index entries (path, stage, mode,
     /// object id) for before/after equality checks.
     async fn index_manifest(&self, checkout: &Path) -> WorktreeResult<Vec<u8>>;
@@ -301,6 +319,36 @@ pub trait RepositoryOps: Send + Sync {
         checkout: &Path,
     ) -> WorktreeResult<crate::worktree::integrate::RecoveryOutcome>;
 }
+
+/// What one baseline capture did, for tracing and tests.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CaptureStats {
+    /// Files and symlinks whose content was read (a large file the
+    /// repository did not hold is counted once although it is read twice).
+    pub files_read: u64,
+    /// Bytes of content read, including the second read of a large file
+    /// the repository did not hold.
+    pub bytes_read: u64,
+    /// Objects (blobs, trees, the commit) the repository did not hold and
+    /// the capture wrote.
+    pub objects_written: u64,
+    /// Tracked files whose real-index object id was taken without reading.
+    pub reused_index_entries: u64,
+}
+
+impl CaptureStats {
+    pub(crate) fn add(&mut self, other: &CaptureStats) {
+        self.files_read += other.files_read;
+        self.bytes_read += other.bytes_read;
+        self.objects_written += other.objects_written;
+        self.reused_index_entries += other.reused_index_entries;
+    }
+}
+
+/// Files of at least this many bytes are hashed by streaming first and read
+/// again for writing only when the repository does not hold them. Matches
+/// the snapshot store's `Limits::stream_bytes` (`snapshot/git/mod.rs`).
+pub(crate) const LARGE_FILE_THRESHOLD: u64 = 16 * 1024 * 1024;
 
 /// Native repository operations backed entirely by `gix`.
 ///
@@ -827,7 +875,11 @@ impl RepositoryOps for GixRepoOps {
         let common_dir = common_dir.to_path_buf();
         let path = path.to_path_buf();
         let full = full_branch_name(branch);
-        tokio::task::spawn_blocking(move || {
+        // Spans do not follow `spawn_blocking`; the closure gets a clone so
+        // `files` can be recorded from the blocking thread.
+        let span = tracing::info_span!("worktree.checkout", files = tracing::field::Empty);
+        let checkout_span = span.clone();
+        let work = tokio::task::spawn_blocking(move || {
             let repo = open_repo(&common_dir)?;
 
             // gix 0.90 copies the source worktree's active sparse-checkout
@@ -863,9 +915,10 @@ impl RepositoryOps for GixRepoOps {
 
             let head = gix::worktree::add::Head::Attached(full);
             let interrupt = std::sync::atomic::AtomicBool::new(false);
-            let (child, _outcome) = repo
+            let (child, outcome) = repo
                 .add_worktree(&path, head, gix::progress::Discard, &interrupt)
                 .map_err(native_err)?;
+            checkout_span.record("files", outcome.files_updated as i64);
 
             // Post-check on the actual child, independent of which source
             // gix copied from or which config file carries the setting.
@@ -888,9 +941,8 @@ impl RepositoryOps for GixRepoOps {
                 return Err(err);
             }
             Ok(())
-        })
-        .await
-        .map_err(native_err)?
+        });
+        tracing::Instrument::instrument(async { work.await.map_err(native_err)? }, span).await
     }
 
     async fn remove_worktree(
@@ -1121,76 +1173,17 @@ impl RepositoryOps for GixRepoOps {
         checkout: &Path,
         commit_message: &str,
     ) -> WorktreeResult<CapturedWorkingState> {
-        let checkout = checkout.to_path_buf();
-        let commit_message = commit_message.to_string();
-        tokio::task::spawn_blocking(move || {
-            // The status pass below must see untracked files even when the
-            // repository config disables them (`status.showUntrackedFiles`),
-            // otherwise the baseline would silently miss content.
-            let repo = open_repo_for_status(&checkout)?;
-            let head = repo.head_id().map_err(|err| {
-                if is_not_found(&err) {
-                    WorktreeError::InvalidOperation(
-                        "cannot capture baseline: checkout has no commits (unborn HEAD)".into(),
-                    )
-                } else {
-                    native_err(err)
-                }
-            })?;
-            let source_head = head.detach();
-            let head_commit = repo.find_commit(head).map_err(native_err)?;
-            let head_tree = head_commit.tree_id().map_err(native_err)?.detach();
+        self.capture_working_state_with_stats(checkout, commit_message)
+            .await
+            .map(|(state, _stats)| state)
+    }
 
-            // Seed a private index from HEAD and reconcile it with actual
-            // working contents (deletions, modifications, untracked
-            // non-ignored files), never touching the real index.
-            let mut private_index =
-                gix::index::State::from_tree(&head_tree, &repo.objects, Default::default())
-                    .map_err(native_err)?;
-
-            // Reject active submodules before touching the working tree: a
-            // gitlink checkout is a directory and cannot be read as blob
-            // content.
-            reject_gitlinks(&repo, head_tree)?;
-
-            let (ignored_files, kept) =
-                classify_and_reconcile(&repo, &mut private_index, source_head, head_tree)?;
-
-            // Reject candidate paths whose effective attributes select an
-            // external filter (Git LFS or any custom clean/smudge process);
-            // resolution covers nested `.gitattributes`, Git-directory
-            // attributes, and macros.
-            reject_external_filter_paths(&repo, &private_index, &kept)?;
-
-            let tree = write_tree_from_index(&repo, &private_index, &kept)?;
-
-            let (commit, created_commit) = if tree == head_tree {
-                (source_head, false)
-            } else {
-                let signature = internal_signature();
-                let commit = gix::objs::Commit {
-                    tree,
-                    parents: vec![source_head].into(),
-                    author: signature.clone(),
-                    committer: signature,
-                    encoding: None,
-                    message: commit_message.as_bytes().into(),
-                    extra_headers: Default::default(),
-                };
-                let written = repo.write_object(&commit).map_err(native_err)?;
-                (written.detach(), true)
-            };
-
-            Ok(CapturedWorkingState {
-                source_head: source_head.to_string(),
-                tree: tree.to_string(),
-                commit: commit.to_string(),
-                created_commit,
-                ignored_files,
-            })
-        })
-        .await
-        .map_err(native_err)?
+    async fn capture_working_state_with_stats(
+        &self,
+        checkout: &Path,
+        commit_message: &str,
+    ) -> WorktreeResult<(CapturedWorkingState, CaptureStats)> {
+        capture_with_threshold(checkout, commit_message, LARGE_FILE_THRESHOLD).await
     }
 
     async fn index_manifest(&self, checkout: &Path) -> WorktreeResult<Vec<u8>> {
@@ -1392,12 +1385,12 @@ pub(crate) fn internal_signature() -> gix::actor::Signature {
 }
 
 /// How a directory-walk entry should be counted for status and capture.
-enum DirwalkDisposition {
+pub(crate) enum DirwalkDisposition {
     Ignored(String),
     Untracked(String),
 }
 
-fn classify_dirwalk_entry(entry: &gix::dir::Entry) -> Option<DirwalkDisposition> {
+pub(crate) fn classify_dirwalk_entry(entry: &gix::dir::Entry) -> Option<DirwalkDisposition> {
     if !matches!(
         entry.disk_kind,
         Some(gix::dir::entry::Kind::File | gix::dir::entry::Kind::Symlink)
@@ -1433,7 +1426,7 @@ fn file_kind_from_metadata(md: &std::fs::Metadata) -> FileKind {
 
 /// Checkout-relative path of a HEAD-tree vs index change.
 /// HEAD's root tree id, or `None` when HEAD is unborn.
-fn head_tree_id(repo: &gix::Repository) -> WorktreeResult<Option<gix::hash::ObjectId>> {
+pub(crate) fn head_tree_id(repo: &gix::Repository) -> WorktreeResult<Option<gix::hash::ObjectId>> {
     match repo.head_id() {
         Ok(id) => {
             let commit = repo.find_commit(id).map_err(native_err)?;
@@ -1543,71 +1536,115 @@ pub(crate) fn diff_flattened(base: &FlatTree, tip: &FlatTree) -> Vec<ChangedPath
     changes
 }
 
+/// [`GixRepoOps`]'s capture, with the large-file threshold as a parameter so
+/// tests can lower it without a field on the public unit struct.
+pub(crate) async fn capture_with_threshold(
+    checkout: &Path,
+    commit_message: &str,
+    threshold: u64,
+) -> WorktreeResult<(CapturedWorkingState, CaptureStats)> {
+    let checkout = checkout.to_path_buf();
+    let commit_message = commit_message.to_string();
+    let mut ctx = CaptureCtx {
+        threshold,
+        stats: CaptureStats::default(),
+    };
+    tokio::task::spawn_blocking(move || {
+        // The directory walk emits untracked files explicitly, so the
+        // repository's `status.showUntrackedFiles` cannot hide content.
+        let repo = open_checkout(&checkout)?;
+        let head = repo.head_id().map_err(|err| {
+            if is_not_found(&err) {
+                WorktreeError::InvalidOperation(
+                    "cannot capture baseline: checkout has no commits (unborn HEAD)".into(),
+                )
+            } else {
+                native_err(err)
+            }
+        })?;
+        let source_head = head.detach();
+        let head_commit = repo.find_commit(head).map_err(native_err)?;
+        let head_tree = head_commit.tree_id().map_err(native_err)?.detach();
+
+        // Seed a private index from HEAD and reconcile it with actual
+        // working contents (deletions, modifications, untracked
+        // non-ignored files), never touching the real index.
+        let mut private_index =
+            gix::index::State::from_tree(&head_tree, &repo.objects, Default::default())
+                .map_err(native_err)?;
+
+        // Reject active submodules before touching the working tree: a
+        // gitlink checkout is a directory and cannot be read as blob
+        // content.
+        reject_gitlinks(&repo, head_tree)?;
+
+        let (ignored_files, kept) = classify_and_reconcile(&repo, &mut private_index, &mut ctx)?;
+
+        // Reject candidate paths whose effective attributes select an
+        // external filter (Git LFS or any custom clean/smudge process);
+        // resolution covers nested `.gitattributes`, Git-directory
+        // attributes, and macros.
+        reject_external_filter_paths(&repo, &private_index, &kept)?;
+
+        let tree = write_tree_from_index_counted(&repo, &private_index, &kept, &mut ctx.stats)?;
+
+        let (commit, created_commit) = if tree == head_tree {
+            (source_head, false)
+        } else {
+            let signature = internal_signature();
+            let commit = gix::objs::Commit {
+                tree,
+                parents: vec![source_head].into(),
+                author: signature.clone(),
+                committer: signature,
+                encoding: None,
+                message: commit_message.as_bytes().into(),
+                extra_headers: Default::default(),
+            };
+            let commit = write_object_counted(&repo, &commit, &mut ctx.stats)?;
+            (commit, true)
+        };
+
+        Ok((
+            CapturedWorkingState {
+                source_head: source_head.to_string(),
+                tree: tree.to_string(),
+                commit: commit.to_string(),
+                created_commit,
+                ignored_files,
+            },
+            ctx.stats,
+        ))
+    })
+    .await
+    .map_err(native_err)?
+}
+
+/// Counters and tuning of one capture.
+struct CaptureCtx {
+    /// Files of at least this many bytes are hashed before they are written.
+    threshold: u64,
+    stats: CaptureStats,
+}
+
 /// Classify the working tree and reconcile the private index with actual
 /// working contents.
 ///
-/// Equivalent to `git add -A` against the private index: tracked files use
-/// their working contents (deletions applied), non-ignored untracked files
-/// are added, ignored untracked files stay excluded and are reported.
+/// Equivalent to `git add -A` against the private index, reading each file
+/// raw: tracked files use their working contents (deletions applied),
+/// non-ignored untracked files are added, ignored untracked files stay
+/// excluded and are reported. A tracked file is only read when its
+/// real-index entry cannot vouch for it (see [`reuse_predicate`]); otherwise
+/// the entry's object id is taken and only the mode comes from the disk.
 fn classify_and_reconcile(
     repo: &gix::Repository,
     private_index: &mut gix::index::State,
-    source_head: gix::hash::ObjectId,
-    head_tree: gix::hash::ObjectId,
+    ctx: &mut CaptureCtx,
 ) -> WorktreeResult<(Vec<String>, std::collections::HashSet<gix::bstr::BString>)> {
     let worktree = repo
         .workdir()
         .ok_or_else(|| native_err("bare repository has no working tree"))?
         .to_path_buf();
-
-    // One status pass classifies everything: modifications of tracked files,
-    // untracked files, and ignored files.
-    let platform = repo
-        .status(gix::progress::Discard)
-        .map_err(native_err)?
-        .untracked_files(gix::status::UntrackedFiles::Files)
-        .dirwalk_options(|mut opts| {
-            opts.set_emit_ignored(Some(gix::dir::walk::EmissionMode::Matching));
-            opts
-        });
-
-    let mut ignored: Vec<String> = Vec::new();
-    let mut untracked: Vec<gix::bstr::BString> = Vec::new();
-    for item in platform
-        .into_index_worktree_iter(Vec::new())
-        .map_err(native_err)?
-    {
-        let item = item.map_err(native_err)?;
-        match item {
-            gix::status::index_worktree::Item::DirectoryContents { entry, .. } => {
-                match classify_dirwalk_entry(&entry) {
-                    Some(DirwalkDisposition::Ignored(path)) => {
-                        ignored.push(path);
-                    }
-                    Some(DirwalkDisposition::Untracked(path)) => {
-                        untracked.push(path.into_bytes().into());
-                    }
-                    None => {}
-                }
-            }
-            gix::status::index_worktree::Item::Rewrite { dirwalk_entry, .. } => {
-                match classify_dirwalk_entry(&dirwalk_entry) {
-                    Some(DirwalkDisposition::Ignored(path)) => {
-                        ignored.push(path);
-                    }
-                    Some(DirwalkDisposition::Untracked(path)) => {
-                        untracked.push(path.into_bytes().into());
-                    }
-                    None => {}
-                }
-            }
-            gix::status::index_worktree::Item::Modification { .. } => {
-                // Tracked modifications: the private index is
-                // refreshed from disk for every tracked path below.
-            }
-        }
-    }
-    let _ = (source_head, head_tree);
 
     // Union tracked membership: HEAD-seeded private index plus the real
     // index's paths (staged files absent from HEAD stay capture candidates;
@@ -1615,11 +1652,7 @@ fn classify_and_reconcile(
     // rejected before capture, so only stage-0 entries are considered. A
     // missing index file (fresh checkout without a staging write) means an
     // empty union source.
-    let real_index = if repo.index_path().exists() {
-        Some(repo.open_index().map_err(native_err)?)
-    } else {
-        None
-    };
+    let mut real_index = open_real_index(repo)?;
     let mut kept: std::collections::HashSet<gix::bstr::BString> = Default::default();
     let mut additional: Vec<(gix::bstr::BString, gix::index::entry::Stat)> = Vec::new();
     if let Some(real_index) = &real_index {
@@ -1655,34 +1688,92 @@ fn classify_and_reconcile(
         .iter()
         .map(|entry| entry.path(private_index).to_vec().into())
         .collect();
+    let stat_opts = repo.stat_options().map_err(native_err)?;
+    let empty_index = gix::index::State::new(repo.object_hash());
+    // Real-index positions whose recorded kind matches the disk: the
+    // directory walk below may take those at face value.
+    let mut uptodate: Vec<usize> = Vec::new();
     {
+        let real_state: &gix::index::State = real_index.as_deref().unwrap_or(&empty_index);
+        let index_timestamp = real_state.timestamp();
+        let mut conversions: Option<ConversionDetector<'_>> = None;
         let entries = private_index.entries_mut();
         for (entry, path) in entries.iter_mut().zip(&tracked_paths) {
             let abs = worktree.join(gix_pathbuf(path.as_bstr()));
-            match std::fs::symlink_metadata(&abs) {
-                Ok(md) if !md.is_dir() => {
-                    let kind = file_kind_from_metadata(&md);
-                    entry.id = write_blob_from_disk(repo, &abs, &md)?;
-                    entry.mode = index_mode_for(kind);
-                    kept.insert(path.clone());
+            // Deleted from the working tree: excluded from the baseline.
+            // Directories (e.g. an uncaught gitlink checkout) are never
+            // read as blob content.
+            let md = match gix::index::fs::Metadata::from_path_no_follow(&abs) {
+                Ok(md) if !md.is_dir() => md,
+                _ => continue,
+            };
+            let real_position = real_state.entry_index_by_path(path.as_bstr()).ok();
+            let real_entry = real_position.map(|position| &real_state.entries()[position]);
+            if let (Some(position), Some(real_entry)) = (real_position, real_entry) {
+                let recorded = index_kind(real_entry.mode);
+                if recorded.is_some() && recorded == disk_kind(&md) {
+                    uptodate.push(position);
                 }
-                // Deleted from the working tree: excluded from the
-                // baseline. Directories (e.g. an uncaught gitlink
-                // checkout) are never read as blob content.
-                _ => {}
             }
+            // Cheap stat rules first; resolve attributes, then the blob's
+            // header size, only for entries that would otherwise be reused.
+            let reused =
+                if reuse_predicate(real_entry, &md, index_timestamp, stat_opts, false, true) {
+                    if conversions.is_none() {
+                        conversions = Some(ConversionDetector::new(repo, real_state)?);
+                    }
+                    let converts = conversions
+                        .as_mut()
+                        .expect("initialized above")
+                        .has_conversion(path.as_bstr())?;
+                    // Header lookup only: no blob content is read.
+                    let size_matches = !converts
+                        && real_entry.is_some_and(|real_entry| {
+                            blob_size_matches(repo, real_entry.id, md.len())
+                        });
+                    reuse_predicate(
+                        real_entry,
+                        &md,
+                        index_timestamp,
+                        stat_opts,
+                        converts,
+                        size_matches,
+                    )
+                    .then(|| real_entry.map(|real_entry| real_entry.id))
+                    .flatten()
+                } else {
+                    None
+                };
+            let kind = file_kind_on_disk(&abs)?;
+            entry.id = match reused {
+                Some(id) => {
+                    ctx.stats.reused_index_entries += 1;
+                    id
+                }
+                None => write_blob_from_disk(repo, &abs, &md, ctx)?,
+            };
+            entry.mode = index_mode_for(kind);
+            kept.insert(path.clone());
         }
     }
+    if let Some(index) = real_index.as_mut() {
+        mark_uptodate(index, &uptodate);
+    }
+
+    // Untracked and ignored files, with the ignore-aware directory walk
+    // over the real index.
+    let walk = walk_untracked_and_ignored(repo, real_index.as_deref().unwrap_or(&empty_index))?;
 
     // Add non-ignored untracked files.
-    for path in untracked {
+    for path in walk.untracked {
         if private_index.entry_index_by_path(path.as_bstr()).is_ok() {
             continue;
         }
         let abs = worktree.join(gix_pathbuf(path.as_bstr()));
-        let md = std::fs::symlink_metadata(&abs).map_err(native_err)?;
-        let kind = file_kind_from_metadata(&md);
-        let oid = write_blob_from_disk(repo, &abs, &md)?;
+        let md = gix::index::fs::Metadata::from_path_no_follow(&abs)
+            .map_err(|err| read_err(err, &abs))?;
+        let kind = file_kind_on_disk(&abs)?;
+        let oid = write_blob_from_disk(repo, &abs, &md, ctx)?;
         let stat = gix::index::entry::Stat::default();
         kept.insert(path.clone());
         private_index.dangerously_push_entry(
@@ -1695,6 +1786,7 @@ fn classify_and_reconcile(
     }
     private_index.sort_entries();
 
+    let mut ignored = walk.ignored;
     ignored.sort();
     Ok((ignored, kept))
 }
@@ -1717,7 +1809,7 @@ fn same_checkout_path(base: &Path, target: &Path) -> bool {
     normalize(base) == normalize(target)
 }
 
-fn gix_pathbuf(path: &gix::bstr::BStr) -> PathBuf {
+pub(crate) fn gix_pathbuf(path: &gix::bstr::BStr) -> PathBuf {
     // Platform-aware conversion (raw bytes on Unix, UTF-8 + separator
     // normalization elsewhere); compiles on every target.
     match gix::path::from_bstr(path) {
@@ -1880,25 +1972,113 @@ fn is_executable(_md: &std::fs::Metadata) -> bool {
     false
 }
 
+/// Whether the object database holds `id`. Unlike `Repository::has_object`
+/// this does not treat the empty tree as always present, so a baseline of an
+/// all-deleted checkout still stores its (empty) root tree, as before.
+fn odb_has(repo: &gix::Repository, id: gix::hash::ObjectId) -> bool {
+    gix::objs::Exists::exists(&repo.objects, &id)
+}
+
+/// Store a blob of `bytes` unless the repository already holds it. The id
+/// is computed and checked first so nothing known is written, and a write
+/// is counted.
+fn write_blob_counted(
+    repo: &gix::Repository,
+    bytes: &[u8],
+    stats: &mut CaptureStats,
+) -> WorktreeResult<gix::hash::ObjectId> {
+    let id = gix::objs::compute_hash(repo.object_hash(), gix::objs::Kind::Blob, bytes)
+        .map_err(native_err)?;
+    if !odb_has(repo, id) {
+        gix::objs::Write::write_buf_with_known_id(&repo.objects, gix::objs::Kind::Blob, bytes, id)
+            .map_err(native_err)?;
+        stats.objects_written += 1;
+    }
+    Ok(id)
+}
+
+/// Hash-first write of any object (trees, the baseline commit).
+fn write_object_counted(
+    repo: &gix::Repository,
+    object: &impl gix::objs::WriteTo,
+    stats: &mut CaptureStats,
+) -> WorktreeResult<gix::hash::ObjectId> {
+    let mut buf = Vec::new();
+    object.write_to(&mut buf).map_err(native_err)?;
+    let id =
+        gix::objs::compute_hash(repo.object_hash(), object.kind(), &buf).map_err(native_err)?;
+    if !odb_has(repo, id) {
+        gix::objs::Write::write_buf_with_known_id(&repo.objects, object.kind(), &buf, id)
+            .map_err(native_err)?;
+        stats.objects_written += 1;
+    }
+    Ok(id)
+}
+
+/// Store the raw working bytes of the file or symlink at `abs` as a blob,
+/// hash-first. Files below the threshold are read into memory once. Larger
+/// files are hashed by streaming, and only read a second time to be written
+/// when the repository does not hold the blob; a file that changed between
+/// the two reads fails the attempt.
 fn write_blob_from_disk(
     repo: &gix::Repository,
     abs: &Path,
-    md: &std::fs::Metadata,
+    md: &gix::index::fs::Metadata,
+    ctx: &mut CaptureCtx,
 ) -> WorktreeResult<gix::hash::ObjectId> {
-    if md.file_type().is_symlink() {
-        let target = std::fs::read_link(abs).map_err(native_err)?;
+    if md.is_symlink() {
+        let target = std::fs::read_link(abs).map_err(|err| read_err(err, abs))?;
         // Symlink targets are stored as raw path bytes (Git's convention).
         let target = gix::path::into_bstr(target.as_path()).map_err(native_err)?;
         let bytes: &[u8] = &target;
-        return repo
-            .write_blob(bytes)
-            .map_err(native_err)
-            .map(|id| id.detach());
+        ctx.stats.files_read += 1;
+        ctx.stats.bytes_read += bytes.len() as u64;
+        return write_blob_counted(repo, bytes, &mut ctx.stats);
     }
-    let file = std::fs::File::open(abs).map_err(native_err)?;
-    repo.write_blob_stream(std::io::BufReader::new(file))
-        .map_err(native_err)
-        .map(|id| id.detach())
+    if md.len() < ctx.threshold {
+        let bytes = std::fs::read(abs).map_err(|err| read_err(err, abs))?;
+        ctx.stats.files_read += 1;
+        ctx.stats.bytes_read += bytes.len() as u64;
+        return write_blob_counted(repo, &bytes, &mut ctx.stats);
+    }
+
+    let (hashed, size) = hash_file_stream(repo, abs)?;
+    ctx.stats.files_read += 1;
+    ctx.stats.bytes_read += size;
+    if odb_has(repo, hashed) {
+        return Ok(hashed);
+    }
+    let file = std::fs::File::open(abs).map_err(|err| read_err(err, abs))?;
+    let mut reader = std::io::Read::take(std::io::BufReader::new(file), size);
+    let written =
+        gix::objs::Write::write_stream(&repo.objects, gix::objs::Kind::Blob, size, &mut reader)
+            .map_err(|err| {
+                // A shrunken file cannot supply the declared length.
+                match std::fs::metadata(abs) {
+                    Ok(now) if now.len() == size => native_err(err),
+                    _ => changed_during_capture(format!(
+                        "{} changed while it was written",
+                        abs.display()
+                    )),
+                }
+            })?;
+    ctx.stats.bytes_read += size;
+    if written != hashed {
+        return Err(changed_during_capture(format!(
+            "{} changed between its hash and its write",
+            abs.display()
+        )));
+    }
+    ctx.stats.objects_written += 1;
+    Ok(written)
+}
+
+/// The recorded kind of the file at `abs`, from its own metadata: the
+/// executable bit is any execute permission, as capture always took it.
+fn file_kind_on_disk(abs: &Path) -> WorktreeResult<FileKind> {
+    std::fs::symlink_metadata(abs)
+        .map(|md| file_kind_from_metadata(&md))
+        .map_err(|err| read_err(err, abs))
 }
 
 fn index_mode_for(kind: FileKind) -> gix::index::entry::Mode {
@@ -1917,6 +2097,17 @@ pub(crate) fn write_tree_from_index(
     repo: &gix::Repository,
     index: &gix::index::State,
     kept: &std::collections::HashSet<gix::bstr::BString>,
+) -> WorktreeResult<gix::hash::ObjectId> {
+    write_tree_from_index_counted(repo, index, kept, &mut CaptureStats::default())
+}
+
+/// [`write_tree_from_index`] that writes only trees the repository lacks and
+/// counts those writes.
+fn write_tree_from_index_counted(
+    repo: &gix::Repository,
+    index: &gix::index::State,
+    kept: &std::collections::HashSet<gix::bstr::BString>,
+    stats: &mut CaptureStats,
 ) -> WorktreeResult<gix::hash::ObjectId> {
     #[derive(Default)]
     struct Dir {
@@ -1968,11 +2159,15 @@ pub(crate) fn write_tree_from_index(
         );
     }
 
-    fn write_dir(repo: &gix::Repository, dir: &Dir) -> WorktreeResult<gix::hash::ObjectId> {
+    fn write_dir(
+        repo: &gix::Repository,
+        dir: &Dir,
+        stats: &mut CaptureStats,
+    ) -> WorktreeResult<gix::hash::ObjectId> {
         let mut entries: Vec<gix::objs::tree::Entry> = Vec::new();
         for (name, item) in &dir.entries {
             let (mode, oid) = match item {
-                TreeItem::Dir(d) => (EntryKind::Tree, write_dir(repo, d)?),
+                TreeItem::Dir(d) => (EntryKind::Tree, write_dir(repo, d, stats)?),
                 TreeItem::File { oid, mode } => {
                     let kind = if *mode == gix::index::entry::Mode::DIR {
                         EntryKind::Tree
@@ -2000,12 +2195,10 @@ pub(crate) fn write_tree_from_index(
         // Git's rule and the serializer does not sort for us.
         entries.sort();
         let tree = gix::objs::Tree { entries };
-        repo.write_object(&tree)
-            .map_err(native_err)
-            .map(|id| id.detach())
+        write_object_counted(repo, &tree, stats)
     }
 
-    write_dir(repo, &root)
+    write_dir(repo, &root, stats)
 }
 
 /// Commit message of baseline captures.
@@ -2367,6 +2560,19 @@ impl RepositoryOps for FaultInjectingRepoOps {
         }
         self.inner()
             .capture_working_state(checkout, commit_message)
+            .await
+    }
+
+    async fn capture_working_state_with_stats(
+        &self,
+        checkout: &Path,
+        commit_message: &str,
+    ) -> WorktreeResult<(CapturedWorkingState, CaptureStats)> {
+        if let Some(err) = self.take_failure(FailurePoint::CaptureWorkingState) {
+            return Err(err);
+        }
+        self.inner()
+            .capture_working_state_with_stats(checkout, commit_message)
             .await
     }
 

@@ -15,6 +15,7 @@ use crate::worktree::error::{WorktreeError, WorktreeResult};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use tracing::Instrument;
 
 /// How long administration may wait for the per-repository lock.
 const ADMIN_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
@@ -40,33 +41,80 @@ where
     Fut: Future<Output = WorktreeResult<T>>,
 {
     let path = admin_lock_path(storage_root, common_dir);
-    with_lock_file(&path, fut).await
+    with_lock_file(&path, "admin", None, fut).await
 }
 
 /// Low-level form of [`with_admin_lock`] operating on an explicit lock
 /// file path. Exposed for tests that must coordinate across processes.
-pub(crate) async fn with_lock_file<T, Fut>(path: &Path, fut: Fut) -> WorktreeResult<T>
+///
+/// Acquisition is traced as `worktree.lock.wait`: `lock` names the kind
+/// (`batch`, `admin` or `gate`), `checkout` is the gate's canonical checkout
+/// root (gates only) and `polls` counts the `try_lock` attempts that found
+/// the lock held. The span ends when the lock is acquired, so it never
+/// covers `fut`.
+pub(crate) async fn with_lock_file<T, Fut>(
+    path: &Path,
+    lock: &'static str,
+    checkout: Option<&Path>,
+    fut: Fut,
+) -> WorktreeResult<T>
 where
     Fut: Future<Output = WorktreeResult<T>>,
 {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    let span = tracing::info_span!(
+        "worktree.lock.wait",
+        lock,
+        checkout = tracing::field::Empty,
+        polls = tracing::field::Empty,
+    );
+    if let Some(checkout) = checkout {
+        span.record("checkout", checkout.display().to_string());
     }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(path)?;
+    let file = acquire_lock_file(path, span.clone())
+        .instrument(span)
+        .await?;
+    // The lock is released when `file` drops at the end of this scope.
+    let result = fut.await;
+    drop(file);
+    result
+}
+
+/// Open the lock file off the async workers, then poll the OS-level
+/// exclusive lock with a bounded deadline. `try_lock` never blocks, so it
+/// and the poll sleeps stay on the async task.
+async fn acquire_lock_file(path: &Path, span: tracing::Span) -> WorktreeResult<std::fs::File> {
+    let open_path = path.to_path_buf();
+    let file = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
+        if let Some(parent) = open_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&open_path)
+    })
+    .await
+    .map_err(|err| {
+        WorktreeError::InvalidOperation(format!(
+            "failed to open lock file {}: {err}",
+            path.display()
+        ))
+    })??;
 
     let deadline = Instant::now() + ADMIN_LOCK_TIMEOUT;
-    // Poll the OS-level exclusive lock with a bounded deadline. The lock
-    // is released when `file` drops at the end of this scope.
+    let mut polls: i64 = 0;
     loop {
         match file.try_lock() {
-            Ok(()) => break,
+            Ok(()) => {
+                span.record("polls", polls);
+                return Ok(file);
+            }
             Err(std::fs::TryLockError::WouldBlock) => {
+                polls += 1;
                 if Instant::now() >= deadline {
+                    span.record("polls", polls);
                     return Err(WorktreeError::InvalidOperation(format!(
                         "timed out waiting for repository administration lock at {}",
                         path.display()
@@ -82,8 +130,6 @@ where
             }
         }
     }
-
-    fut.await
 }
 
 #[cfg(test)]
@@ -150,7 +196,7 @@ mod tests {
     async fn hold_admin_lock_helper() {
         let path = PathBuf::from(std::env::var("QMT_ADMIN_LOCK_PATH").unwrap());
         let marker = PathBuf::from(std::env::var("QMT_ADMIN_LOCK_MARKER").unwrap());
-        with_lock_file(&path, async {
+        with_lock_file(&path, "admin", None, async {
             std::fs::write(&marker, b"held").unwrap();
             tokio::time::sleep(Duration::from_millis(900)).await;
             Ok(())
@@ -193,7 +239,9 @@ mod tests {
 
         // Our acquisition must block until the helper exits and releases.
         let start = Instant::now();
-        with_lock_file(&path, async { Ok(()) }).await.unwrap();
+        with_lock_file(&path, "admin", None, async { Ok(()) })
+            .await
+            .unwrap();
         let elapsed = start.elapsed();
 
         let status = child.wait().unwrap();

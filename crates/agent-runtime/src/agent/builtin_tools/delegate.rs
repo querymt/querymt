@@ -99,6 +99,10 @@ impl ToolTrait for DelegateTool {
                             "type": "string",
                             "enum": ["inherit", "isolated", "shared"],
                             "description": "Execution workspace for this delegate. Precedence: an explicit 'isolated'/'shared' here wins; otherwise the target agent's configured isolation applies (listed per agent under Available Agents); otherwise it follows the parent session (isolated parents isolate every delegate, local parents share their checkout). 'inherit' (default) means 'use the configured/parent policy'. 'isolated' is a private Git worktree seeded from the parent's current code state; its result is integrated with accept_delegation_result, never by delegating a patch/merge task. 'shared' shares the parent's checkout and is disclosed as shared execution. The resolved policy is reported in the tool result."
+                        },
+                        "handoff_from": {
+                            "type": "string",
+                            "description": "Optional. The id of an earlier isolated delegation of this session. The new delegate then runs in that delegation's existing worktree (with its edits present) instead of a new checkout: ownership of the worktree moves to the new delegate and the previous owner becomes read-only. Use it to have a reviewer inspect and fix a coder's work, or to run another round on it. The previous delegation must have finished, and a worktree stays named by the delegation that created it, so pass that same id for every round and to accept_delegation_result. Cannot be combined with isolation 'shared'."
                         }
                     },
                     "required": ["target_agent_id", "objective"]
@@ -140,6 +144,25 @@ impl ToolTrait for DelegateTool {
                     "Unknown isolation '{}': expected one of inherit, isolated, shared",
                     value
                 )));
+            }
+        }
+
+        // A handoff always runs in an isolated worktree, so it cannot be
+        // combined with an explicit shared checkout.
+        if let Some(raw) = args.get("handoff_from").filter(|raw| !raw.is_null()) {
+            let handoff = raw
+                .as_str()
+                .ok_or_else(|| ToolError::InvalidRequest("handoff_from must be a string".into()))?;
+            if handoff.trim().is_empty() {
+                return Err(ToolError::InvalidRequest(
+                    "handoff_from must not be empty".into(),
+                ));
+            }
+            if args.get("isolation").and_then(Value::as_str) == Some("shared") {
+                return Err(ToolError::InvalidRequest(
+                    "handoff_from runs the delegate in an existing isolated worktree and cannot be combined with isolation 'shared'"
+                        .into(),
+                ));
             }
         }
 
@@ -249,6 +272,44 @@ mod tests {
             assert!(!result.is_empty());
         }
         tool.call(args_json(None), &TestContext).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shared_isolation_with_handoff() {
+        let (tool, _dir) = tool_with(&["coder"]).await;
+        let mut args = args_json(Some("shared"));
+        args["handoff_from"] = Value::String("del-1".into());
+        let err = tool.call(args, &TestContext).await.unwrap_err();
+        assert!(matches!(err, ToolError::InvalidRequest(_)), "{err}");
+        assert!(err.to_string().contains("cannot be combined"), "{err}");
+
+        for isolation in [None, Some("inherit"), Some("isolated")] {
+            let mut args = args_json(isolation);
+            args["handoff_from"] = Value::String("del-1".into());
+            tool.call(args, &TestContext)
+                .await
+                .unwrap_or_else(|err| panic!("isolation {isolation:?} should pass: {err}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn handoff_from_must_be_a_non_empty_string() {
+        let (tool, _dir) = tool_with(&["coder"]).await;
+        for bad in [serde_json::json!(7), serde_json::json!("  ")] {
+            let mut args = args_json(None);
+            args["handoff_from"] = bad;
+            let err = tool.call(args, &TestContext).await.unwrap_err();
+            assert!(err.to_string().contains("handoff_from"), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn schema_exposes_handoff_from_as_a_string() {
+        let (tool, _dir) = tool_with(&[]).await;
+        let parameters = tool.definition().function.parameters;
+        assert_eq!(parameters["properties"]["handoff_from"]["type"], "string");
+        let required = parameters["required"].as_array().unwrap();
+        assert!(!required.iter().any(|name| name == "handoff_from"));
     }
 
     #[tokio::test]

@@ -798,6 +798,7 @@ See the `examples/confs/` directory for complete examples:
 - `coder_agent.toml` - Coder agent with full features
 - `multi_agent.toml` - Agent with delegates
 - `coder_delegate.toml`, `learning_pair.toml` - Agent with delegates, a delegation summary and workspace notes
+- `coder_team.toml` - Orchestrator with an isolated coder, a reviewer that takes over the coder's worktree (`handoff_from`) and a read-only explorer
 
 ## Profiles Configuration
 

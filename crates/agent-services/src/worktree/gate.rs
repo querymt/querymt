@@ -71,7 +71,10 @@ impl CheckoutMutationGate {
         F: Future,
     {
         let path = self.gate_path();
-        crate::worktree::lock::with_lock_file(&path, async { Ok(fut.await) }).await
+        crate::worktree::lock::with_lock_file(&path, "gate", Some(&self.checkout_root), async {
+            Ok(fut.await)
+        })
+        .await
     }
 }
 

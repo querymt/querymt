@@ -8,7 +8,9 @@
 mod capture;
 mod confined;
 mod gc;
+mod link;
 mod restore;
+mod sink;
 #[cfg(test)]
 mod tests;
 
@@ -398,6 +400,24 @@ impl SnapshotBackend for GitSnapshotBackend {
         tokio::task::spawn_blocking(move || {
             let repo = backend.open_or_init(&worktree)?;
             gc::collect_garbage(&repo, &config, SystemTime::now())
+        })
+        .await
+        .map_err(|_| SnapshotError::TaskPanicked)?
+    }
+
+    async fn link_object_source(
+        &self,
+        worktree: &Path,
+        objects_dir: &Path,
+        baseline_commit: &str,
+    ) -> SnapshotResult<()> {
+        let worktree = worktree.to_path_buf();
+        let objects_dir = objects_dir.to_path_buf();
+        let baseline_commit = baseline_commit.to_owned();
+        let backend = self.clone();
+
+        tokio::task::spawn_blocking(move || {
+            backend.link_object_source_blocking(&worktree, &objects_dir, &baseline_commit)
         })
         .await
         .map_err(|_| SnapshotError::TaskPanicked)?

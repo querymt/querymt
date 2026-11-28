@@ -23,6 +23,7 @@
 pub mod allocate;
 pub mod apply;
 pub mod capture;
+mod capture_scan;
 pub use querymt_agent_core::worktree::domain;
 pub mod error;
 pub mod finalize;
@@ -51,7 +52,8 @@ pub mod test_support;
 
 pub use allocate::{BaselineSource, RecoveredWorkspace, WorkspaceAllocator, checkout_path_for};
 pub use capture::{
-    CaptureRetryPolicy, CapturedState, capture_working_state, capture_working_state_validated,
+    CaptureRetryPolicy, CaptureStats, CapturedState, capture_working_state,
+    capture_working_state_validated,
 };
 pub use domain::{
     Baseline, BaselineMode, ChangeKind, ChangedPath, DelegationIsolation, ExecutionMode,
@@ -79,11 +81,11 @@ pub use lifecycle::{RemovalReport, WorkspaceManager, WorkspaceStatus};
 pub use lock::{admin_lock_path, with_admin_lock};
 pub use ops::{
     Announcement, ArchiveOutcome, FollowUp, FollowUpOutcome, HandoffHost, HandoffOptions,
-    IsolatedSessionSpawner, MergeOptions, MergeOutcome, OwnerHost, RemoveOutcome, WorkspaceTarget,
-    WorktreeCreateRequest, WorktreeCreateResponse, WorktreeFollowUpError, WorktreeHandoffResponse,
-    WorktreeListResponse, WorktreeMergeResponse, WorktreeOpError, WorktreeOps,
-    WorktreePublishResponse, WorktreeRecoverResponse, WorktreeRemoveResponse, WorktreeResultEntry,
-    WorktreeResultResponse, WorktreeStatusResponse, WorktreeSummary,
+    IsolatedSessionSpawner, MergeOptions, MergeOutcome, OwnerHost, PendingHandoff, RemoveOutcome,
+    WorkspaceTarget, WorktreeCreateRequest, WorktreeCreateResponse, WorktreeFollowUpError,
+    WorktreeHandoffResponse, WorktreeListResponse, WorktreeMergeResponse, WorktreeOpError,
+    WorktreeOps, WorktreePublishResponse, WorktreeRecoverResponse, WorktreeRemoveResponse,
+    WorktreeResultEntry, WorktreeResultResponse, WorktreeStatusResponse, WorktreeSummary,
 };
 pub use protect::IndexLock;
 pub use querymt_agent_core::worktree::repository::WorkspaceRepository;

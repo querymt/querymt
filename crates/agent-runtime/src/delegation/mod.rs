@@ -20,6 +20,10 @@ pub use root::{RootParts, build_root, delegation_enabled};
 pub use summarizer::DelegationSummarizer;
 
 #[cfg(test)]
+mod handoff_tests;
+#[cfg(test)]
 mod member_tests;
 #[cfg(test)]
 pub(crate) mod root_tests;
+#[cfg(test)]
+mod startup_span_tests;

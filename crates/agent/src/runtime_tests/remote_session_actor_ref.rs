@@ -1127,6 +1127,7 @@ mod session_actor_ref_remote_tests {
                 tool_call_id: Some("call-remote".into()),
                 batch_id: None,
                 cycle_id: None,
+                handoff_from: None,
             },
         )
         .await

@@ -785,14 +785,29 @@ pub fn ensure_workspace_provisioning_columns(conn: &mut Connection) -> Result<()
 /// the paired migration stays idempotent. Existing rows keep NULL and review
 /// falls back to the workspace baseline commit.
 pub fn ensure_workspace_result_columns(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    ensure_workspace_result_column(conn, "captured_head")
+}
+
+/// Add the `delegation_id` column (the delegation whose completion published
+/// the result) to `workspace_results` when an existing database predates it.
+/// Existing rows keep NULL: acceptance then judges the workspace's own
+/// delegation, as before.
+pub fn ensure_workspace_result_publisher(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    ensure_workspace_result_column(conn, "delegation_id")
+}
+
+fn ensure_workspace_result_column(
+    conn: &mut Connection,
+    column: &str,
+) -> Result<(), rusqlite::Error> {
     let existing: HashSet<String> = {
         let mut stmt = conn.prepare("PRAGMA table_info(workspace_results)")?;
         stmt.query_map([], |row| row.get::<_, String>(1))?
             .collect::<Result<_, _>>()?
     };
-    if !existing.contains("captured_head") {
+    if !existing.contains(column) {
         conn.execute(
-            "ALTER TABLE workspace_results ADD COLUMN captured_head TEXT",
+            &format!("ALTER TABLE workspace_results ADD COLUMN {column} TEXT"),
             [],
         )?;
     }
@@ -882,6 +897,10 @@ pub const WORKSPACE_TABLES_DDL: &str = r#"
         -- review stays accurate after later commits. NULL for rows written
         -- before the column existed.
         captured_head TEXT,
+        -- The delegation whose completion published the result (after a
+        -- delegation by handoff, not the workspace's own). NULL for explicit
+        -- publishes, merge snapshots and rows written before the column.
+        delegation_id TEXT,
         FOREIGN KEY(workspace_public_id) REFERENCES workspaces(public_id) ON DELETE CASCADE
     );
 

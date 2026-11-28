@@ -297,8 +297,11 @@ pub struct AcceptRequest<'a> {
     /// The requesting session's effective cwd; its checkout is the target.
     pub target_cwd: &'a Path,
     pub objective: &'a str,
-    /// Durable status of the delegation; only a `Complete` delegation may be
-    /// accepted. Callers read it from the session store.
+    /// Durable status of the run that produced the result: the delegation
+    /// recorded as the result's publisher ([`WorkspaceService::result_publisher`];
+    /// after a delegation by handoff it is not `delegation_id`), else the
+    /// delegation itself. Only a `Complete` run may be accepted. Callers read
+    /// it from the session store.
     pub delegation_status: crate::session::domain::DelegationStatus,
     /// The requesting session's checkout mutation gate. When `None` (or
     /// bound to a different checkout) the checkout-keyed gate under the
@@ -535,6 +538,60 @@ impl WorkspaceService {
     /// Find the retained result of `record` that `prefix` names: `Ok(None)`
     /// when `prefix` is not a hex prefix of at least 7 digits or matches no
     /// retained result, a refusal when it matches several.
+    /// The delegation whose completion published the retained result of
+    /// `delegation_id`'s workspace matching `result_commit` (full id or a
+    /// prefix of at least 7 hex digits). `None` when no single result
+    /// matches, or the matching result was not published by a delegation
+    /// (explicit publish, merge snapshot, older rows): acceptance then
+    /// judges `delegation_id` itself.
+    ///
+    /// # Errors
+    /// Registry read failures.
+    pub async fn result_publisher(
+        &self,
+        delegation_id: &str,
+        result_commit: &str,
+    ) -> WorktreeResult<Option<String>> {
+        let wanted = result_commit.to_ascii_lowercase();
+        if wanted.len() < 7 || !wanted.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Ok(None);
+        }
+        let Some(record) = self
+            .registry()
+            .get_workspace_by_delegation(delegation_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let results = self.registry().list_results(&record.id).await?;
+        let matching: Vec<_> = results
+            .iter()
+            .filter(|r| {
+                r.result_commit
+                    .as_deref()
+                    .is_some_and(|c| c.starts_with(&wanted))
+            })
+            .collect();
+        // One commit, one publisher: anything else is left to the
+        // acceptance's own matching and refusals.
+        let mut commits: Vec<_> = matching
+            .iter()
+            .filter_map(|r| r.result_commit.as_deref())
+            .collect();
+        commits.sort_unstable();
+        commits.dedup();
+        let mut publishers: Vec<_> = matching
+            .iter()
+            .map(|r| r.delegation_id.as_deref())
+            .collect();
+        publishers.sort_unstable();
+        publishers.dedup();
+        Ok(match (commits.as_slice(), publishers.as_slice()) {
+            ([_], [Some(publisher)]) => Some((*publisher).to_owned()),
+            _ => None,
+        })
+    }
+
     pub(crate) async fn match_result(
         &self,
         record: &WorkspaceRecord,

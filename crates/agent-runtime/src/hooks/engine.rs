@@ -385,6 +385,9 @@ pub struct PreDelegationRequest {
     pub expected_output: Option<String>,
     /// Isolation requested on the delegate tool call, before policy hooks.
     pub isolation: crate::worktree::DelegationIsolation,
+    /// Earlier delegation whose worktree this delegate takes over by
+    /// ownership handoff. Read-only for hooks.
+    pub handoff_from: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1421,6 +1424,7 @@ impl Hooks {
             context: NullableString::from_string(request.context),
             constraints: NullableString::from_string(request.constraints),
             expected_output: NullableString::from_string(request.expected_output),
+            handoff_from: NullableString::from_string(request.handoff_from),
         };
 
         let mut result = PreDelegationResult::default();

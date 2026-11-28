@@ -199,3 +199,201 @@ The parent session of a completed isolated delegation SHALL be able to accept a 
 - **THEN** the next acceptance on that checkout first restores the touched paths or completes the index update according to the branch target, and removes only a lock QueryMT provably owns
 - **AND** a touched path edited since the interruption is never overwritten; recovery is refused and the intent kept
 - **AND** a reference transaction that applied only one of its two updates is resolved by the same recovery rather than rolled back immediately
+
+### Requirement: Delegation by worktree handoff
+A delegating session SHALL be able to run a new delegate in the isolated worktree of one of its earlier delegations by naming that delegation as `handoff_from` on the `delegate` call. Ownership SHALL move to the new delegate session before it runs; no worktree SHALL be allocated, and files, branch, index, baseline and retained results SHALL be unchanged. The previous owner SHALL become read-only.
+
+#### Scenario: Reviewer takes over a coder's worktree
+- **WHEN** session P delegated to `coder` as delegation D1 in isolated worktree W, D1 completed with edits, and P delegates to `reviewer` with `handoff_from = D1`
+- **THEN** the reviewer's session owns W and runs in W's execution cwd with the coder's edits present
+- **AND** no new worktree is created and W's branch, baseline and earlier results are unchanged
+- **AND** loading the coder's session discloses read-only access with reason `owner_transferred` and the reviewer's session as current owner
+
+#### Scenario: Handoff from a failed or cancelled delegation
+- **WHEN** the delegation named by `handoff_from` failed or was cancelled after editing files in its retained worktree
+- **THEN** the new delegate takes ownership of that worktree and sees those edits
+
+#### Scenario: Second round after a review
+- **WHEN** a delegate that ran by handoff in W has completed and P delegates again with `handoff_from = D1`
+- **THEN** the new delegate takes ownership of W from the previous delegate
+
+#### Scenario: Handoff is disclosed to the caller and hooks
+- **WHEN** P calls `delegate` with `handoff_from`
+- **THEN** the `delegation_requested` event and the `pre_delegation` hook input carry `handoff_from`
+- **AND** the tool result discloses that the delegate runs in the existing worktree of that delegation rather than a new or shared checkout
+
+### Requirement: Refused delegation handoff changes nothing
+A delegation with `handoff_from` SHALL fail before its delegate runs, with an error naming the reason, when the named delegation was not made by the delegating session, has no isolated worktree, the worktree is not ready, its owner is busy, its owner's delegation has not reported its terminal state, its owner is not hosted locally, or the call also requests `isolation = "shared"`. Ownership, files and the previous owner's access SHALL be unchanged and no worktree SHALL be allocated.
+
+#### Scenario: Handoff from another session's delegation
+- **WHEN** session Q calls `delegate` with `handoff_from` naming a delegation made by session P
+- **THEN** the delegation fails with `not_parent_session` and P's worktree keeps its owner
+
+#### Scenario: Handoff from a shared delegation
+- **WHEN** `handoff_from` names a delegation that ran in the shared checkout
+- **THEN** the delegation fails with `no_isolated_workspace`
+
+#### Scenario: Owner still running
+- **WHEN** `handoff_from` names a delegation whose worktree owner has a running turn or queued input
+- **THEN** the delegation fails with `owner_active` and the running owner is not interrupted
+
+#### Scenario: Owner's delegation still finishing
+- **WHEN** `handoff_from` names a delegation whose delegate's turn ended but which is still verifying, summarizing or capturing its result
+- **THEN** the delegation fails with `owner_active`, the owner's session is not unloaded, and the finishing delegation publishes its result from the unchanged worktree
+
+#### Scenario: Shared isolation with handoff
+- **WHEN** a `delegate` call sets both `handoff_from` and `isolation = "shared"`
+- **THEN** the call is rejected as an invalid request and nothing is queued
+
+#### Scenario: Unknown delegation
+- **WHEN** `handoff_from` names a delegation id that does not exist
+- **THEN** the delegation fails with an error naming the id and nothing is allocated
+
+### Requirement: Handoff results are accepted under the worktree's delegation
+A delegate that ran by handoff SHALL publish its result on the worktree when it completes, as any isolated delegate does. Its completion output SHALL name the delegation that created the worktree as the id to pass to `accept_delegation_result`. Accepting that id with the new result commit SHALL integrate the whole baseline-relative delta, including earlier owners' edits.
+
+#### Scenario: Accept coder work plus reviewer fixes
+- **WHEN** the coder of D1 changed file A, the reviewer that took over by handoff fixed file B and completed with result R2, and P calls `accept_delegation_result` with D1 and R2
+- **THEN** one commit changing A and B is created on P's branch
+
+#### Scenario: Completion names the worktree's delegation
+- **WHEN** a delegate that ran by handoff from D1 completes with changes
+- **THEN** its completion output tells the delegating session to call `accept_delegation_result` with delegation id D1 and the new result commit
+
+### Requirement: Acceptance judges the run that published the result
+Every result a delegation publishes on completion SHALL record that delegation as its publisher. `accept_delegation_result` SHALL require the result's publishing delegation to be complete, and the worktree's own delegation when the result has no publisher.
+
+#### Scenario: Accept after a failed coder
+- **WHEN** the coder of D1 failed after editing file A, a reviewer that took over by handoff completed with result R2, and P calls `accept_delegation_result` with D1 and R2
+- **THEN** one commit changing A is created on P's branch
+
+#### Scenario: Result without a publisher
+- **WHEN** D1 failed and P accepts a result of its worktree that was published without a delegation (an explicit publish)
+- **THEN** the acceptance is refused with `delegation_not_complete` and nothing changes
+
+### Requirement: Baseline capture reads only changed content
+Baseline capture SHALL NOT read the content of a tracked file whose stat data matches its entry in the source's real index, as Git compares stat data. It SHALL take that entry's content identity instead. It SHALL read modified tracked files and non-ignored untracked files. It SHALL find non-ignored untracked files regardless of the repository's `status.showUntrackedFiles` setting.
+
+#### Scenario: Clean checkout reads no file content
+- **WHEN** an isolated delegate is requested from a checkout whose working files all match the index and HEAD, and the index was written in a later timestamp tick than any of them was modified
+- **THEN** the capture reads no file content
+- **AND** the baseline identifies HEAD's commit
+
+#### Scenario: One edited file is the only file read
+- **WHEN** an isolated delegate is requested after one tracked file was edited in a checkout of many files
+- **THEN** the capture reads that file and no unchanged tracked file
+- **AND** the delegate's checkout has the edited contents
+
+#### Scenario: Staged then edited file keeps working contents
+- **WHEN** a file was staged and then edited again before an isolated delegate is requested
+- **THEN** the baseline holds the edited working contents, not the staged contents
+- **AND** the real index is byte-for-byte unchanged
+
+#### Scenario: Untracked files are captured when status hides them
+- **WHEN** the repository sets `status.showUntrackedFiles=no` and a new non-ignored file exists
+- **THEN** the capture reads that file
+- **AND** the baseline includes it
+
+### Requirement: Index entries that can hide working content are read
+Baseline capture SHALL read a tracked file whose real-index entry is racily clean (modified no earlier than the index was written) or carries an assume-unchanged, skip-worktree, fsmonitor-valid or intent-to-add flag, even when its stat data matches the entry. It SHALL also read a tracked file whose recorded kind (regular file or symbolic link) differs from the file on disk.
+
+#### Scenario: Racily clean entry is read
+- **WHEN** a tracked file's index entry is racily clean and the file was rewritten with the same size and modification time
+- **THEN** the capture reads that file
+- **AND** the baseline holds its current contents
+
+#### Scenario: Assume-unchanged file edited is captured
+- **WHEN** a tracked file marked assume-unchanged in the real index was edited before an isolated delegate is requested
+- **THEN** the capture reads that file
+- **AND** the baseline holds its edited contents
+
+#### Scenario: Intent-to-add file is read
+- **WHEN** a file was added with intent-to-add and has content before an isolated delegate is requested
+- **THEN** the capture reads that file
+- **AND** the baseline holds its contents
+
+#### Scenario: File replaced by a symlink is read
+- **WHEN** a tracked regular file was replaced by a symbolic link
+- **THEN** the capture reads the link
+- **AND** the baseline records a symbolic link with its target
+
+### Requirement: Baselines hold raw working contents
+The baseline SHALL hold the raw working bytes and on-disk modes of the checkout, and SHALL equal one built by reading every candidate file. Baseline capture SHALL read a tracked file whose effective attributes or configuration convert its content between the index and the working tree. Baseline capture SHALL read a tracked file whose index blob size differs from the file size.
+
+#### Scenario: Line-ending converted file keeps working bytes
+- **WHEN** a tracked file's attributes convert line endings between the index and the working tree
+- **THEN** the capture reads that file
+- **AND** the baseline holds its working bytes, as a capture that reads every file would
+
+#### Scenario: Index blob normalised under earlier settings is read
+- **WHEN** a tracked file's index blob was converted under earlier settings that no longer apply, and its stat data matches the index entry
+- **THEN** the capture reads that file
+- **AND** the baseline holds its working bytes
+
+#### Scenario: Selective capture matches a full read
+- **WHEN** a checkout holds a tracked deletion, an edited file, a staged-only addition, an executable, a symlink and a non-ignored untracked file
+- **THEN** the baseline tree is identical to the tree obtained by reading every candidate file
+
+### Requirement: Baseline capture writes no content the repository holds
+Baseline capture SHALL NOT write an object to the source repository that the repository already holds. It SHALL write only the blobs, trees and commit of contents the repository does not yet contain.
+
+#### Scenario: Repeated delegation from the same dirty state
+- **WHEN** two isolated delegates are requested one after the other from a checkout whose working state did not change in between
+- **THEN** the second capture writes no new blob or tree
+
+#### Scenario: Repeated delegation with a large dirty file writes nothing
+- **WHEN** two isolated delegates are requested one after the other from a checkout with a dirty file of at least the large-file threshold, and nothing changed in between
+- **THEN** the second capture writes no new blob or tree
+
+#### Scenario: New untracked file is written once
+- **WHEN** an isolated delegate is requested after a new non-ignored file was created
+- **THEN** the capture writes that file's blob
+- **AND** the baseline includes the file
+
+### Requirement: Capture validation reads file contents once per attempt
+Each capture attempt SHALL read the content of each file at most once, except that a captured file modified within the racy window of the attempt's start SHALL be read once more to verify the captured content, and a file of at least the large-file threshold that the repository does not yet hold SHALL be read once more to write it. A verified file whose content no longer matches SHALL be treated as a change detected during capture, which is retried or fails as already required.
+
+#### Scenario: Same-size rewrite after the read is detected
+- **WHEN** a captured file modified within the racy window is rewritten with the same size after the capture read it, and its stat data after the rewrite equals its stat data before the capture
+- **THEN** the attempt is discarded and a new validated capture is made, or the delegation fails before the child launches
+
+#### Scenario: Quiet checkout needs one attempt
+- **WHEN** nothing changes the checkout while the capture runs
+- **THEN** the baseline is produced by one attempt that read each changed file once, apart from files verified because they were modified within the racy window and large files written for the first time
+
+### Requirement: Capture validation compares stat fingerprints
+Validation SHALL compare HEAD, the index entries, and the size, modification time and mode of every captured path and every non-ignored untracked path, plus change time and inode where the platform provides them and the repository's stat settings use them, taken before and after the capture. Any difference SHALL be treated as a change detected during capture, which is retried or fails as already required.
+
+#### Scenario: External edit to an already dirty file during capture
+- **WHEN** a file that already differs from HEAD is rewritten by another process while the capture runs
+- **THEN** the attempt is discarded and a new validated capture is made, or the delegation fails before the child launches
+
+#### Scenario: Untracked file created during capture
+- **WHEN** a new non-ignored file appears in the checkout while the capture runs
+- **THEN** the attempt is discarded and a new validated capture is made, or the delegation fails before the child launches
+
+### Requirement: Isolated delegation startup is traceable
+When tracing is enabled, each phase between claiming a delegation and sending the delegate's first prompt SHALL be recorded as its own span under the delegation's handler span. The parallel-slot wait and `delegation.execute` SHALL be siblings. Admission, parent workspace resolution, baseline capture, lock and gate waits, provisioning, the `delegation_start` hook and session creation SHALL be under `delegation.execute`.
+
+#### Scenario: No unattributed startup time
+- **WHEN** an isolated delegation starts and its delegate receives its first prompt
+- **THEN** the spans under the handler span cover the interval from the end of the claim to the first prompt, except for gaps of at most 50 ms in total
+
+#### Scenario: Queued delegation shows its wait
+- **WHEN** a delegation waits because the parallel-delegation limit is reached
+- **THEN** a queue-wait span records the time from the claim to the start of execution
+
+#### Scenario: Shared delegation has no allocation spans
+- **WHEN** a shared (non-isolated) delegation starts
+- **THEN** no baseline capture or provisioning span is recorded for it
+
+### Requirement: Startup spans record what they did
+A baseline capture span SHALL record its attempt count, files read, bytes read and objects written. A lock or gate wait span SHALL cover only the time spent waiting and SHALL record the lock it waited for, and a gate wait span SHALL record the checkout the gate serialises. A provisioning span SHALL record the number of files checked out. The workspace id SHALL be recorded once it exists.
+
+#### Scenario: Capture span explains a slow capture
+- **WHEN** a capture reads 100 files totalling 10 MB in one attempt
+- **THEN** its span records 1 attempt, 100 files read and 10 MB read
+
+#### Scenario: Contended gate is visible
+- **WHEN** baseline capture waits for the source checkout's mutation gate held by another operation
+- **THEN** a gate-wait span records the wait time and the checkout it serialises

@@ -60,6 +60,7 @@ fast_html2md = { package = "fast_html2md", version = "0.0.66", features = ["scra
 mdq = "0.10.0"
 gix = { version = "0.90", default-features = false, features = ["basic", "worktree-mutation", "attributes", "sha1", "status", "merge"] }
 gix-error = "0.5"
+filetime = "0.2"
 dirs.workspace = true
 dunce = "1"
 opentelemetry = "0.33"

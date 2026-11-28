@@ -292,6 +292,16 @@ impl WorkspaceService {
         Ok(Some(WorkspaceBinding::new(record, &self.storage_root)?))
     }
 
+    /// The binding of an existing workspace record: its execution cwd and the
+    /// checkout's mutation gate. Used by a delegation that takes over a
+    /// workspace by ownership handoff instead of allocating one.
+    ///
+    /// # Errors
+    /// When the checkout's mutation gate cannot be created.
+    pub fn binding_for(&self, record: WorkspaceRecord) -> WorktreeResult<WorkspaceBinding> {
+        WorkspaceBinding::new(record, &self.storage_root)
+    }
+
     /// Bind a freshly created session as the workspace's single writable
     /// owner. Fails when another session already owns it (fail closed; a
     /// second writable attachment is rejected, not silently shared).
@@ -699,10 +709,25 @@ impl WorkspaceService {
         crate::worktree::placement::ensure_local_filesystem_execution(parent_cwd)?;
         crate::worktree::placement::ensure_local_filesystem_execution(&self.storage_root)?;
 
-        let resolved = resolve_repository(parent_cwd)?;
-        let relative =
-            crate::worktree::identity::relative_cwd(&resolved.checkout.root, parent_cwd)?;
-        let fallback_gate = CheckoutMutationGate::new(&self.storage_root, &resolved.checkout.root)?;
+        // Repository resolution, cwd relativization and the fallback gate's
+        // canonicalization are blocking filesystem work; run them together
+        // off the async workers.
+        let (resolved, relative, fallback_gate) = {
+            let parent_cwd = parent_cwd.to_path_buf();
+            let storage_root = self.storage_root.clone();
+            tokio::task::spawn_blocking(move || -> WorktreeResult<_> {
+                let resolved = resolve_repository(&parent_cwd)?;
+                let relative =
+                    crate::worktree::identity::relative_cwd(&resolved.checkout.root, &parent_cwd)?;
+                let fallback_gate =
+                    CheckoutMutationGate::new(storage_root, &resolved.checkout.root)?;
+                Ok((resolved, relative, fallback_gate))
+            })
+            .await
+            .map_err(|err| {
+                WorktreeError::InvalidOperation(format!("repository resolution task failed: {err}"))
+            })??
+        };
         let parent_gate = Some(parent_gate.unwrap_or(&fallback_gate));
 
         // Delegates always start from the parent's current working state:
@@ -718,7 +743,7 @@ impl WorkspaceService {
             "{}.lock",
             querymt_agent_core::hash::RapidHash::new(batch_key.as_bytes()).to_hex()
         ));
-        crate::worktree::lock::with_lock_file(&lock_path, async {
+        crate::worktree::lock::with_lock_file(&lock_path, "batch", None, async {
             let existing = match delegation_batch_id.as_deref() {
                 Some(batch) => self.registry.list_workspaces_by_batch(batch).await?,
                 None => Vec::new(),
@@ -804,6 +829,24 @@ impl WorkspaceService {
         gate: Option<&CheckoutMutationGate>,
         verification: Option<ResultVerificationStatus>,
     ) -> WorktreeResult<ResultProvenance> {
+        self.publish_delegation_result(record, checkout, gate, verification, None)
+            .await
+    }
+
+    /// [`Self::publish_result`] for the completion of `delegation_id`, which
+    /// is recorded as the result's publisher. After a delegation by handoff
+    /// it is not the workspace's own delegation; acceptance judges it.
+    ///
+    /// # Errors
+    /// Same as [`Self::publish_result`].
+    pub async fn publish_delegation_result(
+        &self,
+        record: &WorkspaceRecord,
+        checkout: &Path,
+        gate: Option<&CheckoutMutationGate>,
+        verification: Option<ResultVerificationStatus>,
+        delegation_id: Option<&str>,
+    ) -> WorktreeResult<ResultProvenance> {
         crate::worktree::placement::ensure_local_filesystem_execution(checkout)?;
 
         let message = result_commit_message(&record.id);
@@ -817,11 +860,12 @@ impl WorkspaceService {
             Some(gate) => gate.run(capture).await??,
             None => capture.await?,
         };
-        self.retain_result(
+        self.retain_result_published_by(
             record,
             &captured.commit,
             &captured.source_head,
             verification,
+            delegation_id,
         )
         .await
     }
@@ -841,6 +885,18 @@ impl WorkspaceService {
         captured_head: &str,
         verification: Option<ResultVerificationStatus>,
     ) -> WorktreeResult<ResultProvenance> {
+        self.retain_result_published_by(record, commit, captured_head, verification, None)
+            .await
+    }
+
+    async fn retain_result_published_by(
+        &self,
+        record: &WorkspaceRecord,
+        commit: &str,
+        captured_head: &str,
+        verification: Option<ResultVerificationStatus>,
+        delegation_id: Option<&str>,
+    ) -> WorktreeResult<ResultProvenance> {
         let result_ref = format!("refs/qmt/results/{}/{}", record.id, uuid::Uuid::now_v7());
         self.git
             .create_ref_if_absent(&record.repository.common_dir, result_ref.as_str(), commit)
@@ -857,6 +913,7 @@ impl WorkspaceService {
             verification,
             captured_at: time::OffsetDateTime::now_utc(),
             captured_head: Some(captured_head.to_string()),
+            delegation_id: delegation_id.map(str::to_owned),
         };
         self.registry.record_result(&record.id, &provenance).await?;
         Ok(provenance)
@@ -946,6 +1003,52 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn contended_gate_is_visible() {
+        use crate::tools::trace_support::genai_trace::{attr, capture};
+        use std::time::Duration;
+
+        let (repo, _storage, svc) = service().await;
+        let gate = CheckoutMutationGate::new(&svc.storage_root, repo.path()).unwrap();
+        let canonical = gate.checkout_root().display().to_string();
+
+        // One holder and one waiter on the same task, so both inherit the
+        // capture subscriber. The waiter starts only once the holder owns
+        // the gate, and the holder keeps it far longer than the waiter's
+        // first `try_lock` takes, so the waiter's acquisition is contended.
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+        let (_, spans) = capture(async {
+            let holder = gate.run(async move {
+                held_tx.send(()).unwrap();
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            });
+            let waiter = async {
+                held_rx.await.unwrap();
+                svc.capture_batch_baseline(
+                    repo.path(),
+                    BaselineMode::CurrentWorkingTree,
+                    Some(&gate),
+                )
+                .await
+                .unwrap()
+            };
+            tokio::join!(holder, waiter)
+        })
+        .await;
+
+        let waited = spans
+            .iter()
+            .filter(|s| s.name == "worktree.lock.wait")
+            .filter(|s| attr(s, "lock").map(|v| v.to_string()).as_deref() == Some("gate"))
+            .filter(|s| attr(s, "checkout").map(|v| v.to_string()).as_deref() == Some(&canonical))
+            .find(|s| matches!(attr(s, "polls"), Some(opentelemetry::Value::I64(n)) if *n > 0))
+            .expect("a contended gate wait span with polls > 0 and the canonical checkout");
+        assert!(
+            waited.end_time.duration_since(waited.start_time).unwrap() > Duration::ZERO,
+            "the wait span covers the time spent waiting"
+        );
+    }
 
     #[tokio::test]
     async fn delegation_cancellation_before_provisioning_creates_no_workspace() {

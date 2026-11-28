@@ -553,6 +553,71 @@ impl WorkspaceRepository for SqliteWorkspaceRepository {
         })
     }
 
+    async fn revert_transfer(
+        &self,
+        id: &WorkspaceId,
+        previous: &str,
+        successor: &str,
+    ) -> SessionResult<WorkspaceRecord> {
+        let (workspace, previous_owned, successor_owned) = (
+            id.as_str().to_owned(),
+            previous.to_owned(),
+            successor.to_owned(),
+        );
+        let reverted = self
+            .run_blocking(move |conn| {
+                let tx = conn.transaction()?;
+                let marker = tx.execute(
+                    "DELETE FROM workspace_handoffs \
+                     WHERE from_session_id = ?1 AND workspace_public_id = ?2 \
+                     AND to_session_id = ?3",
+                    params![previous_owned, workspace, successor_owned],
+                )?;
+                // The most recent remaining handoff, if any, is again the
+                // workspace's latest one.
+                let changed = tx.execute(
+                    "UPDATE workspaces SET owner_session_id = ?2, \
+                     handed_off_to = (SELECT to_session_id FROM workspace_handoffs \
+                       WHERE workspace_public_id = ?1 \
+                       ORDER BY transferred_at DESC, rowid DESC LIMIT 1), \
+                     updated_at = ?4 \
+                     WHERE public_id = ?1 AND lifecycle = 'ready' AND owner_session_id = ?3",
+                    params![
+                        workspace,
+                        previous_owned,
+                        successor_owned,
+                        format_dt(&OffsetDateTime::now_utc())
+                    ],
+                )?;
+                if marker == 0 || changed == 0 {
+                    // Dropping the transaction rolls the marker delete back.
+                    return Ok(None);
+                }
+                let record =
+                    tx.query_row(&select_by_id_sql(), params![workspace], row_to_workspace)?;
+                tx.commit()?;
+                Ok(Some(record))
+            })
+            .await?;
+        if let Some(record) = reverted {
+            return Ok(record);
+        }
+        let record = self
+            .get_workspace(id)
+            .await?
+            .ok_or_else(|| SessionError::WorkspaceNotFound(id.to_string()))?;
+        if record.lifecycle != WorkspaceLifecycle::Ready {
+            return Err(SessionError::InvalidOperation(format!(
+                "workspace {id} is {} and cannot change owner",
+                record.lifecycle
+            )));
+        }
+        Err(SessionError::WorkspaceAlreadyOwned {
+            workspace: id.to_string(),
+            owner: record.ownership.owner_session_id.unwrap_or_default(),
+        })
+    }
+
     async fn transferred_to(&self, session_id: &str) -> SessionResult<Option<String>> {
         let session = session_id.to_owned();
         self.run_blocking(move |conn| {
@@ -656,12 +721,13 @@ impl WorkspaceRepository for SqliteWorkspaceRepository {
         let verification = provenance.verification.map(|v| v.to_string());
         let captured_at = format_dt(&provenance.captured_at);
         let captured_head = provenance.captured_head.clone();
+        let delegation_id = provenance.delegation_id.clone();
         self.run_blocking(move |conn| {
             conn.execute(
                 "INSERT INTO workspace_results (
                     workspace_public_id, baseline_commit, result_commit, result_ref,
-                    verification, captured_at, captured_head
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    verification, captured_at, captured_head, delegation_id
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     id,
                     baseline_commit,
@@ -669,7 +735,8 @@ impl WorkspaceRepository for SqliteWorkspaceRepository {
                     result_ref,
                     verification,
                     captured_at,
-                    captured_head
+                    captured_head,
+                    delegation_id
                 ],
             )?;
             Ok(())
@@ -682,7 +749,8 @@ impl WorkspaceRepository for SqliteWorkspaceRepository {
         self.run_blocking(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT baseline_commit, result_commit, result_ref, verification, captured_at, \
-                 captured_head FROM workspace_results WHERE workspace_public_id = ?1 \
+                 captured_head, delegation_id FROM workspace_results \
+                 WHERE workspace_public_id = ?1 \
                  ORDER BY captured_at DESC, id DESC",
             )?;
             let rows = stmt
@@ -693,6 +761,7 @@ impl WorkspaceRepository for SqliteWorkspaceRepository {
                     let verification: Option<String> = row.get(3)?;
                     let captured_at: String = row.get(4)?;
                     let captured_head: Option<String> = row.get(5)?;
+                    let delegation_id: Option<String> = row.get(6)?;
                     Ok(ResultProvenance {
                         baseline_commit,
                         result_commit,
@@ -703,6 +772,7 @@ impl WorkspaceRepository for SqliteWorkspaceRepository {
                             .map_err(|_| rusqlite::Error::InvalidQuery)?,
                         captured_at: parse_dt(&captured_at)?,
                         captured_head,
+                        delegation_id,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -1030,6 +1100,57 @@ mod tests {
                 .id,
             ws
         );
+    }
+
+    #[tokio::test]
+    async fn revert_transfer_restores_a_writable_previous_owner() {
+        let repo = repo();
+        let ws = ready_owned(&repo, "ws-1", "sess-a").await;
+        insert_session(&repo, "sess-b").await;
+        insert_session(&repo, "sess-c").await;
+        repo.transfer_owner(&ws, "sess-a", "sess-b").await.unwrap();
+        repo.transfer_owner(&ws, "sess-b", "sess-c").await.unwrap();
+
+        // Refused without changes: wrong successor, or a marker that does
+        // not point to it.
+        let err = repo
+            .revert_transfer(&ws, "sess-a", "sess-b")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SessionError::WorkspaceAlreadyOwned { ref owner, .. } if owner == "sess-c"),
+            "{err:?}"
+        );
+        let err = repo
+            .revert_transfer(&ws, "sess-a", "sess-c")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SessionError::WorkspaceAlreadyOwned { .. }),
+            "{err:?}"
+        );
+        assert_eq!(
+            repo.transferred_to("sess-b").await.unwrap().as_deref(),
+            Some("sess-c")
+        );
+
+        let reverted = repo.revert_transfer(&ws, "sess-b", "sess-c").await.unwrap();
+        assert_eq!(
+            reverted.ownership.owner_session_id.as_deref(),
+            Some("sess-b")
+        );
+        assert_eq!(
+            reverted.ownership.handed_off_to.as_deref(),
+            Some("sess-b"),
+            "the earlier handoff is the latest again"
+        );
+        assert_eq!(repo.transferred_to("sess-b").await.unwrap(), None);
+        assert_eq!(
+            repo.transferred_to("sess-a").await.unwrap().as_deref(),
+            Some("sess-b")
+        );
+        // The restored owner can be handed off again.
+        repo.transfer_owner(&ws, "sess-b", "sess-c").await.unwrap();
     }
 
     #[tokio::test]
@@ -1378,6 +1499,7 @@ mod tests {
             verification: Some(ResultVerificationStatus::Failed),
             captured_at: datetime!(2026-01-15 10:00:00 UTC),
             captured_head: Some("head-old".into()),
+            delegation_id: None,
         };
         let newer = ResultProvenance {
             baseline_commit: "base".into(),
@@ -1386,6 +1508,7 @@ mod tests {
             verification: Some(ResultVerificationStatus::Passed),
             captured_at: datetime!(2026-01-15 12:00:00 UTC),
             captured_head: None,
+            delegation_id: Some("delegation-2".into()),
         };
         repo.record_result(&id, &older).await.unwrap();
         repo.record_result(&id, &newer).await.unwrap();
@@ -1403,6 +1526,7 @@ mod tests {
             verification: None,
             captured_at: datetime!(2026-01-15 13:00:00 UTC),
             captured_head: Some("head-dup".into()),
+            delegation_id: None,
         };
         assert!(repo.record_result(&id, &dup).await.is_err());
     }

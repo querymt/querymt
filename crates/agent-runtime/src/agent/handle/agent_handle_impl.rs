@@ -95,9 +95,54 @@ impl LocalAgentHandle {
         workspace: crate::worktree::WorkspaceBinding,
         parent_session_id: String,
     ) -> std::result::Result<(String, SessionActorRef), Error> {
+        self.create_delegation_session_in_workspace(
+            PreallocatedWorkspace::Fresh(workspace),
+            parent_session_id,
+        )
+        .await
+    }
+
+    /// Opens a delegate session in an existing workspace whose owner was
+    /// stopped by `WorktreeOps::begin_handoff`. Ownership moves to the new
+    /// session with the pending handoff's transfer before its actor starts;
+    /// the session is a delegate of `parent_session_id` (fork origin
+    /// `delegation`), not a `worktree` child.
+    pub async fn create_handoff_delegation_session(
+        &self,
+        workspace: crate::worktree::WorkspaceBinding,
+        parent_session_id: String,
+        pending: crate::worktree::PendingHandoff,
+    ) -> std::result::Result<(String, SessionActorRef), Error> {
+        self.create_delegation_session_in_workspace(
+            PreallocatedWorkspace::Handoff {
+                binding: workspace,
+                pending: Box::new(pending),
+            },
+            parent_session_id,
+        )
+        .await
+    }
+
+    async fn create_delegation_session_in_workspace(
+        &self,
+        workspace: PreallocatedWorkspace,
+        parent_session_id: String,
+    ) -> std::result::Result<(String, SessionActorRef), Error> {
+        let cwd = match &workspace {
+            PreallocatedWorkspace::Fresh(binding) => binding.effective_cwd.clone(),
+            PreallocatedWorkspace::Handoff { binding, .. } => binding.effective_cwd.clone(),
+        };
+        // For a handoff, what is needed to return the workspace if the
+        // session fails after ownership moved to it.
+        let handoff = match &workspace {
+            PreallocatedWorkspace::Fresh(_) => None,
+            PreallocatedWorkspace::Handoff { binding, pending } => {
+                Some((binding.clone(), pending.previous().to_owned()))
+            }
+        };
         let mut meta = serde_json::Map::new();
         meta.insert("parent_session_id".to_string(), parent_session_id.into());
-        let req = NewSessionRequest::new(workspace.effective_cwd.clone()).meta(meta);
+        let req = NewSessionRequest::new(cwd).meta(meta);
         let prepared = Box::pin(
             self.session_materializer
                 .prepare_new_session_with_workspace(req, Some(workspace)),
@@ -105,7 +150,22 @@ impl LocalAgentHandle {
         .await?;
         if let Err(error) = self.session_materializer.finalize_session(&prepared).await {
             prepared.actor_ref.kill();
-            return Err(error);
+            // Ownership already moved to the never-registered successor:
+            // give the workspace back to the previous owner (or report
+            // `handoff_incomplete`), as a failed actor start does.
+            return Err(match handoff {
+                Some((binding, previous)) => {
+                    self.session_materializer
+                        .roll_back_handoff_successor(
+                            &binding,
+                            &prepared.session_id,
+                            &previous,
+                            error,
+                        )
+                        .await
+                }
+                None => error,
+            });
         }
         let session_ref =
             crate::agent::session_registry::register_prepared_session(&self.registry, &prepared)

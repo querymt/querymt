@@ -14,3 +14,14 @@ slow-timeout = { period = "120s", terminate-after = 2 }
 # stopping at the first. Per-test overrides from the default profile still apply.
 [profile.ci]
 fail-fast = false
+
+# The startup gap test budgets 50 ms of unattributed time, so scheduler noise
+# from other tests must not eat it: it runs alone (`threads-required` takes
+# every test slot) and in a group of its own.
+[test-groups]
+startup-gap = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'test(no_unattributed_startup_time)'
+test-group = 'startup-gap'
+threads-required = "num-test-threads"

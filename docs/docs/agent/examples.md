@@ -435,6 +435,32 @@ Use this profile when you want config-level hook commands to inspect shell calls
 
 Two profiles for Interactive Brokers' hosted MCP server. The analyst logs in with only the `mcp.read` scope, researches and writes small scripts and order tickets. The desk has the order scope but no shell, file-write or web tools, starts in `plan` mode, and runs `examples/hooks/trading/order_guard.py` before every order (risk limits, kill switch, build-mode-only, limit orders only) and asks you to confirm each order. Use a paper account first; see the header comments in both files for setup.
 
+### `coder_team.toml` — Orchestrator, coder and reviewer in one worktree
+
+The `coder-team` profile (embedded in `qmtcode`, profile id `coder-team`) is a coding team that reviews its own work before anything is merged. It turns on `[dotagents]` and `[agent.workspace]` (`baseline = "current_working_tree"`, so delegates start from your current edits) and has four roles:
+
+| Member | Isolation | What it does |
+|---|---|---|
+| orchestrator | - | Plan mode, read-only tools plus `delegate` and `accept_delegation_result`. Explores, plans, delegates and merges; never edits or runs commands. |
+| `coder` | isolated | Implements the task in its own private Git worktree. |
+| `reviewer` | isolated | Runs with `handoff_from` set to the coder's delegation, so it takes over the **coder's worktree**, reviews the work against the objective, runs the project's checks, fixes what it finds in place and ends with `VERDICT: PASS` or `VERDICT: FAIL`. Replies `BLOCKED` if it does not see the described work. |
+| `explorer` | shared | Read-only code search and explanation in the orchestrator's checkout. |
+
+The review loop the orchestrator follows:
+
+```mermaid
+flowchart TD
+  A[Explore and plan] --> B[delegate coder: delegation D1]
+  B --> C[delegate reviewer, handoff_from D1]
+  C --> D{VERDICT}
+  D -- FAIL --> E[delegate coder, handoff_from D1, with the findings]
+  E --> C
+  D -- PASS --> F[accept_delegation_result D1, latest result]
+  F --> G[One commit on your branch, after you approve]
+```
+
+`accept_delegation_result` is listed in `[agent.permissions] always_ask`, so every merge asks you first. The worktree stays named by the coder's delegation, so every round and the merge use that one id, and the merge contains the coder's and the reviewer's changes. Delegates read `.agents` from their own checkout: a gitignored `.agents/` directory is not in a delegate's baseline. Because delegates start from your current edits, a merge that touches a file you had already changed (uncommitted) when the coder was delegated is refused with `baseline_local_edits`: the result cannot be separated from your edit. Commit or stash such edits before delegating; after this refusal, commit them and delegate the task again. See [Delegation](delegation.md#running-in-an-earlier-delegates-worktree-handoff_from) and [Git Worktree Workspaces](worktrees.md#delegating-to-a-successor-handoff_from).
+
 ### `multi_agent.toml` — Agent + delegates
 
 ```toml

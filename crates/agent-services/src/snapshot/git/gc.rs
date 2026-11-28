@@ -192,7 +192,7 @@ fn sweep(
 }
 
 /// Add `tree_id` and everything below it to `reachable` without loading blobs.
-fn mark_tree(
+pub(super) fn mark_tree(
     repo: &gix::Repository,
     tree_id: gix::ObjectId,
     reachable: &mut HashSet<gix::ObjectId>,
