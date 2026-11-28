@@ -64,12 +64,14 @@ mod tests {
     }
     fn prompt() -> AgentEventKind {
         AgentEventKind::PromptReceived {
+            slash_command: None,
             content: "p".into(),
             message_id: None,
         }
     }
     fn block() -> AgentEventKind {
         AgentEventKind::UserPromptBlock {
+            slash_command: None,
             message_id: "m".into(),
             client_prompt_id: None,
             block: serde_json::from_value(serde_json::json!({"type":"text","text":"x"})).unwrap(),

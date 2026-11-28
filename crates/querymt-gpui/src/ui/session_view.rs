@@ -29,18 +29,20 @@ use super::kit;
 use super::kit::ButtonExt as _;
 use super::kit::badged_tone;
 use super::kit::{accent_btn, flat_btn};
-use super::session_pane::{SessionPane, SessionPaneEvent};
+use super::session_pane::{Blocked, SessionPane, SessionPaneEvent};
 use super::start::{mode_tone, toolbar_button};
+use crate::session::commands::{CommandTraits, recognise};
 use crate::session::open::{Delivery, SessionKey};
 use crate::session::{
     COMPACTING_LABEL, Compaction, CompactionStatus, Diff, Item, ItemKind, SelectOption,
-    SessionView, Thought, ToolCall, UserAttachment, WorkEntry, is_compact_command,
+    SessionView, Thought, ToolCall, UserAttachment, WorkEntry,
 };
 use crate::store::Model;
 use crate::store::worktree::WorktreeAction;
 use crate::theme::Palette;
 use crate::usage::{self, TokenKey};
 use crate::util::{human_size, workspace_name};
+use querymt_agent_session_core::view::SlashCommandView;
 
 const OUTPUT_LINES: usize = 80;
 /// Floating composer: height of the fade above it, and its background-colored halo.
@@ -500,6 +502,9 @@ impl RenderCtx {
                 self.expanded.contains(&item.key).hash(&mut h);
                 self.expanded
                     .contains(&front_matter_key(&item.key))
+                    .hash(&mut h);
+                self.expanded
+                    .contains(&expansion_key(&item.key))
                     .hash(&mut h);
             }
             _ => self.expanded.contains(&item.key).hash(&mut h),
@@ -2276,6 +2281,32 @@ fn front_matter_key(item_key: &str) -> String {
     format!("front-matter:{item_key}")
 }
 
+/// Expansion key of a prompt command's "Show prompt" toggle.
+fn expansion_key(item_key: &str) -> String {
+    format!("expansion:{item_key}")
+}
+
+/// The prompt a slash command expanded to: what the model received. Plain
+/// text in the mono face, under the bubble.
+fn render_expansion(item_key: &str, expansion: &str, rc: &RenderCtx) -> AnyElement {
+    let p = &rc.p;
+    div()
+        .id(SharedString::from(format!("uexpansion-{item_key}")))
+        .debug_selector(|| "user-command-expansion".into())
+        .min_w_0()
+        .px_3p5()
+        .py_2()
+        .rounded(px(10.))
+        .bg(p.card)
+        .border_1()
+        .border_color(p.border)
+        .font_family(kit::MONO)
+        .text_xs()
+        .text_color(p.muted)
+        .child(expansion.to_owned())
+        .into_any_element()
+}
+
 /// Front matter of a user message as highlighted YAML, with its own copy
 /// button (desktop `SessionMessageMetadata`).
 fn render_front_matter(
@@ -3242,6 +3273,7 @@ fn render_item(ix: usize, item: &Item, rc: &RenderCtx) -> AnyElement {
             text,
             attachments,
             local,
+            command,
         } => {
             let copied = rc.copied.as_deref() == Some(item.key.as_str());
             let group = SharedString::from(format!("ug-{}", item.key));
@@ -3251,10 +3283,18 @@ fn render_item(ix: usize, item: &Item, rc: &RenderCtx) -> AnyElement {
             // The toggle is a developer tool (desktop `SessionTurn`).
             let front = crate::util::split_front_matter(text)
                 .and_then(|(front, _)| rc.developer.then_some(front));
+            let hover_fg = p.text;
             let fm_key = front_matter_key(&item.key);
             let fm_open = front.is_some() && rc.expanded.contains(&fm_key);
-            // The same text find searches (`find::views_of`).
-            let text = find::user_body(text).to_string();
+            // The same text find searches (`find::views_of`): for a command,
+            // the arguments; `/name` is drawn apart.
+            let text = match command {
+                Some(command) => command.arguments.clone(),
+                None => find::user_body(text).to_string(),
+            };
+            let expansion_key = expansion_key(&item.key);
+            let expansion_open = command.is_some() && rc.expanded.contains(&expansion_key);
+            let has_body = command.is_some() || !text.is_empty();
             v_flex()
                 .group(group.clone())
                 .w_full()
@@ -3280,59 +3320,87 @@ fn render_item(ix: usize, item: &Item, rc: &RenderCtx) -> AnyElement {
                 // Metadata reads before the message it describes. One column
                 // holds both and stretches them to the wider one, so the
                 // panel and the bubble share their width.
-                .when(
-                    !text.is_empty() || attachments.is_empty() || fm_open,
-                    |el| {
-                        el.child(
-                            v_flex()
-                                .max_w(relative(0.86))
-                                .min_w_0()
-                                .items_stretch()
-                                .gap_1p5()
-                                .when_some(front.clone().filter(|_| fm_open), |el, front| {
-                                    el.child(render_front_matter(&item.key, &front, rc))
-                                })
-                                .when(!text.is_empty() || attachments.is_empty(), |el| {
-                                    el.child(
-                                        // Right-aligned and tinted with the
-                                        // accent; the HUD's is a full pill.
-                                        prose(
-                                            div()
-                                                .min_w_0()
-                                                .px_3p5()
-                                                .py(px(if rc.density.is_compact() {
-                                                    6.
-                                                } else {
-                                                    8.
-                                                }))
-                                                .rounded(px(if rc.density.is_compact() {
-                                                    18.
-                                                } else {
-                                                    14.
-                                                }))
-                                                .bg(p.accent_dim),
-                                            rc.density,
-                                        )
-                                        .when(*local, |el| el.opacity(0.7))
-                                        .when(text.is_empty(), |el| {
-                                            el.text_color(p.dim).child("No message body")
-                                        })
-                                        // Markdown like the desktop app's user messages.
-                                        .when(
-                                            !text.is_empty(),
-                                            |el| {
-                                                el.min_w_0().child(rc.md.markdown(
-                                                    find::user_view_id(&item.key),
-                                                    text.clone(),
-                                                    p,
-                                                ))
-                                            },
-                                        ),
+                .when(has_body || attachments.is_empty() || fm_open, |el| {
+                    el.child(
+                        v_flex()
+                            .max_w(relative(0.86))
+                            .min_w_0()
+                            .items_stretch()
+                            .gap_1p5()
+                            .when_some(front.clone().filter(|_| fm_open), |el, front| {
+                                el.child(render_front_matter(&item.key, &front, rc))
+                            })
+                            .when(has_body || attachments.is_empty(), |el| {
+                                el.child(
+                                    // Right-aligned and tinted with the
+                                    // accent; the HUD's is a full pill.
+                                    prose(
+                                        div()
+                                            .min_w_0()
+                                            .px_3p5()
+                                            .py(px(if rc.density.is_compact() { 6. } else { 8. }))
+                                            .rounded(px(if rc.density.is_compact() {
+                                                18.
+                                            } else {
+                                                14.
+                                            }))
+                                            .bg(p.accent_dim),
+                                        rc.density,
                                     )
-                                }),
-                        )
-                    },
-                )
+                                    .when(*local, |el| el.opacity(0.7))
+                                    .when(!has_body, |el| {
+                                        el.text_color(p.dim).child("No message body")
+                                    })
+                                    // A prompt command: `/name` in the
+                                    // mono face, then what followed it.
+                                    .when_some(command.as_ref(), |el, command| {
+                                        el.child(
+                                            h_flex()
+                                                .min_w_0()
+                                                .items_start()
+                                                .gap_x_1p5()
+                                                .child(
+                                                    div()
+                                                        .debug_selector(|| {
+                                                            "user-command-name".into()
+                                                        })
+                                                        .flex_none()
+                                                        .font_family(kit::MONO)
+                                                        .child(format!("/{}", command.name)),
+                                                )
+                                                .when(!text.is_empty(), |el| {
+                                                    el.child(div().min_w_0().flex_1().child(
+                                                        rc.md.markdown(
+                                                            find::user_view_id(&item.key),
+                                                            text.clone(),
+                                                            p,
+                                                        ),
+                                                    ))
+                                                }),
+                                        )
+                                    })
+                                    // Markdown like the desktop app's user messages.
+                                    .when(
+                                        command.is_none() && !text.is_empty(),
+                                        |el| {
+                                            el.min_w_0().child(rc.md.markdown(
+                                                find::user_view_id(&item.key),
+                                                text.clone(),
+                                                p,
+                                            ))
+                                        },
+                                    ),
+                                )
+                            })
+                            // What the model received, on demand.
+                            .when_some(
+                                command.as_ref().filter(|_| expansion_open),
+                                |el, command| {
+                                    el.child(render_expansion(&item.key, &command.expansion, rc))
+                                },
+                            ),
+                    )
+                })
                 .child(
                     h_flex()
                         .h(px(26.))
@@ -3340,7 +3408,30 @@ fn render_item(ix: usize, item: &Item, rc: &RenderCtx) -> AnyElement {
                         .gap_0p5()
                         .invisible()
                         .group_hover(group, |s| s.visible())
-                        .when(copied || fm_open, |el| el.visible())
+                        .when(copied || fm_open || expansion_open, |el| el.visible())
+                        .when(command.is_some(), |el| {
+                            let (weak, key) = (rc.weak.clone(), expansion_key.clone());
+                            el.child(
+                                h_flex()
+                                    .id(SharedString::from(format!("uexp-{}", item.key)))
+                                    .debug_selector(|| "user-command-toggle".into())
+                                    .gap_0p5()
+                                    .px_1()
+                                    .rounded(px(4.))
+                                    .cursor_pointer()
+                                    .text_xs()
+                                    .text_color(p.dim)
+                                    .hover(move |s| s.text_color(hover_fg))
+                                    .child(if expansion_open {
+                                        "Hide prompt"
+                                    } else {
+                                        "Show prompt"
+                                    })
+                                    .on_click(move |_, _, cx| {
+                                        toggle_expanded(&weak, key.clone(), cx)
+                                    }),
+                            )
+                        })
                         .when(front.is_some(), |el| {
                             let (weak, fm_key) = (rc.weak.clone(), fm_key.clone());
                             let label = if fm_open {
@@ -3372,6 +3463,7 @@ fn render_item(ix: usize, item: &Item, rc: &RenderCtx) -> AnyElement {
                                 if copied { "Copied" } else { "Copy prompt" },
                             )
                             .xsmall()
+                            .debug_selector(|| "user-copy".into())
                             .on_click(move |_, _, cx| {
                                 cx.write_to_clipboard(ClipboardItem::new_string(text2.clone()));
                                 let key = key.clone();
@@ -3613,7 +3705,14 @@ fn render_compaction(item: &Item, c: &Compaction, rc: &RenderCtx) -> AnyElement 
         ),
     };
     let has_summary = !c.summary.trim().is_empty();
-    let open = has_summary && rc.expanded.contains(&item.key);
+    // The instructions of a manual `/compact`, shown in full in the details.
+    let instructions = c
+        .requested
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let has_details = has_summary || instructions.is_some();
+    let open = has_details && rc.expanded.contains(&item.key);
     let rule = || div().flex_1().h(px(1.)).bg(p.border);
     let (hover_fg, weak, key) = (p.text, rc.weak.clone(), item.key.clone());
     let header = h_flex()
@@ -3644,7 +3743,30 @@ fn render_compaction(item: &Item, c: &Compaction, rc: &RenderCtx) -> AnyElement 
                         })
                         .child(d)
                 }))
-                .when(has_summary, |el| {
+                // A manual compaction names its command; the instructions
+                // follow on one truncated line.
+                .when(c.requested.is_some(), |el| {
+                    el.child(
+                        div()
+                            .id(SharedString::from(format!("creq-{}", item.key)))
+                            .debug_selector(|| "compaction-command".into())
+                            .flex_none()
+                            .font_family(kit::MONO)
+                            .text_color(p.muted)
+                            .child("/compact"),
+                    )
+                    .when_some(instructions, |el, text| {
+                        el.child(
+                            div()
+                                .debug_selector(|| "compaction-request".into())
+                                .min_w_0()
+                                .truncate()
+                                .text_color(p.dim)
+                                .child(text.replace('\n', " ")),
+                        )
+                    })
+                })
+                .when(has_details, |el| {
                     el.child(
                         h_flex()
                             .id(SharedString::from(format!("ctoggle-{}", item.key)))
@@ -3654,7 +3776,12 @@ fn render_compaction(item: &Item, c: &Compaction, rc: &RenderCtx) -> AnyElement 
                             .cursor_pointer()
                             .text_color(p.dim)
                             .hover(move |s| s.text_color(hover_fg))
-                            .child(if open { "Hide summary" } else { "Show summary" })
+                            .child(match (open, has_summary) {
+                                (true, true) => "Hide summary",
+                                (false, true) => "Show summary",
+                                (true, false) => "Hide details",
+                                (false, false) => "Show details",
+                            })
                             .child(kit::icon(
                                 if open {
                                     IconName::ChevronUp
@@ -3692,7 +3819,26 @@ fn render_compaction(item: &Item, c: &Compaction, rc: &RenderCtx) -> AnyElement 
             .py_3()
             .rounded(px(10.))
             .bg(p.card)
-            .child(body)
+            .when_some(instructions, |el, text| {
+                el.child(
+                    v_flex()
+                        .id(SharedString::from(format!("cinstr-{}", item.key)))
+                        .debug_selector(|| "compaction-instructions".into())
+                        .gap_0p5()
+                        .when(has_summary, |el| {
+                            el.pb_2().mb_2().border_b_1().border_color(p.border)
+                        })
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_semibold()
+                                .text_color(p.dim)
+                                .child("Instructions"),
+                        )
+                        .child(div().text_sm().text_color(p.muted).child(text.to_owned())),
+                )
+            })
+            .when(has_summary, |el| el.child(body))
     });
     v_flex()
         .w_full()
@@ -3709,9 +3855,6 @@ fn activity(view: &SessionView) -> (String, Option<String>) {
         return (COMPACTING_LABEL.into(), None);
     }
     match view.items.last().map(|i| &i.kind) {
-        Some(ItemKind::User {
-            text, local: true, ..
-        }) if is_compact_command(text) => (COMPACTING_LABEL.into(), None),
         Some(ItemKind::Work(entries)) => match entries.last() {
             Some(WorkEntry::Tool(call)) if call.running() => {
                 let more = entries
@@ -3955,12 +4098,19 @@ impl SessionPane {
         self.set_option(&option.id, &value, cx);
     }
 
-    /// The shown session can take a prompt now: its agent is connected, it
-    /// has loaded without error, and a running turn can be steered or queued.
-    /// Typed prompts and palette commands share this check.
-    pub(crate) fn session_ready(&self, cx: &App) -> bool {
+    /// Whether the shown session can take `command` (or, with `None`, an
+    /// ordinary prompt) now, and if not, why (slash-command-actions D3): its
+    /// agent is connected, it has loaded without error, and a running turn
+    /// can be steered or queued (a command must also accept queueing).
+    /// Typed prompts and palette commands share this check; the first
+    /// failing check wins.
+    pub(crate) fn readiness(
+        &self,
+        command: Option<&SlashCommandView>,
+        cx: &App,
+    ) -> Result<(), Blocked> {
         let Some(session) = self.session.as_ref() else {
-            return false;
+            return Err(Blocked::NotConnected);
         };
         let open = session.read(cx);
         let view = &open.view;
@@ -3971,19 +4121,42 @@ impl SessionPane {
             .read(cx)
             .runtime(&view.agent_id)
             .is_some_and(|rt| rt.is_connected());
+        if !connected {
+            return Err(Blocked::NotConnected);
+        }
         // A read-only session (archived, handed off) takes no prompts.
-        connected
-            && view.access.is_none()
-            && !view.loading
-            && view.error.is_none()
-            && (!view.running() || open.can_control_run())
+        if view.access.is_some() {
+            return Err(Blocked::ReadOnly);
+        }
+        if view.loading {
+            return Err(Blocked::Loading);
+        }
+        if view.error.is_some() {
+            return Err(Blocked::LoadFailed);
+        }
+        if view.running() {
+            let queues = command.is_none_or(|c| CommandTraits::of(c).accepts_queue);
+            if !open.can_control_run() || !queues {
+                return Err(Blocked::TurnRunning);
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn send_session_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.prompt.read(cx).value().trim().to_string();
-        if (text.is_empty() && self.attachments.is_empty()) || !self.session_ready(cx) {
+        if text.is_empty() && self.attachments.is_empty() {
             return;
         }
+        let command = recognise(&text, self.slash_commands(cx)).cloned();
+        if let Err(blocked) = self.readiness(command.as_ref(), cx) {
+            // A blocked command keeps its text and says why under the
+            // composer; an ordinary prompt stays silent, as before.
+            self.blocked = command.map(|_| blocked);
+            cx.notify();
+            return;
+        }
+        self.blocked = None;
         let Some(session) = self.session.clone() else {
             return;
         };
@@ -7515,5 +7688,249 @@ mod find_tests {
         assert_eq!(built, expected);
         let user = expected.iter().find(|(id, _)| id == "umd-user-u1").unwrap();
         assert_eq!(user.1, "check the **token**", "front matter is split off");
+    }
+}
+
+/// Slash commands in the transcript (slash-command-transcript).
+#[cfg(test)]
+mod command_tests {
+    use gpui_kit::AppContext as _;
+    use gpui_kit::test::TestWindowExt as _;
+    use serde_json::json;
+
+    use super::super::find;
+    use super::super::session_pane::{SessionPane, open_pane_for_test};
+    use crate::session::SessionView;
+
+    const TEMPLATE: &str = "The user invoked the slash command `/explain` with: closures";
+
+    fn record(name: &str, arguments: &str, source: &str, effect: &str) -> serde_json::Value {
+        json!({ "querymt": { "slashCommand": {
+            "name": name, "arguments": arguments, "source": source, "effect": effect } } })
+    }
+
+    fn explain() -> SessionView {
+        let mut view = SessionView::new("test-agent", "s", "/w", "cmd");
+        view.apply(
+            &json!({ "sessionUpdate": "user_message_chunk", "messageId": "u1",
+            "content": { "type": "text", "text": TEMPLATE },
+            "_meta": record("explain", "closures", "project", "prompt") }),
+        );
+        view
+    }
+
+    fn compacting(meta: Option<serde_json::Value>) -> SessionView {
+        let mut view = SessionView::new("test-agent", "s", "/w", "cmd");
+        let mut update = json!({ "sessionUpdate": "compaction_update", "compactionId": "c1",
+            "status": "in_progress" });
+        if let Some(meta) = meta {
+            update["_meta"] = meta;
+        }
+        view.apply(&update);
+        view.apply(
+            &json!({ "sessionUpdate": "compaction_summary_chunk", "compactionId": "c1",
+            "content": { "type": "text", "text": "the summary" } }),
+        );
+        view.apply(
+            &json!({ "sessionUpdate": "compaction_update", "compactionId": "c1",
+            "status": "completed" }),
+        );
+        view
+    }
+
+    fn open(
+        cx: &mut gpui_kit::TestAppContext,
+        view: SessionView,
+    ) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<SessionPane>) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::apply(crate::theme::Appearance::builtin(true), cx);
+        });
+        let (handle, pane) =
+            open_pane_for_test(cx, crate::store::automations::schedule_ui_fixture(), view);
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        (handle, pane)
+    }
+
+    fn expand(
+        cx: &mut gpui_kit::TestAppContext,
+        handle: gpui_kit::AnyWindowHandle,
+        pane: &gpui_kit::Entity<SessionPane>,
+        key: String,
+    ) {
+        cx.update_window(handle, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                pane.expanded.insert(key);
+                cx.notify();
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+    }
+
+    fn key_of(pane: &gpui_kit::Entity<SessionPane>, cx: &mut gpui_kit::TestAppContext) -> String {
+        cx.update(|cx| {
+            pane.read(cx).view(cx).expect("a session").items[0]
+                .key
+                .clone()
+        })
+    }
+
+    #[gpui_kit::test]
+    fn prompt_command_bubble_shows_the_typed_text(cx: &mut gpui_kit::TestAppContext) {
+        let (handle, pane) = open(cx, explain());
+        let mut vcx = gpui_kit::VisualTestContext::from_window(handle, cx);
+        assert!(
+            vcx.debug_bounds("user-command-name").is_some(),
+            "`/explain` is drawn apart"
+        );
+        assert!(
+            vcx.debug_bounds("user-command-expansion").is_none(),
+            "the expansion is hidden by default"
+        );
+        drop(vcx);
+        // The bubble's Markdown is what was typed after the name, never the
+        // template the model received.
+        let built = cx.update(|cx| pane.read(cx).transcript.md.built());
+        assert_eq!(
+            built,
+            vec![("umd-user-u1".to_owned(), "closures".to_owned())]
+        );
+        let indexed: Vec<_> = cx.update(|cx| {
+            pane.read(cx)
+                .view(cx)
+                .unwrap()
+                .items
+                .iter()
+                .flat_map(find::views_of)
+                .collect()
+        });
+        assert_eq!(indexed, built);
+        let text = cx.update(|cx| match &pane.read(cx).view(cx).unwrap().items[0].kind {
+            crate::session::ItemKind::User { text, .. } => text.clone(),
+            _ => panic!("a user row"),
+        });
+        assert_eq!(text, "/explain closures");
+    }
+
+    #[gpui_kit::test]
+    fn expanded_prompt_on_demand(cx: &mut gpui_kit::TestAppContext) {
+        let (handle, pane) = open(cx, explain());
+        let key = key_of(&pane, cx);
+        expand(cx, handle, &pane, super::expansion_key(&key));
+        let mut vcx = gpui_kit::VisualTestContext::from_window(handle, cx);
+        assert!(
+            vcx.debug_bounds("user-command-expansion").is_some(),
+            "the expanded prompt shows under the bubble"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn a_message_without_a_record_has_no_command_form(cx: &mut gpui_kit::TestAppContext) {
+        let mut view = SessionView::new("test-agent", "s", "/w", "cmd");
+        view.apply(
+            &json!({ "sessionUpdate": "user_message_chunk", "messageId": "u1",
+            "content": { "type": "text", "text": "/tmp is full, why?" } }),
+        );
+        let (handle, pane) = open(cx, view);
+        let key = key_of(&pane, cx);
+        expand(cx, handle, &pane, super::expansion_key(&key));
+        let mut vcx = gpui_kit::VisualTestContext::from_window(handle, cx);
+        assert!(vcx.debug_bounds("user-command-name").is_none());
+        assert!(vcx.debug_bounds("user-command-expansion").is_none());
+        drop(vcx);
+        let built = cx.update(|cx| pane.read(cx).transcript.md.built());
+        assert_eq!(
+            built,
+            vec![("umd-user-u1".to_owned(), "/tmp is full, why?".to_owned())]
+        );
+    }
+
+    #[gpui_kit::test]
+    fn copy_copies_the_typed_text(cx: &mut gpui_kit::TestAppContext) {
+        let (handle, _pane) = open(cx, explain());
+        let mut vcx = gpui_kit::VisualTestContext::from_window(handle, cx);
+        // The actions show while the pointer is over the message.
+        let name = vcx.debug_bounds("user-command-name").expect("the bubble");
+        vcx.simulate_mouse_move(name.center(), None, gpui_kit::Modifiers::none());
+        vcx.update(|window, cx| window.render_frame(cx));
+        let copy = vcx
+            .debug_bounds("user-copy")
+            .expect("the copy button shows on hover");
+        vcx.simulate_click(copy.center(), gpui_kit::Modifiers::none());
+        let copied = vcx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(copied.as_deref(), Some("/explain closures"));
+    }
+
+    #[gpui_kit::test]
+    fn manual_compaction_names_the_command_and_shows_instructions(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let meta = record("compact", "keep the API decisions", "builtin", "action");
+        let (handle, pane) = open(cx, compacting(Some(meta)));
+        let mut vcx = gpui_kit::VisualTestContext::from_window(handle, cx);
+        assert!(vcx.debug_bounds("compaction-command").is_some());
+        assert!(vcx.debug_bounds("compaction-request").is_some());
+        assert!(vcx.debug_bounds("compaction-instructions").is_none());
+        drop(vcx);
+        let (key, requested) = cx.update(|cx| {
+            let row = &pane.read(cx).view(cx).unwrap().items[0];
+            match &row.kind {
+                crate::session::ItemKind::Compaction(c) => (row.key.clone(), c.requested.clone()),
+                _ => panic!("a compaction row"),
+            }
+        });
+        assert_eq!(requested.as_deref(), Some("keep the API decisions"));
+        // The full instructions are in the details.
+        expand(cx, handle, &pane, key);
+        let mut vcx = gpui_kit::VisualTestContext::from_window(handle, cx);
+        assert!(vcx.debug_bounds("compaction-instructions").is_some());
+    }
+
+    #[gpui_kit::test]
+    fn manual_compaction_without_instructions_names_only_the_command(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let meta = record("compact", "", "builtin", "action");
+        let (handle, _pane) = open(cx, compacting(Some(meta)));
+        let mut vcx = gpui_kit::VisualTestContext::from_window(handle, cx);
+        assert!(vcx.debug_bounds("compaction-command").is_some());
+        assert!(vcx.debug_bounds("compaction-request").is_none());
+    }
+
+    #[gpui_kit::test]
+    fn automatic_compaction_row_is_unchanged(cx: &mut gpui_kit::TestAppContext) {
+        let (handle, pane) = open(cx, compacting(None));
+        let key = key_of(&pane, cx);
+        expand(cx, handle, &pane, key);
+        let mut vcx = gpui_kit::VisualTestContext::from_window(handle, cx);
+        assert!(vcx.debug_bounds("compaction-command").is_none());
+        assert!(vcx.debug_bounds("compaction-request").is_none());
+        assert!(vcx.debug_bounds("compaction-instructions").is_none());
+    }
+
+    #[test]
+    fn an_active_compaction_still_reads_compacting_context() {
+        let mut view = SessionView::new("test-agent", "s", "/w", "cmd");
+        view.apply(
+            &json!({ "sessionUpdate": "user_message_chunk", "messageId": "u1",
+            "content": { "type": "text", "text": "hi" } }),
+        );
+        view.apply(
+            &json!({ "sessionUpdate": "compaction_update", "compactionId": "c1",
+            "status": "in_progress" }),
+        );
+        assert_eq!(super::activity(&view).0, crate::session::COMPACTING_LABEL);
+    }
+
+    #[test]
+    fn a_local_compact_prompt_reads_sending_until_the_compaction_starts() {
+        let mut view = SessionView::new("test-agent", "s", "/w", "cmd");
+        view.prompt_optimistic(
+            "c1",
+            &[json!({ "type": "text", "text": "/compact keep X" })],
+        );
+        assert_eq!(super::activity(&view).0, "Sending prompt…");
     }
 }

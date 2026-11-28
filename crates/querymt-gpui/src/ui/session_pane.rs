@@ -106,8 +106,36 @@ pub(crate) struct SessionPane {
     /// stays closed until the text changes.
     pub(super) slash_dismissed: Option<String>,
     pub(super) slash_scroll: ScrollHandle,
+    /// Why the command the user last sent from the composer was not sent;
+    /// shown in the hint row until the text changes.
+    pub(super) blocked: Option<Blocked>,
     _session: Option<Subscription>,
     _subs: Vec<Subscription>,
+}
+
+/// Why the open session cannot take a prompt or command now
+/// (slash-command-actions D3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Blocked {
+    NotConnected,
+    /// A read-only session lists no commands, so this is never shown for one.
+    ReadOnly,
+    Loading,
+    LoadFailed,
+    TurnRunning,
+}
+
+impl Blocked {
+    /// The copy shown to the user.
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Blocked::NotConnected => "Agent not connected",
+            Blocked::ReadOnly => "Session is read-only",
+            Blocked::Loading => "Session is loading",
+            Blocked::LoadFailed => "Session could not be loaded",
+            Blocked::TurnRunning => "Available when the turn ends",
+        }
+    }
 }
 
 impl EventEmitter<SessionPaneEvent> for SessionPane {}
@@ -148,6 +176,7 @@ impl SessionPane {
                     // dismissal (Esc) ends with the first edit.
                     this.slash_cursor = 0;
                     this.slash_dismissed = None;
+                    this.blocked = None;
                     cx.notify();
                 }
             }),
@@ -188,6 +217,7 @@ impl SessionPane {
             slash_cursor: 0,
             slash_dismissed: None,
             slash_scroll: ScrollHandle::new(),
+            blocked: None,
             _session: None,
             _subs: subs,
         }

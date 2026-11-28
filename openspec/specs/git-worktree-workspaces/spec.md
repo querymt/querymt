@@ -220,8 +220,9 @@ Native `/worktree` output SHALL reach clients only through the prompt response a
 - **THEN** each connection receives the output as an agent message update before the prompt response, on stdio and WebSocket alike
 
 #### Scenario: Output is not replayed
-- **WHEN** a session that ran a native command is loaded later
-- **THEN** the command's output update is not replayed, except for the durable ownership-transferred update of a handoff
+- **WHEN** a session that ran a native `list`, `status`, or `result` command, or a command rejected as a usage error, is loaded later
+- **THEN** that command's output update is not replayed
+- **AND** replies to mutating commands are replayed as durable replies, and the durable ownership-transferred and archived updates are replayed
 
 #### Scenario: No bridge route registered
 - **WHEN** a native command runs and no client bridge route exists for the session
@@ -245,11 +246,12 @@ Result publication and inspection SHALL support top-level workspaces as well as 
 - **THEN** the error and recoverable workspace are reported without claiming a complete result or successful integration
 
 ### Requirement: Conservative lifecycle and recovery
-Managed workspaces SHALL use durable storage, survive session completion/cancellation, and support reconciliation after interrupted provisioning or removal. Removal SHALL reject active ownership, uncommitted files (including untracked and ignored files), or committed results lacking a retained recovery reference or integration proof. The system SHALL NOT delete externally owned worktrees or unknown pre-existing directories. Retained references SHALL be disclosed.
+Managed workspaces SHALL use durable storage, survive session completion/cancellation, and support reconciliation after interrupted provisioning or removal. Removal SHALL reject active ownership, uncommitted, untracked, or ignored files not preserved by a published result, or committed results lacking a retained recovery reference or integration proof. The system SHALL NOT delete externally owned worktrees or unknown pre-existing directories. Retained references SHALL be disclosed.
 
 #### Scenario: Dirty or active workspace removal
-- **WHEN** removal targets an active workspace or one containing uncommitted, untracked, or ignored files
+- **WHEN** removal targets an active workspace, or one containing ignored files or uncommitted or untracked files whose working state no retained published result matches
 - **THEN** removal is refused and the blocking state is reported without deleting files
+- **AND** the `unpreserved_content` message names committing, publishing (`/worktree publish`), or deleting the listed files as the way forward
 
 #### Scenario: History-preserving explicit archival
 - **WHEN** a user explicitly archives a workspace whose owner is idle
@@ -332,10 +334,16 @@ Removal SHALL accept an explicit archive option (native `--archive`) that archiv
 #### Scenario: One-step cleanup
 - **WHEN** `/worktree remove --archive` targets a clean workspace with an idle owner
 - **THEN** the workspace is archived and removed, and retained refs are reported
+- **AND** the owner's archived update states that the workspace was archived and removed
 
 #### Scenario: Archive succeeds, removal refused
-- **WHEN** `/worktree remove --archive` targets a workspace with untracked or ignored files
+- **WHEN** `/worktree remove --archive` targets a workspace with untracked or ignored files that no published result preserves
 - **THEN** the workspace is archived, removal is refused with `unpreserved_content` listing the blocking paths, and no files are deleted
+- **AND** the owner's archived update states that removal was refused, with the code and reason, and does not instruct the user to run `/worktree remove` as if it had not been attempted
+
+#### Scenario: Archived update replayed with the removal outcome
+- **WHEN** the owner session of a workspace archived by `/worktree remove --archive` is loaded later
+- **THEN** the replayed archived update is recorded after the removal attempt and carries the same removal outcome it had live
 
 ### Requirement: Visible native command failures
 A refused or failed native `/worktree` command, including a usage error, SHALL complete the prompt successfully with `_meta["querymt.worktree"].error = { code, message }` and SHALL emit its message as a session update before the response. Refusal messages SHALL name the next action. ACP extension methods SHALL keep returning errors with `data.code` and `data.message`.
@@ -411,7 +419,7 @@ Configuration MAY set a default baseline mode for top-level isolated creation. I
 - **THEN** the session starts from that commit and reports that local changes are excluded
 
 ### Requirement: One operation core for all management surfaces
-Creation, handoff, listing, status, result, publication, archival, removal, and recovery SHALL share one typed implementation across ACP extensions, native `/worktree`, the simple API, and Python. Failures SHALL carry stable machine-readable error codes on every surface alongside human-readable diagnostics.
+Creation, handoff, listing, status, result, publication, merge, archival, removal, and recovery SHALL share one typed implementation across ACP extensions, native `/worktree`, the simple API, and Python. Failures SHALL carry stable machine-readable error codes on every surface alongside human-readable diagnostics.
 
 #### Scenario: Equivalent results across surfaces
 - **WHEN** the same create or result operation is performed through native `/worktree` and through Python
@@ -425,8 +433,13 @@ Creation, handoff, listing, status, result, publication, archival, removal, and 
 - **WHEN** an isolated request fails because of an unsupported repository layout or a missing workspace
 - **THEN** ACP error data and the Python exception expose the corresponding stable code
 
+#### Scenario: Equivalent merge across surfaces
+- **WHEN** a merge is performed through native `/worktree merge`, `querymt/worktree/merge`, the simple API, and Python
+- **THEN** each reports the same outcome (`merged`, `already_merged` or `no_changes`), commit, branch, changed paths and follow-up result
+- **AND** a refused merge exposes the same code and paths on every surface
+
 ### Requirement: Workspace capability discoverability
-Agents with a workspace service SHALL advertise workspace support, the default baseline, and the `sourceSession`, `handoff`, and `handoffSummary` features through additive capability metadata. Isolated session creation and managed session load SHALL disclose the resolved execution cwd, workspace identity, branch, baseline mode, and excluded content.
+Agents with a workspace service SHALL advertise workspace support, the default baseline, and the `sourceSession`, `handoff`, `handoffSummary`, and `merge` features through additive capability metadata. Isolated session creation and managed session load SHALL disclose the resolved execution cwd, workspace identity, branch, baseline mode, and excluded content.
 
 #### Scenario: Client offers an explicit choice
 - **WHEN** a client initializes against an agent with the service enabled
@@ -440,6 +453,10 @@ Agents with a workspace service SHALL advertise workspace support, the default b
 - **WHEN** a client initializes against an agent whose workspace service supports handoff with summaries
 - **THEN** the workspace capability metadata includes `sourceSession`, `handoff`, and `handoffSummary` set to true
 
+#### Scenario: Merge capability advertised
+- **WHEN** a client initializes against an agent with the workspace service enabled
+- **THEN** the workspace capability metadata includes `merge` set to true
+
 ### Requirement: Requested isolation fails closed
 When a usable repository/base, supported repository layout, durable storage, or local filesystem execution is unavailable, requested isolation SHALL fail with an actionable error before agent execution. The system SHALL NOT downgrade to shared execution. Concurrent administration SHALL prevent duplicate allocation and ownership across processes.
 
@@ -451,3 +468,177 @@ When a usable repository/base, supported repository layout, durable storage, or 
 #### Scenario: Concurrent allocation
 - **WHEN** two processes request workspace allocation for one repository concurrently
 - **THEN** each successful request receives unique resources and durable ownership without corrupting Git administration data
+
+### Requirement: Published working state satisfies removal content safety
+Removal SHALL treat uncommitted and untracked files as preserved when the checkout's full working state (tracked changes, deletions and non-ignored untracked files) is exactly the content of one of the workspace's retained published results, re-checked under the removal's exclusive lease immediately before deletion. It SHALL then remove the checkout and report that result reference as preserving the working state. Ignored files SHALL still block removal.
+
+#### Scenario: Remove after publishing uncommitted work
+- **WHEN** a workspace with uncommitted and untracked edits is published and then removed without further edits
+- **THEN** removal succeeds, the checkout is deleted, and the response reports the published result reference as `preserved_by` and lists it among the retained references
+- **AND** the published result still presents the removed edits through result inspection
+
+#### Scenario: Edited after publishing
+- **WHEN** files change after the last publication and removal is requested
+- **THEN** removal is refused with `unpreserved_content` listing the blocking paths, the message states that the working state differs from the most recent published result and names that result, and nothing is deleted
+
+#### Scenario: Ignored files with a matching publication
+- **WHEN** the checkout's non-ignored working state matches a published result but ignored files are present
+- **THEN** removal is refused with `unpreserved_content` listing the ignored paths, and nothing is deleted
+
+#### Scenario: Recovery of an interrupted removal of published work
+- **WHEN** removal of a published dirty checkout is interrupted after Removing intent was persisted and recovery is run
+- **THEN** recovery re-checks the working state against the published results and completes removal only if it still matches
+
+### Requirement: Read-only sessions accept cancel
+`session/cancel` on a session that is read-only because its workspace was archived or its ownership was transferred SHALL succeed without effect, on local and mesh-enabled agents alike.
+
+#### Scenario: Cancel an archived owner
+- **WHEN** a client sends `session/cancel` for the owner session of an archived workspace
+- **THEN** the notification succeeds without an error and nothing changes
+
+#### Scenario: Cancel a previous owner
+- **WHEN** a client sends `session/cancel` for a session whose workspace was handed off
+- **THEN** the notification succeeds without an error and nothing changes
+
+### Requirement: Durable replies to mutating native commands
+The reply to a native `/worktree` `publish`, `archive`, `remove`, `recover`, or `handoff` command, successful or refused, SHALL be recorded durably on the issuing session's stream with a stable message identity, the command, and its outcome code, and SHALL be replayed on load with the same identity. When the outcome is already recorded as a durable announcement on the issuing session's stream, that announcement SHALL be the reply.
+
+#### Scenario: Mutating command reply is replayed
+- **WHEN** a session that ran a native `publish`, `archive`, `remove`, `recover`, or `handoff` command, successful or refused, is loaded later
+- **THEN** the command's reply is replayed as an agent message with the same message identity it had live, and `_meta.querymt.worktreeCommand` carries the command name, the outcome `code` (absent on success), and `archived: true` when a refused removal followed a successful archive
+
+#### Scenario: Refused removal reply survives reload
+- **WHEN** `/worktree remove` is refused with `unpreserved_content` and the session is reloaded
+- **THEN** the refusal message, including the blocking paths and the way forward, is part of the replayed conversation
+
+#### Scenario: Announcement replaces the reply
+- **WHEN** a mutating command's outcome is already recorded as a durable announcement on the issuing session's stream (a handoff or archive of the issuing session's own workspace)
+- **THEN** that announcement is the reply and no second reply update is recorded
+
+### Requirement: Merge a worktree into its source checkout
+A worktree SHALL be mergeable into its source checkout, as one commit on that checkout's current branch containing exactly the baseline-relative delta of the merged version. The source checkout is the effective checkout of the session the worktree was created from, else the worktree's recorded source cwd. Merge SHALL be available as native `/worktree merge [id] [--commit <rev>] [--archive|--remove]` and on every management surface.
+
+#### Scenario: Merge commits only the worktree's own changes
+- **WHEN** a worktree created from a checkout with uncommitted files A changes only file B, and `/worktree merge` runs in the worktree session
+- **THEN** one commit changing only B is created on the source checkout's current branch with the configured identity
+- **AND** A stays uncommitted and untouched in the source checkout
+- **AND** the reply names the commit, the branch and the changed paths
+
+#### Scenario: Merge layers onto a moved source branch
+- **WHEN** the source branch gained unrelated commits after the worktree was created
+- **THEN** the merge commit is created on top of the moved branch and keeps those commits' changes
+
+#### Scenario: Merge from the source session by id
+- **WHEN** the source session runs `/worktree merge <workspace-id>`
+- **THEN** that workspace is merged into the source checkout exactly as when run from the worktree session
+
+#### Scenario: Merge is a single squashed commit
+- **WHEN** the worktree branch holds several commits and uncommitted edits
+- **THEN** the source branch gains exactly one new commit whose only parent is the previous source HEAD
+- **AND** its message names the worktree and carries `QueryMT-Workspace`, `QueryMT-Result` and `QueryMT-Baseline` trailers
+
+#### Scenario: Merge source checkout no longer exists
+- **WHEN** neither the source session's checkout nor the recorded source cwd resolves to a checkout of the worktree's repository
+- **THEN** merge is refused with `source_missing` and nothing changes
+
+### Requirement: Merge version selection
+By default merge SHALL first publish the worktree's current working state as a retained result and merge exactly that result. With `--commit <rev>` it SHALL take no snapshot and merge the named version: a retained result of the workspace (full id or at least 7 hex digits), or a commit on the worktree branch after its baseline, which is then retained like a published result.
+
+#### Scenario: Default merge snapshots the working state
+- **WHEN** a worktree has a new commit, staged and unstaged edits, a non-ignored untracked file and an ignored file, and `/worktree merge` runs
+- **THEN** a new retained result is published and its baseline-relative delta, including the untracked file and excluding the ignored file, is merged
+- **AND** the reply reports the published result and the excluded ignored files
+- **AND** the worktree's branch, index and files are unchanged
+
+#### Scenario: Merge a previously published result
+- **WHEN** `/worktree merge --commit <result>` names an earlier retained result and the worktree has changed since
+- **THEN** exactly that result's delta is merged and no new result is published
+
+#### Scenario: Merge a commit on the worktree branch
+- **WHEN** `--commit <rev>` names a commit on the worktree branch after its baseline
+- **THEN** that commit is retained as a result and its baseline-relative delta is merged
+
+#### Scenario: Merge refuses an unrelated commit
+- **WHEN** `--commit <rev>` names no retained result and no commit between the baseline and the worktree branch head, or matches several retained results
+- **THEN** merge is refused with `commit_not_on_workspace_branch` or `ambiguous_result_commit` and nothing changes
+
+#### Scenario: Snapshot while the owner is busy
+- **WHEN** a default merge targets a worktree whose owner has a running turn, queued input or steering
+- **THEN** merge is refused with `owner_active` and no result is published
+
+### Requirement: Merge protects local work and runs commit hooks
+Merge SHALL apply the same safety rules as explicit delegate result acceptance: it SHALL refuse paths with local state, report overlapping edits as a conflict, run the repository's pre-commit, prepare-commit-msg and commit-msg hooks natively without bypass, and advance the branch only by compare-and-swap. Every refusal or failure SHALL leave the source checkout, its index and its branch unchanged.
+
+#### Scenario: Merge refuses touched paths with local edits
+- **WHEN** a path the merge would write has staged, unstaged, untracked or ignored local state in the source checkout
+- **THEN** merge is refused with `touches_local_changes` naming the paths and nothing changes
+
+#### Scenario: Merge refuses inherited uncommitted edits
+- **WHEN** a delta path also differed between the source HEAD and the worktree's baseline at creation (it was uncommitted in the source then)
+- **THEN** merge is refused with `baseline_local_edits` naming the paths and nothing changes
+
+#### Scenario: Merge reports overlapping edits as a conflict
+- **WHEN** the source branch and the merged version edited the same lines since the baseline
+- **THEN** merge is refused with `merge_conflict` naming the paths and nothing changes
+
+#### Scenario: Merge rejected by a commit hook
+- **WHEN** a pre-commit or commit-msg hook exits non-zero
+- **THEN** merge is refused with `commit_rejected` and the hook output, the touched paths are restored and the branch is unchanged
+
+#### Scenario: Merge refused while the source session is busy
+- **WHEN** the source session has a running turn, queued input or steering
+- **THEN** merge is refused with `source_active` and nothing changes
+
+#### Scenario: Merge refused for unsupported source state
+- **WHEN** the source checkout has a detached or unborn HEAD, an operation in progress, sparse checkout, `commit.gpgSign` enabled or no user identity
+- **THEN** merge is refused with the same stable code as result acceptance and no commit is created
+
+#### Scenario: Merge refused for an unmergeable workspace
+- **WHEN** the workspace is provisioning, failed, missing, removing or removed, or is archived and no `--commit` is given
+- **THEN** merge is refused with the workspace's lifecycle code and nothing changes
+
+### Requirement: Repeated and interrupted merges
+A merged version SHALL be recorded so that merging it again reports the original commit instead of creating a second one. An interrupted merge SHALL be recovered before the next merge or acceptance on the same checkout.
+
+#### Scenario: Merging the same version again
+- **WHEN** the same retained result is merged a second time
+- **THEN** the reply reports `already_merged` with the original commit and no commit is created
+- **AND** when the recorded commit is no longer on the source branch, merge is refused with `integration_record_unreachable`
+
+#### Scenario: Source already contains the changes
+- **WHEN** the source branch already contains the whole delta
+- **THEN** the reply reports `no_changes` and no commit is created
+
+#### Scenario: Merge interrupted by a crash
+- **WHEN** the process stops after writing files or after moving the branch but before completing
+- **THEN** the next merge or acceptance on that checkout first restores the touched paths or completes the index update, according to where the branch points
+
+### Requirement: Merge follow-up archive or removal
+With `--archive` or `--remove`, merge SHALL archive, or archive and remove, the workspace under the existing rules once the source contains the merged version (merged, already merged, or no changes). A follow-up failure SHALL be reported alongside the successful merge outcome and SHALL NOT undo it. The two options SHALL NOT be combined.
+
+#### Scenario: Merge then remove
+- **WHEN** `/worktree merge --remove` merges a worktree whose working state is fully captured by the merged result and whose owner is idle
+- **THEN** the merge commit is created, the workspace is archived and removed, and the reply reports both outcomes and the retained refs
+
+#### Scenario: Merge succeeds but removal is refused
+- **WHEN** `/worktree merge --commit <older-result> --remove` merges while the worktree holds later unpublished edits
+- **THEN** the merge commit is created, the workspace is archived, removal is refused with `unpreserved_content`, and the reply reports the merge and the refusal
+
+#### Scenario: Follow-up skipped after a refused merge
+- **WHEN** `--archive` or `--remove` is given and the merge is refused or conflicts
+- **THEN** the workspace is neither archived nor removed
+
+#### Scenario: Archive and remove together are rejected
+- **WHEN** `/worktree merge --archive --remove` is issued
+- **THEN** it is rejected with `invalid_options` before anything runs
+
+### Requirement: Durable merge reply
+The reply to a native `/worktree merge`, successful or refused, SHALL be recorded in the issuing session's history and replayed on load. When the merge archives the issuing session's own workspace, the archived update SHALL be that reply's durable record and SHALL state the merge outcome.
+
+#### Scenario: Merge reply survives reload
+- **WHEN** a session that ran `/worktree merge` is loaded later
+- **THEN** the merge reply, including a refusal code and paths, is replayed in order
+
+#### Scenario: Self-archiving merge reply
+- **WHEN** `/worktree merge --archive` runs in the worktree session and succeeds
+- **THEN** the session becomes read-only and its replayed archived update names the merge commit

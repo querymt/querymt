@@ -380,3 +380,115 @@ fn malformed_command_entries_are_skipped() {
     ]))]);
     assert_eq!(command_names(&core), ["compact"]);
 }
+
+#[test]
+fn descriptor_is_read_from_the_catalog() {
+    use querymt_agent_protocol_types::events::{SlashCommandEffect, SlashCommandSource};
+    use querymt_agent_session_core::view::{CommandInput, CommandSubmission};
+    let mut core = SessionCore::new("s1");
+    core.apply(&[commands_update(json!([{
+        "name": "compact",
+        "description": "Compact",
+        "_meta": { "querymt": {
+            "source": "builtin",
+            "effect": "action",
+            "input": "optional",
+            "accepts": ["prompt", "queue"]
+        } }
+    }]))]);
+    let command = &core.header().available_commands[0];
+    assert_eq!(command.source, Some(SlashCommandSource::Builtin));
+    assert_eq!(command.effect, Some(SlashCommandEffect::Action));
+    assert_eq!(command.input, Some(CommandInput::Optional));
+    assert_eq!(
+        command.accepts,
+        Some(vec![CommandSubmission::Prompt, CommandSubmission::Queue])
+    );
+}
+
+#[test]
+fn catalog_without_descriptors() {
+    let mut core = SessionCore::new("s1");
+    core.apply(&[commands_update(json!([
+        { "name": "compact", "description": "Compact", "input": { "hint": "[x]" } },
+        { "name": "worktree", "description": "Worktree" }
+    ]))]);
+    for command in &core.header().available_commands {
+        assert_eq!(command.source, None, "{}", command.name);
+        assert_eq!(command.effect, None, "{}", command.name);
+        assert_eq!(command.input, None, "{}", command.name);
+        // Absent, not an empty list: a client picks its fallback from `None`.
+        assert_eq!(command.accepts, None, "{}", command.name);
+    }
+    let commands = &core.header().available_commands;
+    assert_eq!(commands[0].description, "Compact");
+    assert_eq!(commands[0].input_hint.as_deref(), Some("[x]"));
+}
+
+#[test]
+fn unknown_descriptor_value_is_absent() {
+    use querymt_agent_protocol_types::events::SlashCommandSource;
+    use querymt_agent_session_core::view::CommandSubmission;
+    let mut core = SessionCore::new("s1");
+    core.apply(&[commands_update(json!([{
+        "name": "explain",
+        "description": "Explain",
+        "_meta": { "querymt": {
+            "source": "project",
+            "effect": "workflow",
+            "accepts": ["prompt", "broadcast"]
+        } }
+    }]))]);
+    let command = &core.header().available_commands[0];
+    assert_eq!(command.source, Some(SlashCommandSource::Project));
+    assert_eq!(command.effect, None);
+    assert_eq!(command.input, None);
+    // An unknown element is dropped; the list stays a list.
+    assert_eq!(command.accepts, Some(vec![CommandSubmission::Prompt]));
+    assert_eq!(command_names(&core), ["explain"]);
+}
+
+#[test]
+fn user_message_exposes_its_record() {
+    use querymt_agent_protocol_types::events::{
+        SlashCommandEffect, SlashCommandRecord, SlashCommandSource,
+    };
+    let mut core = SessionCore::new("s1");
+    core.apply(&[
+        live(json!({
+            "sessionUpdate": "user_message_chunk",
+            "messageId": "u1",
+            "content": { "type": "text", "text": "The user invoked the slash command `/explain`." },
+            "_meta": { "querymt": { "slashCommand": {
+                "name": "explain",
+                "arguments": "closures",
+                "source": "project",
+                "effect": "prompt",
+                "clientPromptId": "c1"
+            } } }
+        })),
+        // A later chunk of the same message that repeats no record.
+        live(json!({
+            "sessionUpdate": "user_message_chunk",
+            "messageId": "u1",
+            "content": { "type": "text", "text": "attachment" }
+        })),
+    ]);
+    let ids = core.turn_ids();
+    let turn = core.turn(ids.last().expect("a turn")).expect("turn exists");
+    let EntryKind::UserMessage(message) = &turn.entries[0].kind else {
+        panic!("expected a user message, got {:?}", turn.entries[0].kind);
+    };
+    assert_eq!(
+        message.slash_command,
+        Some(SlashCommandRecord {
+            name: "explain".into(),
+            arguments: "closures".into(),
+            source: SlashCommandSource::Project,
+            effect: SlashCommandEffect::Prompt,
+            client_prompt_id: Some("c1".into()),
+        })
+    );
+    // The chunk's content stays the message's blocks.
+    assert_eq!(message.blocks.len(), 2);
+}

@@ -37,6 +37,7 @@ pub use querymt_agent_core::session_control;
 pub mod session_materializer;
 pub mod session_mcp;
 pub mod session_registry;
+pub mod slash_reload;
 pub mod snapshots;
 pub mod tools;
 pub mod turn_control;

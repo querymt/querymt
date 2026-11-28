@@ -10,10 +10,11 @@ use gpui_kit::component::input::{Enter, IndentInline, MoveDown, MoveUp, Position
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use querymt_agent_session_core::view::SlashCommandView;
+use querymt_agent_session_core::view::{CommandInput, SlashCommandView};
 
 use super::kit;
 use super::session_pane::SessionPane;
+use crate::session::commands::recognise;
 use crate::theme::Palette;
 
 /// Rows visible at once; more scroll.
@@ -48,6 +49,23 @@ fn complete(text: &str, name: &str) -> (String, u32) {
     }
     out.push_str(rest);
     (out, column)
+}
+
+/// Whether `text` starts with a command being typed: `/` and a name-like
+/// first word. A first word with another `/` is a path (`/tmp/x`), and is
+/// part of the message, not a command name to replace.
+fn starts_with_command_word(text: &str) -> bool {
+    let first = text.split(char::is_whitespace).next().unwrap_or("");
+    first
+        .strip_prefix('/')
+        .is_some_and(|word| !word.contains('/'))
+}
+
+/// The cursor position after the last character of `text`.
+fn end_position(text: &str) -> Position {
+    let line = text.matches('\n').count() as u32;
+    let last = text.rsplit('\n').next().unwrap_or("");
+    Position::new(line, last.chars().count() as u32)
 }
 
 /// The command whose hint is shown: the text is exactly `/name ` and that
@@ -110,6 +128,15 @@ impl SessionPane {
     pub(super) fn slash_hint(&self, cx: &App) -> Option<(String, String)> {
         let text = self.prompt.read(cx).value();
         let commands = self.slash_commands(cx);
+        // A command that was not sent says why, in place of its hint.
+        if let Some(blocked) = self.blocked
+            && let Some(c) = recognise(&text, commands)
+        {
+            return Some((
+                c.name.trim_start_matches('/').to_string(),
+                blocked.reason().into(),
+            ));
+        }
         hinted(&text, commands).map(|c| (c.name.clone(), c.input_hint.clone().unwrap_or_default()))
     }
 
@@ -160,32 +187,70 @@ impl SessionPane {
         cx.notify();
     }
 
-    /// Picking a slash command in the palette. Without an input it is sent
-    /// as a prompt (`/name`), under the same rules as a typed one: nothing is
-    /// sent while the session is not ready, and while a turn runs
-    /// `send_prompt` queues it. With an input the composer gets `/name `, the
-    /// cursor at the end and the focus, so the arguments can be typed.
+    /// Put `/name ` in the composer with the focus, keeping the draft as
+    /// the command's arguments (design D7): an empty composer becomes
+    /// `/name `, a draft whose first word is `/word` (a command being typed,
+    /// not a path such as `/tmp/x`) has that word replaced, any other draft
+    /// becomes `/name <draft>`. The cursor ends up after the
+    /// name for a replaced word and at the end of the text otherwise.
+    pub(crate) fn prefill_slash(
+        &mut self,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = name.trim_start_matches('/');
+        let draft = self.prompt.read(cx).value().to_string();
+        let (text, cursor) = if draft.trim().is_empty() {
+            let text = format!("/{name} ");
+            let end = end_position(&text);
+            (text, end)
+        } else if starts_with_command_word(&draft) {
+            let (text, column) = complete(&draft, name);
+            (text, Position::new(0, column))
+        } else {
+            let text = format!("/{name} {draft}");
+            let end = end_position(&text);
+            (text, end)
+        };
+        self.prompt.update(cx, |state, cx| {
+            state.set_value(text, window, cx);
+            // Moves the caret and focuses the composer.
+            state.set_cursor_position(cursor, window, cx);
+        });
+        self.slash_cursor = 0;
+        self.slash_dismissed = None;
+        cx.notify();
+    }
+
+    /// Picking a slash command in the palette. With input `None` or
+    /// `Optional` it is sent as a prompt (`/name`), under the same rules as a
+    /// typed one: nothing is sent while the session cannot take it, and while
+    /// a turn runs `send_prompt` queues it. With `Required` input the
+    /// composer gets `/name ` and the focus, so the arguments can be typed.
     pub(crate) fn run_slash_command(
         &mut self,
         name: &str,
-        takes_input: bool,
+        input: CommandInput,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // Names are bare (the core trims the slash); a prefix would send `//`.
         let name = name.trim_start_matches('/');
-        if takes_input {
-            let text = format!("/{name} ");
-            let end = Position::new(0, text.chars().count() as u32);
-            self.prompt.update(cx, |state, cx| {
-                state.set_value(text, window, cx);
-                // Moves the caret and focuses the composer.
-                state.set_cursor_position(end, window, cx);
-            });
-            cx.notify();
+        if input == CommandInput::Required {
+            self.prefill_slash(name, window, cx);
             return;
         }
-        if let Some(session) = self.session.clone().filter(|_| self.session_ready(cx)) {
+        let command = self
+            .slash_commands(cx)
+            .iter()
+            .find(|c| c.name.trim_start_matches('/') == name)
+            .cloned();
+        if let Some(session) = self
+            .session
+            .clone()
+            .filter(|_| self.readiness(command.as_ref(), cx).is_ok())
+        {
             let delivery = self.delivery;
             self.store.update(cx, |s, cx| {
                 s.send_prompt(&session, format!("/{name}"), Vec::new(), delivery, cx)
@@ -341,7 +406,7 @@ impl SessionPane {
 
 #[cfg(test)]
 mod pure_tests {
-    use super::{complete, hinted, slash_query};
+    use super::{complete, hinted, slash_query, starts_with_command_word};
     use querymt_agent_session_core::view::SlashCommandView;
 
     fn command(name: &str, hint: Option<&str>) -> SlashCommandView {
@@ -349,6 +414,10 @@ mod pure_tests {
             name: name.into(),
             description: String::new(),
             input_hint: hint.map(Into::into),
+            source: None,
+            effect: None,
+            input: None,
+            accepts: None,
         }
     }
 
@@ -372,6 +441,18 @@ mod pure_tests {
         // A cursor inside a multi-byte character is not a position.
         assert_eq!(slash_query("/é", 2), None);
         assert_eq!(slash_query("/é", 3), Some("é"));
+    }
+
+    #[test]
+    fn a_path_is_not_a_command_word() {
+        assert!(starts_with_command_word("/"));
+        assert!(starts_with_command_word("/expl"));
+        assert!(starts_with_command_word("/compact keep the plan"));
+        assert!(starts_with_command_word("/compact\nmore"));
+        assert!(!starts_with_command_word("/tmp/build.log is empty"));
+        assert!(!starts_with_command_word("/tmp/"));
+        assert!(!starts_with_command_word("closures in Rust"));
+        assert!(!starts_with_command_word(" /compact"));
     }
 
     #[test]
@@ -419,6 +500,7 @@ mod ui_tests {
     use gpui_kit::{
         AnyWindowHandle, AppContext as _, Entity, Modifiers, TestAppContext, VisualTestContext,
     };
+    use querymt_agent_session_core::view::CommandInput;
     use serde_json::{Value, json};
 
     struct Rig {
@@ -514,6 +596,16 @@ mod ui_tests {
         })
     }
 
+    fn clear_composer(cx: &mut TestAppContext, rig: &Rig) {
+        let select_all = if cfg!(target_os = "macos") {
+            "cmd-a backspace"
+        } else {
+            "ctrl-a backspace"
+        };
+        keys(cx, rig, select_all);
+        assert!(text(cx, rig).is_empty(), "the composer was not cleared");
+    }
+
     /// Names in the list as it renders now (empty when it is not shown).
     fn listed(cx: &mut TestAppContext, rig: &Rig) -> Vec<String> {
         cx.update_window(rig.handle, |_, window, cx| {
@@ -555,6 +647,103 @@ mod ui_tests {
         })
     }
 
+    /// `compact` accepts queueing, `worktree` only the prompt submission.
+    fn prompt_only_commands() -> Value {
+        json!([
+            { "name": "compact", "description": "Summarize the conversation",
+              "input": { "hint": "[optional instructions]" },
+              "_meta": { "querymt": { "source": "builtin", "effect": "action",
+                  "input": "optional", "accepts": ["prompt", "queue"] } } },
+            { "name": "worktree", "description": "Work in a git worktree",
+              "input": { "hint": "[subcommand]" },
+              "_meta": { "querymt": { "source": "builtin", "effect": "action",
+                  "input": "required", "accepts": ["prompt"] } } },
+        ])
+    }
+
+    /// A rig whose agent lets the app steer and queue into a running turn.
+    fn controlled_rig(cx: &mut TestAppContext, commands: Value, running: bool) -> Rig {
+        rig(cx, session(commands, running), true)
+    }
+
+    fn hint_of(cx: &mut TestAppContext, rig: &Rig) -> Option<(String, String)> {
+        rig.app
+            .read_with(cx, |app, cx| app.pane.read(cx).slash_hint(cx))
+    }
+
+    #[gpui_kit::test]
+    fn path_is_steered_into_the_running_turn(cx: &mut TestAppContext) {
+        let rig = controlled_rig(cx, two_commands(), true);
+        type_text(cx, &rig, "/tmp/build.log is empty");
+        keys(cx, &rig, "enter");
+        cx.run_until_parked();
+        let requests = sent(&rig);
+        let sent_methods = methods(&requests);
+        // Steering first asks for the active run; a queue goes out at once.
+        assert!(
+            sent_methods.contains(&"_querymt/session/runtimeState"),
+            "{requests:?}"
+        );
+        assert!(
+            !sent_methods.contains(&"_querymt/session/queue"),
+            "{requests:?}"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn typed_command_is_queued_not_steered(cx: &mut TestAppContext) {
+        let rig = controlled_rig(cx, two_commands(), true);
+        type_text(cx, &rig, "/compact keep the plan");
+        keys(cx, &rig, "enter");
+        cx.run_until_parked();
+        let requests = sent(&rig);
+        let sent_methods = methods(&requests);
+        assert!(
+            sent_methods.contains(&"_querymt/session/queue"),
+            "{requests:?}"
+        );
+        assert!(
+            !sent_methods.contains(&"_querymt/session/runtimeState")
+                && !sent_methods.contains(&"_querymt/session/steer"),
+            "{requests:?}"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn typed_prompt_only_command_during_a_turn(cx: &mut TestAppContext) {
+        let rig = controlled_rig(cx, prompt_only_commands(), true);
+        type_text(cx, &rig, "/worktree list");
+        keys(cx, &rig, "enter");
+        cx.run_until_parked();
+        assert!(sent(&rig).is_empty(), "nothing is sent");
+        assert_eq!(text(cx, &rig), "/worktree list", "the text is kept");
+        assert_eq!(
+            hint_of(cx, &rig),
+            Some(("worktree".into(), "Available when the turn ends".into()))
+        );
+        // Rendered under the composer.
+        let mut vcx = VisualTestContext::from_window(rig.handle, cx);
+        assert!(vcx.debug_bounds("slash-hint").is_some());
+        // Editing the text drops the reason.
+        type_text(cx, &rig, "x");
+        assert_eq!(hint_of(cx, &rig), None);
+    }
+
+    #[gpui_kit::test]
+    fn typed_prompt_only_command_when_idle(cx: &mut TestAppContext) {
+        let rig = controlled_rig(cx, prompt_only_commands(), false);
+        type_text(cx, &rig, "/worktree list");
+        keys(cx, &rig, "enter");
+        cx.run_until_parked();
+        let requests = sent(&rig);
+        assert!(
+            requests.iter().any(|r| r["method"] == "session/prompt"
+                && r["params"]["prompt"][0]["text"] == "/worktree list"),
+            "{requests:?}"
+        );
+        assert_eq!(hint_of(cx, &rig), None);
+    }
+
     #[gpui_kit::test]
     fn slash_shows_all_commands(cx: &mut TestAppContext) {
         let rig = rig(cx, session(two_commands(), false), false);
@@ -594,7 +783,7 @@ mod ui_tests {
         type_text(cx, &rig, "see a/b");
         assert!(listed(cx, &rig).is_empty());
         // Also a command word after other text, and past the first word.
-        keys(cx, &rig, "cmd-a backspace");
+        clear_composer(cx, &rig);
         type_text(cx, &rig, "/compact focus /w");
         assert!(listed(cx, &rig).is_empty());
     }
@@ -676,8 +865,9 @@ mod ui_tests {
             "the highlighted command completes"
         );
         // A new query starts at the best match again.
-        keys(cx, &rig, "cmd-a backspace");
+        clear_composer(cx, &rig);
         type_text(cx, &rig, "/");
+        assert!(!listed(cx, &rig).is_empty(), "the list reopened");
         assert_eq!(
             rig.app.read_with(cx, |a, cx| a.pane.read(cx).slash_cursor),
             0
@@ -828,11 +1018,11 @@ mod ui_tests {
         // The same after the palette puts `/compact ` in the composer.
         type_text(cx, &rig, "focus");
         assert!(!hint_shown(cx), "arguments typed: the hint is gone");
-        keys(cx, &rig, "cmd-a backspace");
+        clear_composer(cx, &rig);
         assert!(!hint_shown(cx), "no command, no hint");
         cx.update_window(rig.handle, |_, window, cx| {
             rig.app.update(cx, |app, cx| {
-                app.run_slash_command("compact", true, window, cx)
+                app.run_slash_command("compact", CommandInput::Required, window, cx)
             });
             window.render_frame(cx);
         })
@@ -840,7 +1030,7 @@ mod ui_tests {
         assert_eq!(text(cx, &rig), "/compact ");
         assert!(hint_shown(cx), "the palette path shows it too");
         // A command without a hint shows none.
-        keys(cx, &rig, "cmd-a backspace");
+        clear_composer(cx, &rig);
         type_text(cx, &rig, "/worktree ");
         assert!(!hint_shown(cx));
     }

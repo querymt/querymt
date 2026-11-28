@@ -399,6 +399,7 @@ pub fn generate(spec: TraceSpec) -> Trace {
             &mut events,
             &mut seq,
             AgentEventKind::PromptReceived {
+                slash_command: None,
                 content: prompt,
                 message_id: Some(format!("u{turn}")),
             },
@@ -424,6 +425,7 @@ pub fn generate(spec: TraceSpec) -> Trace {
                 &mut events,
                 &mut seq,
                 AgentEventKind::UserPromptBlock {
+                    slash_command: None,
                     message_id: steer_id.clone(),
                     client_prompt_id: None,
                     block: ContentBlock::Text(TextContent::new(steer_text.clone())),
@@ -433,6 +435,7 @@ pub fn generate(spec: TraceSpec) -> Trace {
                 &mut events,
                 &mut seq,
                 AgentEventKind::PromptReceived {
+                    slash_command: None,
                     content: steer_text,
                     message_id: Some(steer_id),
                 },
@@ -551,6 +554,7 @@ pub fn generate(spec: TraceSpec) -> Trace {
                 &mut events,
                 &mut seq,
                 AgentEventKind::CompactionStart {
+                    slash_command: None,
                     // With a model call just before, the compaction's
                     // `tokensBefore` is that request's context; the estimate
                     // is the fallback of a session with no measurement.

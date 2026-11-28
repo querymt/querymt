@@ -24,6 +24,51 @@ pub struct SlashCommand {
     /// Whether this command requires a script to function.
     /// If true and scripts are disabled, the command is hidden from ACP.
     pub requires_script: bool,
+    /// Declared input need (`arguments` frontmatter key); `None` when the file
+    /// does not declare one. Read it through [`SlashCommand::input_need`].
+    pub arguments: Option<ArgumentsNeed>,
+}
+
+impl SlashCommand {
+    /// What the command asks of the user's input. Without a declaration it is
+    /// `required` when the file has an `argument-hint` or the template contains
+    /// `$ARGUMENTS` (clients prefill such commands), and `none` otherwise.
+    ///
+    /// Advice for clients only: an invocation without arguments is still
+    /// expanded.
+    pub fn input_need(&self) -> ArgumentsNeed {
+        self.arguments.unwrap_or_else(|| {
+            if self.argument_hint.is_some() || self.template.contains("$ARGUMENTS") {
+                ArgumentsNeed::Required
+            } else {
+                ArgumentsNeed::None
+            }
+        })
+    }
+}
+
+/// How much input a command needs, as declared by `arguments:` in its
+/// frontmatter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ArgumentsNeed {
+    /// The command takes no input.
+    None,
+    /// The command works with or without input.
+    Optional,
+    /// The command is meant to be sent with input.
+    Required,
+}
+
+impl ArgumentsNeed {
+    /// The wire value of the catalog descriptor's `input` field.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ArgumentsNeed::None => "none",
+            ArgumentsNeed::Optional => "optional",
+            ArgumentsNeed::Required => "required",
+        }
+    }
 }
 
 /// Where a command was discovered.
@@ -44,6 +89,16 @@ impl SlashCommandSource {
             SlashCommandSource::Global(_) => 1,
             SlashCommandSource::Project(_) => 2,
             SlashCommandSource::Configured(_) => 3,
+        }
+    }
+
+    /// The source as the wire (catalog descriptor and invocation record) names it.
+    pub fn wire(&self) -> querymt_agent_core::events::SlashCommandSource {
+        use querymt_agent_core::events::SlashCommandSource as Wire;
+        match self {
+            SlashCommandSource::Global(_) => Wire::Global,
+            SlashCommandSource::Project(_) => Wire::Project,
+            SlashCommandSource::Configured(_) => Wire::Configured,
         }
     }
 }
@@ -163,6 +218,11 @@ pub struct CommandFrontmatter {
     /// When `true` and scripts are disabled, the command is hidden.
     #[serde(default, rename = "requires-script")]
     pub requires_script: bool,
+
+    /// Optional: `none`, `optional` or `required`. Any other value makes the
+    /// file a discovery diagnostic.
+    #[serde(default)]
+    pub arguments: Option<ArgumentsNeed>,
 
     /// Extension fields.
     #[serde(flatten)]

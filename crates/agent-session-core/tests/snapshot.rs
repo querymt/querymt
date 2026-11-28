@@ -599,3 +599,51 @@ fn load_without_snapshot_keeps_commands() {
     assert_eq!(core.header().available_commands.len(), 1);
     assert_eq!(core.header().current_mode.as_deref(), Some("build"));
 }
+
+#[test]
+fn loaded_prompt_command_exposes_its_record() {
+    use querymt_agent_protocol_types::events::{
+        SlashCommandEffect, SlashCommandRecord, SlashCommandSource,
+    };
+    let mut command = prompt(1, "u1", "The user invoked the slash command `/explain`.");
+    command["kind"]["data"]["slash_command"] = serde_json::json!({
+        "name": "explain",
+        "arguments": "closures",
+        "source": "project",
+        "effect": "prompt",
+        "client_prompt_id": "c1"
+    });
+    let prompts = serde_json::json!([{
+        "messageId": "u1",
+        "messageOrder": 0,
+        "timestamp": 1001,
+        "blocks": [
+            { "type": "text", "text": "expansion text" },
+            { "type": "resource_link", "name": "diagram.png", "uri": "file:///tmp/diagram.png" }
+        ]
+    }]);
+    let mut core = SessionCore::new("s1");
+    let report = core.apply(&[loaded(load_response(
+        vec![command, reply(2, "a1", "r1")],
+        serde_json::json!({ "userPrompts": prompts }),
+    ))]);
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+    let ids = core.turn_ids();
+    let turn = core.turn(&ids[0]).expect("turn exists");
+    let EntryKind::UserMessage(message) = &turn.entries[0].kind else {
+        panic!("expected a user message, got {:?}", turn.entries[0].kind);
+    };
+    // The prompt record's blocks, with the record of the event.
+    assert_eq!(message.blocks.len(), 2);
+    assert_eq!(
+        message.slash_command,
+        Some(SlashCommandRecord {
+            name: "explain".into(),
+            arguments: "closures".into(),
+            source: SlashCommandSource::Project,
+            effect: SlashCommandEffect::Prompt,
+            client_prompt_id: Some("c1".into()),
+        })
+    );
+}

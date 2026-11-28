@@ -257,9 +257,25 @@ pub struct SessionRuntime {
     /// Set for Git sessions when the workspace service is configured.
     pub mutation_gate: Arc<OnceCell<Arc<crate::worktree::gate::CheckoutMutationGate>>>,
     /// Session-scoped slash-command registry resolved from the session's
-    /// bound workspace checkout at materialization. Unset for legacy local
-    /// sessions, which keep the agent-level registry.
-    pub slash_registry: OnceCell<Arc<crate::slash_commands::SlashCommandRegistry>>,
+    /// project root (the managed checkout, else the Git root of its cwd,
+    /// else the cwd itself) at materialization. Unset only when the session
+    /// has no cwd or command discovery is off or unconfigured; such a
+    /// session keeps the agent-level registry.
+    /// Replaceable: a changed command file swaps it (see
+    /// `slash_reload`); a turn loads it once, so it never sees a half-updated
+    /// set.
+    pub slash_registry: arc_swap::ArcSwapOption<crate::slash_commands::SlashCommandRegistry>,
+    /// The project root `slash_registry` was resolved from; set together
+    /// with it, and what a reload rebuilds and watches.
+    pub slash_project_root: OnceCell<std::path::PathBuf>,
+    /// The task watching `slash_project_root` for command file changes; it
+    /// ends with this runtime.
+    pub(crate) slash_watch: ParkingMutex<Option<crate::agent::slash_reload::AbortOnDrop>>,
+    /// The command list the session's clients last heard of (the `commands`
+    /// of `SlashCommandsChanged`, or the catalog at materialization); `Null`
+    /// until recorded. A reload announces only a different list. Never held
+    /// across `.await`.
+    pub(crate) announced_slash_commands: ParkingMutex<serde_json::Value>,
     /// Managed checkout context is independent of cooperative locking.
     pub managed_checkout: OnceCell<bool>,
     pub(crate) workspace_activity: OnceCell<crate::worktree::gate::CheckoutActivityLease>,
@@ -274,15 +290,14 @@ pub struct SessionRuntime {
 impl SessionRuntime {
     /// The user slash commands this session expands prompts with, and
     /// therefore the only ones it may advertise: the registry resolved from
-    /// its bound checkout, else the agent-level `startup` registry.
-    pub fn effective_slash_registry<'a>(
-        &'a self,
-        startup: &'a crate::slash_commands::SlashCommandRegistry,
-    ) -> &'a crate::slash_commands::SlashCommandRegistry {
+    /// project root, else the agent-level `startup` registry.
+    pub fn effective_slash_registry(
+        &self,
+        startup: &arc_swap::ArcSwap<crate::slash_commands::SlashCommandRegistry>,
+    ) -> Arc<crate::slash_commands::SlashCommandRegistry> {
         self.slash_registry
-            .get()
-            .map(Arc::as_ref)
-            .unwrap_or(startup)
+            .load_full()
+            .unwrap_or_else(|| startup.load_full())
     }
 
     /// The session's accounting projection, hydrated once per runtime.
@@ -325,7 +340,10 @@ impl SessionRuntime {
             last_snapshot_tree: ParkingMutex::new(None),
             execution_permit: Arc::new(tokio::sync::Semaphore::new(1)),
             mutation_gate: Arc::new(OnceCell::new()),
-            slash_registry: OnceCell::new(),
+            slash_registry: arc_swap::ArcSwapOption::empty(),
+            slash_project_root: OnceCell::new(),
+            slash_watch: ParkingMutex::new(None),
+            announced_slash_commands: ParkingMutex::new(serde_json::Value::Null),
             managed_checkout: OnceCell::new(),
             workspace_activity: OnceCell::new(),
             accounting: OnceCell::new(),

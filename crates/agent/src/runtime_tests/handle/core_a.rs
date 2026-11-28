@@ -1871,6 +1871,7 @@ fn advertised_command_names(
 
 fn test_slash_command(name: &str, description: &str) -> crate::slash_commands::SlashCommand {
     crate::slash_commands::SlashCommand {
+        arguments: None,
         name: name.to_string(),
         source: crate::slash_commands::SlashCommandSource::Global(std::path::PathBuf::from("/tmp")),
         path: std::path::PathBuf::from(format!("/tmp/{name}.md")),
@@ -1983,6 +1984,84 @@ async fn catalog_without_workspace_service_lists_compact_but_not_worktree() {
         advertised_command_names(&catalog),
         vec!["deploy".to_string(), "compact".to_string()]
     );
+}
+
+/// The `_meta.querymt` descriptor of the catalog entry `name`.
+fn catalog_descriptor(
+    notification: &crate::acp::protocol::SessionNotification,
+    name: &str,
+) -> serde_json::Value {
+    let value = serde_json::to_value(notification).expect("serialize catalog");
+    let entry = value["update"]["availableCommands"]
+        .as_array()
+        .expect("availableCommands")
+        .iter()
+        .find(|command| command["name"] == name)
+        .unwrap_or_else(|| panic!("catalog has no `{name}`: {value}"))
+        .clone();
+    entry["_meta"]["querymt"].clone()
+}
+
+#[tokio::test]
+async fn user_defined_command_descriptor() {
+    let mut registry = crate::slash_commands::SlashCommandRegistry::new();
+    let mut explain = test_slash_command("explain", "Explain");
+    explain.source =
+        crate::slash_commands::SlashCommandSource::Project(std::path::PathBuf::from("/proj"));
+    explain.template = "Explain $ARGUMENTS".into();
+    registry.register(explain);
+    let fixture = crate::test_utils::TestAgent::with_slash_command_registry(registry).await;
+    let catalog = fixture.handle.slash_command_catalog("any-session").await;
+    assert_eq!(
+        catalog_descriptor(&catalog, "explain"),
+        serde_json::json!({
+            "source": "project",
+            "effect": "prompt",
+            "input": "required",
+            "accepts": ["prompt", "queue"],
+        })
+    );
+}
+
+#[tokio::test]
+async fn compact_descriptor() {
+    let fixture = crate::test_utils::TestAgent::new().await;
+    let catalog = fixture.handle.slash_command_catalog("any-session").await;
+    assert_eq!(
+        catalog_descriptor(&catalog, "compact"),
+        serde_json::json!({
+            "source": "builtin",
+            "effect": "action",
+            "input": "optional",
+            "accepts": ["prompt", "queue"],
+        })
+    );
+}
+
+#[tokio::test]
+async fn overriding_command_reports_its_own_source() {
+    let global = tempfile::TempDir::new().expect("global dir");
+    let project = tempfile::TempDir::new().expect("project dir");
+    for dir in [&global, &project] {
+        std::fs::write(
+            dir.path().join("explain.md"),
+            "---\ndescription: Explain\n---\nExplain $ARGUMENTS\n",
+        )
+        .expect("explain command");
+    }
+    let (registry, diagnostics) = crate::slash_commands::SlashCommandRegistry::from_sources(
+        &[
+            crate::slash_commands::SlashCommandSource::Global(global.path().to_path_buf()),
+            crate::slash_commands::SlashCommandSource::Project(project.path().to_path_buf()),
+        ],
+        &Default::default(),
+    );
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    let fixture = crate::test_utils::TestAgent::with_slash_command_registry(registry).await;
+    let catalog = fixture.handle.slash_command_catalog("any-session").await;
+    let names = advertised_command_names(&catalog);
+    assert_eq!(names.iter().filter(|name| *name == "explain").count(), 1);
+    assert_eq!(catalog_descriptor(&catalog, "explain")["source"], "project");
 }
 
 #[tokio::test]

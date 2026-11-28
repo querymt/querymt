@@ -234,7 +234,9 @@ impl AgentConfigBuilder {
             schedule_repository: self.schedule_repository,
             knowledge_store: self.knowledge_store,
             todo_store: Arc::new(crate::tools::builtins::todo::TodoStore::new()),
-            slash_command_registry: self.slash_command_registry,
+            slash_command_registry: Arc::new(arc_swap::ArcSwap::from_pointee(
+                self.slash_command_registry,
+            )),
             slash_commands_config: self.slash_commands_config,
             hooks: self.hooks,
             workspace_service: self.workspace_service,

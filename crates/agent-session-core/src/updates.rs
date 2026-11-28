@@ -6,7 +6,8 @@ use crate::entry::{
     ToolCallEntry, UserMessage,
 };
 use crate::store::TurnHint;
-use crate::view::{PlanView, SlashCommandView};
+use crate::view::{CommandSubmission, PlanView, SlashCommandView};
+use querymt_agent_protocol_types::events::SlashCommandRecord;
 use querymt_agent_protocol_types::protocol::{
     AvailableCommand, AvailableCommandInput, CompactionStatus, CompactionSummaryChunk,
     CompactionUpdate, ContentBlock, ContentChunk, MaybeUndefined, Plan, PlanRemoved, PlanUpdate,
@@ -14,7 +15,7 @@ use querymt_agent_protocol_types::protocol::{
 };
 use querymt_agent_protocol_types::replay::{
     ACCOUNTING_META_KEY, CONTEXT_INVALIDATED_META_KEY, MODEL_META_KEY, QUERYMT_META_NAMESPACE,
-    RUN_ID_META_KEY,
+    RUN_ID_META_KEY, SLASH_COMMAND_META_KEY,
 };
 use querymt_agent_protocol_types::session::history::SummaryProvider;
 use serde::Serialize;
@@ -59,7 +60,9 @@ fn content_values(content: &[ToolCallContent]) -> Vec<serde_json::Value> {
 /// holds them: names without a leading `/`, entries with an empty name
 /// dropped, the first of duplicate names kept. The input hint comes from the
 /// unstructured input; an input kind this core does not know takes input
-/// with an empty hint.
+/// with an empty hint. The descriptor (`_meta.querymt`) is read field by
+/// field: a field the agent did not send, or sent with a value this core does
+/// not know, is absent.
 fn slash_commands(commands: &[AvailableCommand]) -> Vec<SlashCommandView> {
     let mut out: Vec<SlashCommandView> = Vec::with_capacity(commands.len());
     for command in commands {
@@ -72,13 +75,34 @@ fn slash_commands(commands: &[AvailableCommand]) -> Vec<SlashCommandView> {
             Some(_) => Some(String::new()),
             None => None,
         };
+        let descriptor = command
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get(QUERYMT_META_NAMESPACE));
+        let field = |key: &str| descriptor.and_then(|descriptor| descriptor.get(key));
         out.push(SlashCommandView {
             name: name.to_owned(),
             description: command.description.clone(),
             input_hint,
+            source: field("source").and_then(descriptor_value),
+            effect: field("effect").and_then(descriptor_value),
+            input: field("input").and_then(descriptor_value),
+            accepts: field("accepts")
+                .and_then(serde_json::Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(descriptor_value::<CommandSubmission>)
+                        .collect()
+                }),
         });
     }
     out
+}
+
+/// A descriptor value this core knows; `None` for any other.
+fn descriptor_value<T: serde::de::DeserializeOwned>(value: &serde_json::Value) -> Option<T> {
+    serde_json::from_value(value.clone()).ok()
 }
 
 /// The model a `_meta.querymt.model` object names. A live update carries no
@@ -107,6 +131,24 @@ fn querymt_meta<'a>(chunk: &'a ContentChunk, key: &str) -> Option<&'a str> {
         .get(key)?
         .as_str()
         .filter(|value| !value.is_empty())
+}
+
+/// The slash command record under `_meta.querymt.slashCommand`. A record
+/// with a source or effect this core does not know is not exposed.
+fn slash_command_record(
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<SlashCommandRecord> {
+    let record = meta?
+        .get(QUERYMT_META_NAMESPACE)?
+        .get(SLASH_COMMAND_META_KEY)?;
+    let text = |key: &str| record.get(key)?.as_str().map(str::to_owned);
+    Some(SlashCommandRecord {
+        name: text("name")?,
+        arguments: text("arguments")?,
+        source: descriptor_value(record.get("source")?)?,
+        effect: descriptor_value(record.get("effect")?)?,
+        client_prompt_id: text("clientPromptId").filter(|id| !id.is_empty()),
+    })
 }
 
 /// Text of a chunk's content block; non-text blocks carry none.
@@ -331,6 +373,7 @@ impl SessionCore {
         let message_id = chunk.message_id.as_ref().map(|id| id.0.to_string());
         let prompt_id = querymt_meta(chunk, "client_prompt_id").map(str::to_owned);
         let block = chunk.content.clone();
+        let record = slash_command_record(chunk.meta.as_ref());
         // More content of a message already in the view (the structured
         // blocks of one prompt share its message id).
         let existing = message_id
@@ -356,6 +399,9 @@ impl SessionCore {
                 message.blocks.push(block);
                 if new_message_id.is_some() {
                     message.message_id = new_message_id;
+                }
+                if message.slash_command.is_none() {
+                    message.slash_command = record;
                 }
                 true
             });
@@ -385,6 +431,7 @@ impl SessionCore {
                 status: PromptStatus::Sent,
                 error: None,
                 at_ms: None,
+                slash_command: record,
             }),
             hint,
         );
@@ -460,6 +507,7 @@ impl SessionCore {
                 summary: Vec::new(),
                 error: None,
                 meta: None,
+                slash_command: None,
             }),
             TurnHint::Live,
         );
@@ -499,6 +547,13 @@ impl SessionCore {
                 MaybeUndefined::Undefined => {}
                 MaybeUndefined::Null => entry.error = None,
                 MaybeUndefined::Value(text) => entry.error = Some(text.clone()),
+            }
+            // Once set the record stays: a later update that does not repeat
+            // it leaves it.
+            if let MaybeUndefined::Value(meta) = &update.meta
+                && let Some(record) = slash_command_record(Some(meta))
+            {
+                entry.slash_command = Some(record);
             }
             match &update.meta {
                 MaybeUndefined::Undefined => {}

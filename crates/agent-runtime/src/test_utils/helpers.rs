@@ -416,11 +416,32 @@ impl UndoTestFixture {
         Self::with_registry(registry, config_dir, Some(hooks), Vec::new()).await
     }
 
+    /// Like [`Self::with_provider`], with `commands` as the agent's user
+    /// slash commands.
+    pub(crate) async fn with_provider_and_slash_commands(
+        provider: crate::test_utils::SharedLlmProvider,
+        commands: crate::slash_commands::SlashCommandRegistry,
+    ) -> Result<Self> {
+        let (registry, config_dir) =
+            mock_plugin_registry(Arc::new(TestProviderFactory::new(provider)))?;
+        Self::build(registry, config_dir, None, Vec::new(), Some(commands)).await
+    }
+
     async fn with_registry(
         registry: PluginRegistry,
         config_dir: TempDir,
         hooks: Option<crate::hooks::Hooks>,
         middleware: Vec<Arc<dyn crate::middleware::Middleware>>,
+    ) -> Result<Self> {
+        Self::build(registry, config_dir, hooks, middleware, None).await
+    }
+
+    async fn build(
+        registry: PluginRegistry,
+        config_dir: TempDir,
+        hooks: Option<crate::hooks::Hooks>,
+        middleware: Vec<Arc<dyn crate::middleware::Middleware>>,
+        slash_commands: Option<crate::slash_commands::SlashCommandRegistry>,
     ) -> Result<Self> {
         let worktree = TempDir::new()?;
         let snapshot_base = TempDir::new()?;
@@ -442,6 +463,9 @@ impl UndoTestFixture {
         }
         if !middleware.is_empty() {
             builder = builder.with_middlewares(middleware);
+        }
+        if let Some(commands) = slash_commands {
+            builder = builder.with_slash_command_registry(commands);
         }
 
         let config = Arc::new(builder.build());

@@ -59,6 +59,13 @@ GPUI panics on re-entrant entity updates, so:
   `Arc<ToolCall>` pointers (the row cache in `src/ui/session_view.rs` compares them).
   `Item.key` is the core entry id; consecutive reasoning and tool entries group into one
   `ItemKind::Work` keyed by its first entry.
+- Slash-command records (`UserMessage.slash_command`, `CompactionEntry.slash_command`) are
+  the only thing the projection reads to tell a command from a prompt; it never inspects
+  message text. A user row with a record has `text` = `/name arguments` (what was typed) and
+  `command: Some(UserCommand { name, expansion })`, where `expansion` is the prompt the model
+  received (the UI shows it behind "Show prompt"). A compaction with a record has
+  `Compaction.requested = Some(arguments)` (empty for no instructions); automatic compactions
+  have `None`. Without records, rows look as before.
 - The overlay holds client-only state the core leaves out: notices anchored to turn ids,
   load/history errors, modes, access, tool content fetches and steer/queue inputs the agent
   has not confirmed yet.

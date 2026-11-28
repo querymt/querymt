@@ -305,6 +305,10 @@ pub struct GetLlmConfig;
 /// authority. Not serializable: it never crosses the mesh.
 pub struct GetSessionSlashRegistry;
 
+/// Local-only: read the slash command files again (a global command file
+/// changed). Not serializable: it never crosses the mesh.
+pub struct ReloadSlashCommands;
+
 // ══════════════════════════════════════════════════════════════════════════
 //  Undo / Redo
 // ══════════════════════════════════════════════════════════════════════════
@@ -916,6 +920,7 @@ mod tests {
             origin: querymt_agent_core::events::EventOrigin::Local,
             source_node: None,
             kind: querymt_agent_core::events::AgentEventKind::PromptReceived {
+                slash_command: None,
                 content: "hi".into(),
                 message_id: None,
             },

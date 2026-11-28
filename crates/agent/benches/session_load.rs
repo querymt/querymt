@@ -329,6 +329,7 @@ async fn seed_scenario(spec: SyntheticSessionSpec) -> Scenario {
             store.as_ref(),
             &session_id,
             AgentEventKind::PromptReceived {
+                slash_command: None,
                 content: repeated_payload("prompt", index, 420),
                 message_id: Some(format!("prompt-message-{index:06}")),
             },

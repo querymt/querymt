@@ -188,6 +188,9 @@ pub struct LocalAgentHandle {
 
     /// Guard to ensure `shutdown()` only runs its body once.
     shutdown_done: AtomicBool,
+
+    /// Watcher of the global slash command folder; ends with the handle.
+    pub(crate) slash_global_watch: ParkingMutex<Option<crate::agent::slash_reload::AbortOnDrop>>,
 }
 
 /// A running delegation service: the orchestrator and the task that feeds it.

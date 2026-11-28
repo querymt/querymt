@@ -165,8 +165,65 @@
   `--remove` run after the source contains the result, and a failure there never
   undoes the merge. See "Merging a worktree" in the worktrees guide.
 
+- **New crates: `querymt-agent-protocol-types` and `querymt-agent-session-core`.**
+  `querymt-agent-protocol-types` (`crates/agent-protocol-types`) holds the plain
+  wire types clients consume (agent events, the load snapshot payload, accounting
+  and history-window payloads, input-state notifications, the shared replay
+  projection). It has no async runtime and builds for `wasm32-unknown-unknown`;
+  the old `querymt_agent_core`, services and runtime paths re-export it.
+  `querymt-agent-session-core` (`crates/agent-session-core`) is a pure,
+  deterministic reducer from the load snapshot, ACP `session/update`
+  notifications, older-history pages and client observations to a conversation
+  view (turns that are runs, entries with stable ids and revisions) with change
+  reports and borrowed reads; querymt-gpui uses it natively. Both are in hakari
+  `[final-excludes]`. `querymt` builds for `wasm32-unknown-unknown` without
+  default features (`which` is now optional, enabled by `mcp`). A WebAssembly
+  build and release artifact of the reducer was dropped from the plan.
+
+- **ACP: run identity and gap-free loads (QueryMT extensions on v1).** New
+  extension notification `querymt/session/stateUpdate` (`sessionId`, `state`
+  `running` / `requires_action` / `idle`, `runId`, `stopReason`), sent for every
+  run transition in order and not coalesced; message, thought, tool call and
+  compaction updates carry `_meta.querymt.runId`, live and on replay; the
+  `session/prompt` response carries `_meta.querymt.messageId`. On `session/load`
+  the agent holds live updates from before it reads the history, drops those at
+  or before the cut point, sends the text of a message still streaming at the
+  cut as one chunk, and then sends the current run state, so a load no longer
+  loses or repeats events (local and remote-hosted sessions). Every load
+  snapshot carries the whole-session `summary`, and a model change sends a
+  `session_info_update` with `_meta.querymt.contextInvalidated` and the new
+  model. The live `completed` compaction update carries its summary, and replay
+  sends the todo plan once as a `plan_update` for plan-operations clients.
+  Clients that ignore unknown notifications and `_meta` keys see no change.
+
 ### Behavior changes
 
+- **BREAKING (behaviour): a session reads the slash commands of its own
+  folder.** Fixes `/` not offering, and `/explain` not running, the
+  `.qmt/commands/*.md` of the folder a session was opened in (a `qmtcode`
+  started with its embedded config has no startup directory, so no ordinary
+  session saw any project command). A session outside a managed worktree now
+  uses the project commands of its project root, the Git root of its working
+  directory or the folder itself outside Git, for both the advertised catalog
+  and prompt expansion; an idle session re-resolves from its stored folder the
+  same way. It no longer uses the startup directory's project commands: a
+  command that exists only there is not offered in sessions started elsewhere,
+  and `/deploy` runs the session folder's `deploy.md`, not the startup
+  directory's. A session without a working directory, an agent with command
+  discovery off, and managed worktree sessions are unchanged. Folders above
+  the project root are never searched.
+- **BREAKING (ACP behaviour, additive): command files are read without a
+  restart, and `available_commands_update` can arrive mid-session.** Adding,
+  editing or removing a `.md` file in `~/.qmt/commands` or in an open
+  session's `<project root>/.qmt/commands` updates the session's next prompt
+  and sends its clients an `available_commands_update` with the complete
+  command list, built-ins included. New ephemeral event
+  `AgentEventKind::SlashCommandsChanged { commands }` (never journaled, not
+  replayed); `AgentEventKind` is `#[typeshare]`, so generated types change.
+  Configured `slash_commands.paths`, a `.gitignore`d `.qmt/commands` and a
+  `~/.qmt/commands` created after the agent started are read at the next open
+  or start. querymt-desktop follow-up: regenerate the typeshare types and
+  accept `available_commands_update` at any time.
 - **QueryMT Desktop: button label on light accent presets.** On QueryMT Light
   the label on the Teal, Green and Amber accent presets is now black (it was
   white, 1.9 to 2.5:1 contrast with those fills). A preset's label keeps the
@@ -805,6 +862,31 @@
 
 ### Breaking
 
+- **BREAKING (Rust API): wire types moved to `querymt-agent-protocol-types`.**
+  `impl From<McpServerConfig> for McpServerInfo` is replaced by
+  `McpServerConfig::server_info()`, and `AccountingSnapshot::from_reducer` /
+  `from_events` are now `querymt_agent_services::accounting::snapshot_from_reducer`
+  / `snapshot_from_events`. The reducer mutators of `ScopeTotals`,
+  `ComponentSums` and `TokenSums` are private functions in
+  `agent-services`. Other paths under `querymt_agent_core`, services and
+  runtime keep resolving through re-exports.
+- **Slash command files validate a new `arguments` key (BREAKING, slash
+  commands).** A command file may declare `arguments: none | optional |
+  required`. A file whose `arguments` value is anything else is not loaded and
+  discovery reports a diagnostic that names it; the key was ignored before.
+  Without the key the input need is `required` when the file has an
+  `argument-hint` or its template contains `$ARGUMENTS`, else `none`, and the
+  ACP `input` is advertised exactly when it is not `none` (as before for the
+  default). Every catalog entry also carries `_meta.querymt` with `source`,
+  `effect`, `input` and `accepts`. Documented in
+  `docs/docs/agent/slash-commands.md`.
+- **Steering: a command is rejected by name, other `/` text is steered (BREAKING,
+  ACP behaviour).** Steered text that starts with `/` but names no command of
+  the session's catalog (for example `/tmp/build.log is empty`) is now accepted
+  as steering. A steered command, built-in or user-defined, is rejected with an
+  invalid-prompt error (`-32602`) that names the command and says to queue it,
+  instead of the `slash_command_not_steerable` turn-control error, which no
+  longer exists. Documented in `docs/docs/agent/slash-commands.md`.
 - **The `qmtcode --dashboard` UI is QueryMT Desktop web (BREAKING, build
   inputs).** The `dashboard` feature of `querymt-agent` now embeds the wasm
   build of `crates/querymt-gpui` instead of the querymt-desktop Svelte

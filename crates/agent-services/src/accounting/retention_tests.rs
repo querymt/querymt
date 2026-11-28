@@ -20,6 +20,7 @@ fn cost() -> f64 {
 
 fn prompt(id: &str) -> AgentEventKind {
     AgentEventKind::PromptReceived {
+        slash_command: None,
         content: "hello".into(),
         message_id: Some(id.into()),
     }

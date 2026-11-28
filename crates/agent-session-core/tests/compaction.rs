@@ -348,3 +348,44 @@ fn a_second_compaction_is_measured_from_the_first_ones_result() {
         json!({ "tokensBefore": 20000, "tokensAfter": 9000 })
     );
 }
+
+#[test]
+fn compaction_keeps_its_record_through_later_updates() {
+    use querymt_agent_protocol_types::events::{
+        SlashCommandEffect, SlashCommandRecord, SlashCommandSource,
+    };
+    let mut core = SessionCore::new("s1");
+    core.apply(&[
+        live(json!({
+            "sessionUpdate": "compaction_update",
+            "compactionId": "k1",
+            "status": "in_progress",
+            "_meta": { "querymt": { "slashCommand": {
+                "name": "compact",
+                "arguments": "keep the API decisions",
+                "source": "builtin",
+                "effect": "action",
+                "clientPromptId": "c2"
+            } } }
+        })),
+        compaction("k1", "completed"),
+    ]);
+    let found = compactions(&core);
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].1.state, CompactionState::Completed);
+    assert_eq!(
+        found[0].1.slash_command,
+        Some(SlashCommandRecord {
+            name: "compact".into(),
+            arguments: "keep the API decisions".into(),
+            source: SlashCommandSource::Builtin,
+            effect: SlashCommandEffect::Action,
+            client_prompt_id: Some("c2".into()),
+        })
+    );
+
+    // A compaction the agent started on its own has none.
+    let mut auto = SessionCore::new("s1");
+    auto.apply(&[compaction("k2", "in_progress")]);
+    assert_eq!(compactions(&auto)[0].1.slash_command, None);
+}

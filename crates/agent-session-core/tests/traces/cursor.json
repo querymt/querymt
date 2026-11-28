@@ -1945,7 +1945,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -2023,7 +2024,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -2043,7 +2045,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -2121,7 +2124,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -2199,7 +2203,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -2219,7 +2224,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -2270,7 +2276,8 @@
                     },
                     "runId": "r3"
                   }
-                }
+                },
+                "slashCommand": null
               }
             }
           }
@@ -2296,7 +2303,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -2391,7 +2399,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },
@@ -2411,7 +2420,8 @@
                 ],
                 "status": "sent",
                 "error": null,
-                "atMs": null
+                "atMs": null,
+                "slashCommand": null
               }
             }
           },

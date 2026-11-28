@@ -12,9 +12,37 @@ pub fn search_paths(
     include_project: bool,
     extra_paths: &[PathBuf],
 ) -> Vec<SlashCommandSource> {
+    search_paths_with_global(
+        None,
+        project_root,
+        include_global,
+        include_project,
+        extra_paths,
+    )
+}
+
+/// The folder whose files are the user's global commands and are watched
+/// for changes: `global_dir` when given, else `~/.qmt/commands`.
+pub fn global_commands_dir(global_dir: Option<&Path>) -> Option<PathBuf> {
+    match global_dir {
+        Some(dir) => Some(dir.to_path_buf()),
+        None => dirs::home_dir().map(|home| home.join(".qmt/commands")),
+    }
+}
+
+/// Like [`search_paths`], with `global_dir` replacing the global folders.
+pub fn search_paths_with_global(
+    global_dir: Option<&Path>,
+    project_root: Option<&Path>,
+    include_global: bool,
+    include_project: bool,
+    extra_paths: &[PathBuf],
+) -> Vec<SlashCommandSource> {
     let mut paths = Vec::new();
 
-    if include_global {
+    if include_global && let Some(dir) = global_dir {
+        push_unique_source(&mut paths, SlashCommandSource::Global(dir.to_path_buf()));
+    } else if include_global {
         if let Some(home) = dirs::home_dir() {
             push_unique_source(
                 &mut paths,

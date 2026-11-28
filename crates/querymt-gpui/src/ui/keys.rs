@@ -14,14 +14,19 @@ use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem};
+use gpui_kit::component::input::IndentInline;
 use gpui_kit::component::{Icon, IndexPath, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use serde::Deserialize;
 
+use super::session_pane::Blocked;
 use super::{Page, QmtApp, ToggleSidebar};
+use crate::session::commands::CommandTraits;
 use crate::store::{LAUNCH_REASONING, SessionSummary};
 use crate::theme::{self, Appearance, ThemeId, palette};
 use crate::util::workspace_name;
+use querymt_agent_session_core::view::{CommandInput, SlashCommandSource};
 
 gpui_kit::actions!(
     querymt,
@@ -96,9 +101,12 @@ enum PaletteTarget {
     Page(Page),
     Session(Box<SessionSummary>),
     /// A slash command of the open session (`name` has no leading `/`).
+    /// `blocked` is why the session cannot take it now; such a row stays in
+    /// its place and picking it does nothing.
     SlashCommand {
         name: String,
-        takes_input: bool,
+        input: CommandInput,
+        blocked: Option<Blocked>,
     },
     /// "Select theme…": the palette lists the themes instead (design D12).
     SelectTheme,
@@ -123,8 +131,14 @@ pub(super) enum PaletteMode {
 struct PaletteEntry {
     label: SharedString,
     icon: IconName,
-    /// A dimmed second line under the label (a slash command's help).
+    /// A dimmed second line under the label (a slash command's help, or the
+    /// reason it is unavailable).
     description: Option<SharedString>,
+    /// A small word at the end of the first line (`Prompt`).
+    mark: Option<SharedString>,
+    /// Drawn dimmed: the row does nothing now. Not a kit-disabled item, which
+    /// would move the highlight to another row (design D4).
+    dim: bool,
     keywords: Vec<String>,
     /// Marked with a check (the theme in use).
     checked: bool,
@@ -137,10 +151,22 @@ impl PaletteEntry {
             label: label.into(),
             icon,
             description: None,
+            mark: None,
+            dim: false,
             keywords: Vec::new(),
             checked: false,
             target,
         }
+    }
+
+    fn mark(mut self, mark: impl Into<SharedString>) -> Self {
+        self.mark = Some(mark.into());
+        self
+    }
+
+    fn dim(mut self, dim: bool) -> Self {
+        self.dim = dim;
+        self
     }
 
     fn checked(mut self, checked: bool) -> Self {
@@ -205,6 +231,16 @@ fn filter_palette(groups: Vec<PaletteGroup>, query: &str) -> Vec<PaletteGroup> {
     // Stable: equal scores keep the groups' built order.
     found.sort_by_key(|(best, _)| std::cmp::Reverse(*best));
     found.into_iter().map(|(_, group)| group).collect()
+}
+
+/// The word the palette search matches a command's source by.
+fn source_word(source: SlashCommandSource) -> &'static str {
+    match source {
+        SlashCommandSource::Builtin => "builtin",
+        SlashCommandSource::Global => "global",
+        SlashCommandSource::Project => "project",
+        SlashCommandSource::Configured => "configured",
+    }
 }
 
 /// The theme list: the dark themes, then the light ones, each in catalogue
@@ -487,6 +523,10 @@ impl QmtApp {
         match target {
             PaletteTarget::SelectTheme => return self.open_theme_list(window, cx),
             PaletteTarget::Theme(id) => return self.confirm_theme(id, window, cx),
+            // Unavailable: nothing is sent and the palette stays open.
+            PaletteTarget::SlashCommand {
+                blocked: Some(_), ..
+            } => return,
             _ => {}
         }
         self.close_palette(cx);
@@ -507,30 +547,63 @@ impl QmtApp {
             PaletteTarget::RunSetup => return self.open_setup(None, cx),
             PaletteTarget::Page(page) => self.go(page, cx),
             PaletteTarget::Session(s) => self.open_summary(&s, cx),
-            PaletteTarget::SlashCommand { name, takes_input } => {
-                return self.run_slash_command(&name, takes_input, window, cx);
+            PaletteTarget::SlashCommand { name, input, .. } => {
+                return self.run_slash_command(&name, input, window, cx);
             }
         }
         self.restore_focus(window, cx);
         cx.notify();
     }
 
-    /// Picking a slash command in the palette. Without an input it is sent
-    /// as a prompt (`/name`), under the same rules as a typed one: nothing is
-    /// sent while the session is not ready, and while a turn runs
-    /// `send_prompt` queues it. With an input the composer gets `/name `, the
+    /// Picking a slash command in the palette. With no input or an optional
+    /// one it is sent as a prompt (`/name`), under the same rules as a typed
+    /// one: while a turn runs `send_prompt` queues it. With a required input
+    /// the composer gets `/name ` (keeping a draft as the arguments), the
     /// cursor at the end and the focus, so the arguments can be typed.
     pub(super) fn run_slash_command(
         &mut self,
         name: &str,
-        takes_input: bool,
+        input: CommandInput,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // The main window's session pane owns the composer.
         self.pane.update(cx, |pane, cx| {
-            pane.run_slash_command(name, takes_input, window, cx)
+            pane.run_slash_command(name, input, window, cx)
         });
+        cx.notify();
+    }
+
+    /// The target of the highlighted palette row, if any.
+    fn highlighted_target(&self, cx: &App) -> Option<PaletteTarget> {
+        let ix = self.palette.read(cx).selected_index()?;
+        let query = self.palette.read(cx).query(cx).to_string();
+        let groups = filter_palette(self.palette_groups(cx), &query);
+        groups
+            .into_iter()
+            .nth(ix.section)?
+            .entries
+            .into_iter()
+            .nth(ix.row)
+            .map(|e| e.target)
+    }
+
+    /// Tab in the palette: put the highlighted slash command in the composer
+    /// instead of running it (design D6). Only an available command that
+    /// takes input does; on any other row Tab does nothing, and the key is
+    /// spent either way so focus cannot leave the search field.
+    fn palette_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(PaletteTarget::SlashCommand {
+            name,
+            input: CommandInput::Optional | CommandInput::Required,
+            blocked: None,
+        }) = self.highlighted_target(cx)
+        else {
+            return;
+        };
+        self.close_palette(cx);
+        self.pane
+            .update(cx, |pane, cx| pane.prefill_slash(&name, window, cx));
         cx.notify();
     }
 
@@ -574,6 +647,21 @@ impl QmtApp {
             .border_color(p.border)
             .shadow_lg()
             .on_click(|_, _, cx| cx.stop_propagation())
+            // Tab is bound to an action of the search field, which runs
+            // before key-down listeners: catch the action first. The key-down
+            // listener covers a keymap that does not bind Tab.
+            .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
+                this.palette_tab(window, cx);
+                cx.stop_propagation();
+            }))
+            .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                let m = ev.keystroke.modifiers;
+                if ev.keystroke.key != "tab" || m.modified() {
+                    return;
+                }
+                this.palette_tab(window, cx);
+                cx.stop_propagation();
+            }))
             .child(self.palette_view(cx));
         Some(
             div()
@@ -647,44 +735,104 @@ impl QmtApp {
                         .icon(e.icon)
                         .checked(e.checked)
                         .keywords(e.keywords);
-                    // The kit draws icon and label only; a description needs
-                    // a row of our own (the label and keywords still search).
-                    match e.description {
-                        Some(description) => {
-                            let (label, icon) = (e.label, e.icon);
-                            item.child(move |_, _| {
-                                h_flex()
+                    // The kit draws icon and label only; a description, a
+                    // mark or a dimmed row needs a row of our own (the
+                    // label and keywords still search).
+                    if e.description.is_none() && e.mark.is_none() && !e.dim {
+                        return item;
+                    }
+                    let (label, icon, description, mark, dim) =
+                        (e.label, e.icon, e.description, e.mark, e.dim);
+                    let (name_color, icon_color) = if dim {
+                        (p.dim, p.dim)
+                    } else {
+                        (p.text, p.muted)
+                    };
+                    item.child(move |_, _| {
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_2()
+                            .items_center()
+                            .child(Icon::new(icon).size_4().text_color(icon_color))
+                            .child(
+                                v_flex()
                                     .flex_1()
                                     .min_w_0()
-                                    .gap_2()
-                                    .items_center()
-                                    .child(Icon::new(icon).size_4().text_color(p.muted))
                                     .child(
-                                        v_flex()
-                                            .flex_1()
-                                            .min_w_0()
+                                        h_flex()
+                                            .gap_2()
+                                            .items_center()
                                             .child(
                                                 div()
+                                                    .flex_1()
+                                                    .min_w_0()
                                                     .text_sm()
-                                                    .text_color(p.text)
-                                                    .child(label.clone()),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(p.muted)
+                                                    .text_color(name_color)
                                                     .whitespace_nowrap()
                                                     .truncate()
-                                                    .child(description.clone()),
-                                            ),
+                                                    .child(label.clone()),
+                                            )
+                                            .children(mark.clone().map(|mark| {
+                                                div()
+                                                    .flex_none()
+                                                    .text_xs()
+                                                    .text_color(p.muted)
+                                                    .child(mark)
+                                            })),
                                     )
-                            })
-                        }
-                        None => item,
-                    }
+                                    .children(description.clone().map(|description| {
+                                        div()
+                                            .text_xs()
+                                            .text_color(p.muted)
+                                            .whitespace_nowrap()
+                                            .truncate()
+                                            .child(description)
+                                    })),
+                            )
+                    })
                 }),
             ));
         }
+        // While an available command with optional input is highlighted:
+        // Enter runs it, Tab adds arguments. The footer is built with the
+        // state at render, so it follows the highlight.
+        let footer_targets = targets.clone();
+        command = command.footer(move |state, _, _| {
+            let optional = state
+                .selected_index()
+                .and_then(|ix| footer_targets.get(ix.section)?.get(ix.row))
+                .is_some_and(|t| {
+                    matches!(
+                        t,
+                        PaletteTarget::SlashCommand {
+                            input: CommandInput::Optional,
+                            blocked: None,
+                            ..
+                        }
+                    )
+                });
+            let key = |k: &'static str| {
+                Keystroke::parse(k)
+                    .ok()
+                    .map(gpui_kit::component::kbd::Kbd::new)
+            };
+            div().when(optional, |el| {
+                el.debug_selector(|| "palette-key-hint".into())
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .px_3()
+                    .py_1p5()
+                    .text_xs()
+                    .text_color(p.muted)
+                    .children(key("enter"))
+                    .child("to run")
+                    .child("·")
+                    .children(key("tab"))
+                    .child("to add arguments")
+            })
+        });
         command
             .on_confirm(move |ix: IndexPath, window, cx| {
                 let Some(target) = targets.get(ix.section).and_then(|g| g.get(ix.row)).cloned()
@@ -761,22 +909,42 @@ impl QmtApp {
                 entries: commands
                     .iter()
                     .map(|c| {
+                        let traits = CommandTraits::of(c);
+                        let blocked = pane.readiness(Some(c), cx).err();
                         // The bare name: the palette lists commands, it is
-                        // not the composer. The description is the agent's
-                        // own help text for the command.
-                        PaletteEntry::new(
-                            c.name.clone(),
+                        // not the composer. A required input ends it with
+                        // `…`. The second line is the agent's own help text,
+                        // or why the session cannot take the command now.
+                        let label = if traits.input == CommandInput::Required {
+                            format!("{}…", c.name)
+                        } else {
+                            c.name.clone()
+                        };
+                        let second: String = blocked.map_or_else(
+                            || c.description.clone(),
+                            |reason| reason.reason().to_owned(),
+                        );
+                        let mut entry = PaletteEntry::new(
+                            label,
                             IconName::SquareSlash,
                             PaletteTarget::SlashCommand {
                                 name: c.name.clone(),
-                                takes_input: c.input_hint.is_some(),
+                                input: traits.input,
+                                blocked,
                             },
                         )
-                        .description(c.description.clone())
+                        .description(second)
+                        .dim(blocked.is_some())
                         .keywords(
                             std::iter::once(c.description.clone())
-                                .chain(c.input_hint.clone().filter(|h| !h.is_empty())),
-                        )
+                                .chain(c.input_hint.clone().filter(|h| !h.is_empty()))
+                                .chain(traits.source.map(source_word).map(str::to_owned))
+                                .chain(traits.is_prompt().then(|| "prompt".to_owned())),
+                        );
+                        if traits.is_prompt() {
+                            entry = entry.mark("Prompt");
+                        }
+                        entry
                     })
                     .collect(),
             });
@@ -818,10 +986,12 @@ mod tests {
     use super::{PaletteEntry, PaletteGroup, PaletteTarget, filter_palette};
     use crate::session::SessionView;
     use crate::store::AgentsStore;
+    use crate::ui::session_pane::Blocked;
     use crate::ui::{Page, QmtApp};
     use gpui_kit::assets::IconName;
     use gpui_kit::test::TestWindowExt as _;
     use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, TestAppContext};
+    use querymt_agent_session_core::view::CommandInput;
     use serde_json::{Value, json};
 
     const COMPACT: &str = "Summarize the conversation now to free up context";
@@ -840,13 +1010,59 @@ mod tests {
         view
     }
 
-    /// `/compact` takes input, `/worktree` does not.
+    /// `/compact` takes optional input (its descriptor says so), `/worktree`
+    /// has no input and no descriptor.
     fn two_commands() -> Value {
         json!([
             { "name": "compact", "description": COMPACT,
-              "input": { "hint": "[optional instructions]" } },
+              "input": { "hint": "[optional instructions]" },
+              "_meta": { "querymt": { "source": "builtin", "effect": "action",
+                  "input": "optional", "accepts": ["prompt", "queue"] } } },
             { "name": "worktree", "description": "Work in a git worktree" },
         ])
+    }
+
+    /// `compact` (optional input, accepts queueing), `explain` (a project
+    /// prompt command with required input) and `worktree` (required input,
+    /// accepts only the prompt submission).
+    fn described_commands() -> Value {
+        json!([
+            { "name": "compact", "description": COMPACT,
+              "input": { "hint": "[optional instructions]" },
+              "_meta": { "querymt": { "source": "builtin", "effect": "action",
+                  "input": "optional", "accepts": ["prompt", "queue"] } } },
+            { "name": "explain", "description": "Explain a topic",
+              "input": { "hint": "[topic]" },
+              "_meta": { "querymt": { "source": "project", "effect": "prompt",
+                  "input": "required", "accepts": ["prompt", "queue"] } } },
+            { "name": "worktree", "description": "Work in a git worktree",
+              "input": { "hint": "[subcommand]" },
+              "_meta": { "querymt": { "source": "builtin", "effect": "action",
+                  "input": "required", "accepts": ["prompt"] } } },
+        ])
+    }
+
+    /// A running turn the agent lets the app queue into.
+    fn running_session(commands: Value) -> SessionView {
+        let mut view = session_with(commands);
+        view.phase = "model".into();
+        view
+    }
+
+    fn with_turn_control(store: &mut AgentsStore) {
+        store.runtime_mut_for_test("test-agent").capabilities = Some(json!({
+            "features": { "steering": true },
+            "methods": ["querymt/session/steer", "querymt/session/queue",
+                        "querymt/session/runtimeState"],
+        }));
+    }
+
+    fn slash_rows(groups: &[PaletteGroup]) -> Vec<&PaletteEntry> {
+        groups
+            .iter()
+            .filter(|g| g.label == "Slash commands")
+            .flat_map(|g| &g.entries)
+            .collect()
     }
 
     fn rig(
@@ -980,11 +1196,19 @@ mod tests {
         assert!(descriptions[1].is_some(), "every command shows its help");
         assert!(matches!(
             target_of(&all, "compact"),
-            PaletteTarget::SlashCommand { ref name, takes_input: true } if name == "compact"
+            PaletteTarget::SlashCommand {
+                ref name,
+                input: CommandInput::Optional,
+                blocked: None
+            } if name == "compact"
         ));
         assert!(matches!(
             target_of(&all, "worktree"),
-            PaletteTarget::SlashCommand { ref name, takes_input: false } if name == "worktree"
+            PaletteTarget::SlashCommand {
+                ref name,
+                input: CommandInput::None,
+                blocked: None
+            } if name == "worktree"
         ));
         // The search matches the description: `free context` finds /compact
         // (words in order or not), and the other command drops out.
@@ -1033,7 +1257,8 @@ mod tests {
                     IconName::SquareSlash,
                     PaletteTarget::SlashCommand {
                         name: "compact".into(),
-                        takes_input: true,
+                        input: CommandInput::Optional,
+                        blocked: None,
                     },
                 )
                 .description(COMPACT)
@@ -1258,15 +1483,341 @@ mod tests {
         let mut view = session_with(two_commands());
         view.loading = true;
         let rig = rig(cx, Page::Session, Some(view), |_| {});
-        let target = target_of(&groups(cx, &rig), "worktree");
+        let all = groups(cx, &rig);
+        let target = target_of(&all, "worktree");
+        assert!(matches!(
+            target,
+            PaletteTarget::SlashCommand {
+                blocked: Some(Blocked::Loading),
+                ..
+            }
+        ));
+        let row = slash_rows(&all)[1];
+        assert_eq!(row.description.as_deref(), Some("Session is loading"));
+        assert!(row.dim);
         pick(cx, &rig, target);
         assert!(
             sent(&rig).is_empty(),
             "same readiness rule as a typed prompt"
         );
-        // The palette is closed, so the composer gets the focus back.
-        rig.app.read_with(cx, |app, _| assert!(!app.palette_open));
-        assert!(prompt_focused(cx, &rig), "focus returns to the composer");
+        // Picking it did nothing: the palette stays open.
+        rig.app.read_with(cx, |app, _| assert!(app.palette_open));
+    }
+
+    #[gpui_kit::test]
+    fn palette_disables_commands_while_disconnected(cx: &mut TestAppContext) {
+        let rig = rig(
+            cx,
+            Page::Session,
+            Some(session_with(two_commands())),
+            |store| {
+                store.runtime_mut_for_test("test-agent").state =
+                    crate::store::ConnState::Failed("gone".into())
+            },
+        );
+        let all = groups(cx, &rig);
+        let rows = slash_rows(&all);
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert!(row.dim);
+            assert_eq!(row.description.as_deref(), Some("Agent not connected"));
+        }
+    }
+
+    #[gpui_kit::test]
+    fn palette_runs_an_optional_input_command(cx: &mut TestAppContext) {
+        let rig = rig(
+            cx,
+            Page::Session,
+            Some(session_with(two_commands())),
+            |_| {},
+        );
+        let target = target_of(&groups(cx, &rig), "compact");
+        pick(cx, &rig, target);
+        assert_eq!(prompts(&sent(&rig)), ["/compact"]);
+        rig.app.read_with(cx, |app, cx| {
+            assert!(!app.palette_open, "the palette closes");
+            assert_eq!(app.pane.read(cx).prompt.read(cx).value().as_ref(), "");
+        });
+    }
+
+    #[gpui_kit::test]
+    fn prompt_only_command_is_unavailable_during_a_turn(cx: &mut TestAppContext) {
+        let rig = rig(
+            cx,
+            Page::Session,
+            Some(running_session(described_commands())),
+            with_turn_control,
+        );
+        let all = groups(cx, &rig);
+        let worktree = slash_rows(&all)
+            .into_iter()
+            .find(|e| e.label.as_ref() == "worktree…")
+            .expect("worktree…");
+        assert!(worktree.dim);
+        assert_eq!(
+            worktree.description.as_deref(),
+            Some("Available when the turn ends")
+        );
+        let compact = slash_rows(&all)
+            .into_iter()
+            .find(|e| e.label.as_ref() == "compact")
+            .expect("compact");
+        assert!(!compact.dim);
+        assert_eq!(compact.description.as_deref(), Some(COMPACT));
+    }
+
+    #[gpui_kit::test]
+    fn picking_an_unavailable_command_keeps_the_palette_open(cx: &mut TestAppContext) {
+        let rig = rig(
+            cx,
+            Page::Session,
+            Some(running_session(described_commands())),
+            with_turn_control,
+        );
+        open_palette(cx, &rig);
+        cx.update_window(rig.handle, |_, window, cx| {
+            rig.app.update(cx, |app, cx| {
+                app.palette
+                    .update(cx, |s, cx| s.set_query("worktree", window, cx))
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        render(cx, &rig);
+        let query = rig
+            .app
+            .read_with(cx, |app, cx| app.palette.read(cx).query(cx).to_string());
+        let shown = filter_palette(groups(cx, &rig), &query);
+        assert_eq!(shown[0].entries[0].label.as_ref(), "worktree…");
+        let target = shown[0].entries[0].target.clone();
+        pick(cx, &rig, target);
+        assert!(sent(&rig).is_empty(), "nothing is sent");
+        rig.app.read_with(cx, |app, cx| {
+            assert!(app.palette_open, "the palette stays open");
+            assert_eq!(app.pane.read(cx).prompt.read(cx).value().as_ref(), "");
+        });
+    }
+
+    #[gpui_kit::test]
+    fn required_input_rows_end_with_an_ellipsis(cx: &mut TestAppContext) {
+        let rig = rig(
+            cx,
+            Page::Session,
+            Some(session_with(described_commands())),
+            |_| {},
+        );
+        assert_eq!(
+            entry_labels(&groups(cx, &rig), "Slash commands"),
+            ["compact", "explain…", "worktree…"]
+        );
+    }
+
+    #[gpui_kit::test]
+    fn prompt_commands_are_marked(cx: &mut TestAppContext) {
+        let rig = rig(
+            cx,
+            Page::Session,
+            Some(session_with(described_commands())),
+            |_| {},
+        );
+        let all = groups(cx, &rig);
+        let marks: Vec<Option<&str>> = slash_rows(&all).iter().map(|e| e.mark.as_deref()).collect();
+        assert_eq!(marks, [None, Some("Prompt"), None]);
+        // A command without a descriptor shows no mark and no source word.
+        let rig = rig_plain(cx);
+        let all = groups(cx, &rig);
+        assert!(slash_rows(&all).iter().all(|e| e.mark.is_none()));
+    }
+
+    fn rig_plain(cx: &mut TestAppContext) -> Rig {
+        rig(
+            cx,
+            Page::Session,
+            Some(session_with(json!([
+                { "name": "review", "description": "Review", "input": { "hint": "[scope]" } },
+            ]))),
+            |_| {},
+        )
+    }
+
+    #[gpui_kit::test]
+    fn palette_searches_the_source(cx: &mut TestAppContext) {
+        let rig = rig(
+            cx,
+            Page::Session,
+            Some(session_with(described_commands())),
+            |_| {},
+        );
+        let found = filter_palette(groups(cx, &rig), "project");
+        assert_eq!(entry_labels(&found, "Slash commands"), ["explain…"]);
+        let found = filter_palette(groups(cx, &rig), "prompt");
+        assert!(entry_labels(&found, "Slash commands").contains(&"explain…".to_string()));
+        assert!(!entry_labels(&found, "Slash commands").contains(&"compact".to_string()));
+    }
+
+    #[gpui_kit::test]
+    fn composer_draft_becomes_the_arguments(cx: &mut TestAppContext) {
+        let rig = rig(
+            cx,
+            Page::Session,
+            Some(session_with(described_commands())),
+            |_| {},
+        );
+        cx.update_window(rig.handle, |_, window, cx| {
+            let prompt = rig.app.read(cx).pane.read(cx).prompt.clone();
+            prompt.update(cx, |s, cx| s.set_value("closures in Rust", window, cx));
+        })
+        .unwrap();
+        let target = target_of(&groups(cx, &rig), "explain…");
+        pick(cx, &rig, target);
+        assert!(sent(&rig).is_empty());
+        cx.update_window(rig.handle, |_, _, cx| {
+            let state = rig.app.read(cx).pane.read(cx).prompt.clone();
+            let state = state.read(cx);
+            assert_eq!(state.value().as_ref(), "/explain closures in Rust");
+            let c = state.cursor_position();
+            assert_eq!((c.line, c.character), (0, 25), "cursor at the end");
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn a_path_draft_becomes_the_arguments(cx: &mut TestAppContext) {
+        let rig = rig(
+            cx,
+            Page::Session,
+            Some(session_with(described_commands())),
+            |_| {},
+        );
+        cx.update_window(rig.handle, |_, window, cx| {
+            let prompt = rig.app.read(cx).pane.read(cx).prompt.clone();
+            prompt.update(cx, |s, cx| {
+                s.set_value("/tmp/build.log is empty", window, cx)
+            });
+        })
+        .unwrap();
+        let target = target_of(&groups(cx, &rig), "explain…");
+        pick(cx, &rig, target);
+        assert!(sent(&rig).is_empty());
+        cx.update_window(rig.handle, |_, _, cx| {
+            let state = rig.app.read(cx).pane.read(cx).prompt.clone();
+            let state = state.read(cx);
+            // The path is part of the message, not a command name to replace.
+            assert_eq!(state.value().as_ref(), "/explain /tmp/build.log is empty");
+            let c = state.cursor_position();
+            assert_eq!((c.line, c.character), (0, 32), "cursor at the end");
+        })
+        .unwrap();
+    }
+
+    fn press_tab(cx: &mut TestAppContext, rig: &Rig) {
+        cx.update_window(rig.handle, |_, window, cx| window.press("tab", cx))
+            .unwrap();
+        cx.run_until_parked();
+        render(cx, rig);
+    }
+
+    /// Open the palette and highlight the row labelled `label`.
+    fn highlight_row(cx: &mut TestAppContext, rig: &Rig, label: &str) {
+        if !rig.app.read_with(cx, |app, _| app.palette_open) {
+            open_palette(cx, rig);
+        }
+        let shown = filter_palette(groups(cx, rig), "");
+        let (section, row) = shown
+            .iter()
+            .enumerate()
+            .find_map(|(s, g)| {
+                g.entries
+                    .iter()
+                    .position(|e| e.label.as_ref() == label)
+                    .map(|r| (s, r))
+            })
+            .unwrap_or_else(|| panic!("no row {label}"));
+        cx.update_window(rig.handle, |_, window, cx| {
+            rig.app.update(cx, |app, cx| {
+                app.palette.update(cx, |s, cx| {
+                    s.set_selected_index(
+                        Some(IndexPath::default().section(section).row(row)),
+                        window,
+                        cx,
+                    )
+                })
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        render(cx, rig);
+    }
+
+    fn key_hint_shown(cx: &mut TestAppContext, rig: &Rig) -> bool {
+        gpui_kit::VisualTestContext::from_window(rig.handle, cx)
+            .debug_bounds("palette-key-hint")
+            .is_some()
+    }
+
+    #[gpui_kit::test]
+    fn tab_adds_arguments_to_an_optional_command(cx: &mut TestAppContext) {
+        cx.update(super::bind_keys);
+        let rig = rig(
+            cx,
+            Page::Session,
+            Some(session_with(two_commands())),
+            |_| {},
+        );
+        highlight_row(cx, &rig, "compact");
+        press_tab(cx, &rig);
+        assert!(sent(&rig).is_empty(), "nothing is sent");
+        rig.app.read_with(cx, |app, cx| {
+            assert!(!app.palette_open, "the palette closes");
+            assert_eq!(
+                app.pane.read(cx).prompt.read(cx).value().as_ref(),
+                "/compact "
+            );
+        });
+        assert!(prompt_focused(cx, &rig));
+    }
+
+    #[gpui_kit::test]
+    fn tab_on_a_command_without_input_does_nothing(cx: &mut TestAppContext) {
+        cx.update(super::bind_keys);
+        let rig = rig(
+            cx,
+            Page::Session,
+            Some(session_with(two_commands())),
+            |_| {},
+        );
+        highlight_row(cx, &rig, "worktree");
+        press_tab(cx, &rig);
+        assert!(sent(&rig).is_empty());
+        rig.app.read_with(cx, |app, cx| {
+            assert!(app.palette_open, "the palette stays open");
+            assert_eq!(app.pane.read(cx).prompt.read(cx).value().as_ref(), "");
+        });
+        // An Actions row: Tab changes nothing either.
+        highlight_row(cx, &rig, "New session");
+        press_tab(cx, &rig);
+        assert!(sent(&rig).is_empty());
+        rig.app.read_with(cx, |app, cx| {
+            assert!(app.palette_open);
+            assert_eq!(app.pane.read(cx).prompt.read(cx).value().as_ref(), "");
+        });
+    }
+
+    #[gpui_kit::test]
+    fn key_hint_shows_for_an_optional_input_command(cx: &mut TestAppContext) {
+        let rig = rig(
+            cx,
+            Page::Session,
+            Some(session_with(two_commands())),
+            |_| {},
+        );
+        highlight_row(cx, &rig, "compact");
+        assert!(key_hint_shown(cx, &rig));
+        highlight_row(cx, &rig, "New session");
+        assert!(!key_hint_shown(cx, &rig), "not for a row of another group");
+        highlight_row(cx, &rig, "worktree");
+        assert!(!key_hint_shown(cx, &rig), "not for a command without input");
     }
 
     /// A read-only session (archived, handed off) has no composer: it lists
@@ -1285,7 +1836,8 @@ mod tests {
             &rig,
             PaletteTarget::SlashCommand {
                 name: "worktree".into(),
-                takes_input: false,
+                input: CommandInput::None,
+                blocked: None,
             },
         );
         assert!(sent(&rig).is_empty(), "no prompt for a read-only session");
@@ -1296,16 +1848,16 @@ mod tests {
         let rig = rig(
             cx,
             Page::Session,
-            Some(session_with(two_commands())),
+            Some(session_with(described_commands())),
             |_| {},
         );
-        let target = target_of(&groups(cx, &rig), "compact");
+        let target = target_of(&groups(cx, &rig), "explain…");
         pick(cx, &rig, target);
         assert!(sent(&rig).is_empty(), "nothing is sent");
         cx.update_window(rig.handle, |_, window, cx| {
             let entity = rig.app.read(cx).pane.read(cx).prompt.clone();
             let state = entity.read(cx);
-            assert_eq!(state.value().as_ref(), "/compact ");
+            assert_eq!(state.value().as_ref(), "/explain ");
             let cursor = state.cursor_position();
             assert_eq!((cursor.line, cursor.character), (0, 9), "cursor at the end");
             let focus = gpui_kit::Focusable::focus_handle(&entity, cx);
@@ -1491,7 +2043,8 @@ mod tests {
             &rig,
             PaletteTarget::SlashCommand {
                 name: "/web".into(),
-                takes_input: false,
+                input: CommandInput::None,
+                blocked: None,
             },
         );
         assert_eq!(prompts(&sent(&rig)), ["/web"]);

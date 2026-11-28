@@ -519,6 +519,7 @@ impl OwnerHost for LocalAgentHandle {
             .emit_event_persisted(
                 owner,
                 AgentEventKind::WorktreeArchived {
+                    slash_command: None,
                     workspace_id: workspace_id.to_string(),
                     by_session_id: by_session_id.map(str::to_owned),
                     removal,
@@ -606,6 +607,7 @@ impl HandoffHost for LocalAgentHandle {
             .emit_event_persisted(
                 previous,
                 querymt_agent_core::events::AgentEventKind::WorktreeOwnershipTransferred {
+                    slash_command: None,
                     workspace_id: workspace_id.to_string(),
                     successor_session_id: successor.to_string(),
                     summary_seeded,
@@ -1147,10 +1149,15 @@ impl LocalAgentHandle {
             Some(tip) => tip,
             None => match self.hosting_config(&session_id).await {
                 Some(config) => {
-                    let transient = AgentEventKind::WorktreeCommandOutput { text: text.clone() };
+                    let transient = AgentEventKind::WorktreeCommandOutput {
+                        code: None,
+                        slash_command: None,
+                        text: text.clone(),
+                    };
                     let tip = match durable_command {
                         Some(command) => {
                             let reply = AgentEventKind::WorktreeCommandCompleted {
+                                slash_command: None,
                                 id: uuid::Uuid::now_v7().to_string(),
                                 command: command.to_owned(),
                                 code,

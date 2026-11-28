@@ -227,8 +227,13 @@ pub fn user_body(text: &str) -> &str {
 /// The Markdown views `item` shows, as `(view id, source)` in display order.
 pub fn views_of(item: &Item) -> Vec<(String, String)> {
     match &item.kind {
-        ItemKind::User { text, .. } => {
-            let body = user_body(text);
+        ItemKind::User { text, command, .. } => {
+            // A command bubble draws `/name` apart and the arguments as
+            // Markdown; the arguments are what find can search.
+            let body = match command {
+                Some(command) => command.arguments.as_str(),
+                None => user_body(text),
+            };
             if body.is_empty() {
                 Vec::new()
             } else {
@@ -749,6 +754,7 @@ impl SessionPane {
 #[cfg(test)]
 mod tests {
     use super::{FindIndex, Item, ItemKind, match_ranges, searchable_text, views_of};
+    use crate::session::UserCommand;
 
     fn text_of(text: &str, query: &str) -> Vec<String> {
         match_ranges(text, query)
@@ -833,8 +839,51 @@ mod tests {
                 text: text.into(),
                 attachments: Vec::new(),
                 local: false,
+                command: None,
             },
         }
+    }
+
+    fn command(key: &str, name: &str, arguments: &str) -> Item {
+        let typed = if arguments.is_empty() {
+            format!("/{name}")
+        } else {
+            format!("/{name} {arguments}")
+        };
+        Item {
+            key: key.into(),
+            rev: 1,
+            kind: ItemKind::User {
+                text: typed,
+                attachments: Vec::new(),
+                local: false,
+                command: Some(UserCommand {
+                    name: name.into(),
+                    arguments: arguments.into(),
+                    expansion: "The expanded template the model received.".into(),
+                }),
+            },
+        }
+    }
+
+    // slash-command-transcript: a command bubble draws `/name` apart and the
+    // arguments as Markdown, so the arguments are what find indexes.
+    #[test]
+    fn a_command_row_indexes_its_arguments() {
+        assert_eq!(
+            views_of(&command("u1", "explain", "closures")),
+            [("umd-u1".to_string(), "closures".to_string())]
+        );
+        // Neither the name nor the expansion is searchable.
+        let items = [command("u1", "explain", "closures")];
+        assert_eq!(index("explain", &items).total(), 0);
+        assert_eq!(index("template", &items).total(), 0);
+        assert!(index("closures", &items).total() > 0);
+    }
+
+    #[test]
+    fn a_command_without_arguments_has_no_view() {
+        assert!(views_of(&command("u1", "thing", "")).is_empty());
     }
 
     fn index(query: &str, items: &[Item]) -> FindIndex {

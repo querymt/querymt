@@ -11,7 +11,7 @@ use querymt_agent_protocol_types::protocol::{
 };
 use querymt_agent_protocol_types::replay::{
     CompactionIds, QUERYMT_TODO_PLAN_ID, replayable_updates, stamp_compaction_tokens,
-    stored_summary_updates, todo_plan_of, todo_plan_update,
+    stamp_slash_command, stored_summary_updates, todo_plan_of, todo_plan_update,
 };
 
 /// The updates one journal event stands for. Events that carry no
@@ -40,6 +40,7 @@ fn event_updates_inner(event: &Event, ids: &mut CompactionIds) -> Vec<SessionUpd
         AgentEventKind::CompactionStart {
             compaction_id: id,
             token_estimate,
+            slash_command,
         } => {
             let compaction_id = ids.start(id.as_deref(), event.seq);
             let before = ids.start_tokens(&compaction_id, *token_estimate);
@@ -48,6 +49,9 @@ fn event_updates_inner(event: &Event, ids: &mut CompactionIds) -> Vec<SessionUpd
                 CompactionStatus::InProgress,
             ));
             stamp_compaction_tokens(&mut update, Some(before), None);
+            if let Some(record) = slash_command {
+                stamp_slash_command(&mut update, record, None);
+            }
             vec![update]
         }
         AgentEventKind::CompactionSummaryChunk {

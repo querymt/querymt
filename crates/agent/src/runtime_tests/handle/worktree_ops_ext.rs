@@ -2437,6 +2437,7 @@ async fn handoff_announcement_is_durable_and_replayed_without_an_actor() {
         .emit_event_persisted(
             &previous,
             AgentEventKind::PromptReceived {
+                slash_command: None,
                 content: "earlier question".into(),
                 message_id: Some("m-1".into()),
             },
@@ -2465,7 +2466,7 @@ async fn handoff_announcement_is_durable_and_replayed_without_an_actor() {
         .find(|event| {
             matches!(&event.kind, AgentEventKind::WorktreeOwnershipTransferred {
                 workspace_id, successor_session_id, summary_seeded: false,
-            } if *workspace_id == handed.workspace_id && *successor_session_id == handed.session_id)
+            .. } if *workspace_id == handed.workspace_id && *successor_session_id == handed.session_id)
         })
         .expect("durable announcement");
     assert_eq!(announced.session_seq, tip);
@@ -2658,6 +2659,7 @@ async fn load_with_replay_serves_a_previous_owner_without_an_actor() {
         .emit_event_persisted(
             &previous,
             crate::events::AgentEventKind::PromptReceived {
+                slash_command: None,
                 content: "earlier question".into(),
                 message_id: Some("m-1".into()),
             },
@@ -3345,6 +3347,7 @@ async fn owner_archives_itself_and_becomes_read_only() {
         .emit_event_persisted(
             &owner,
             crate::events::AgentEventKind::PromptReceived {
+                slash_command: None,
                 content: "earlier question".into(),
                 message_id: Some("m-1".into()),
             },

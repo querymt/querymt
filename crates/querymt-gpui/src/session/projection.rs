@@ -23,7 +23,7 @@ use serde_json::Value;
 use super::overlay::{Notice, Overlay};
 use super::{
     Compaction, CompactionStatus, ContentFetch, Diff, Item, ItemKind, PendingInput, PlanEntry,
-    Thought, ToolCall, UndoFrame, WorkEntry, content_text, diff_stats, prompt_parts,
+    Thought, ToolCall, UndoFrame, UserCommand, WorkEntry, content_text, diff_stats, prompt_parts,
     synthesized_diffs,
 };
 use crate::usage::{Accounting, Breakdown, TokenUsage};
@@ -574,6 +574,19 @@ fn project_turn(
                     .filter_map(|b| serde_json::to_value(b).ok())
                     .collect();
                 let (text, attachments) = prompt_parts(&blocks);
+                // A record says what the user typed; the blocks are then the
+                // expansion the model received.
+                let (text, command) = match &message.slash_command {
+                    Some(record) => (
+                        typed_command(&record.name, &record.arguments),
+                        Some(UserCommand {
+                            name: record.name.clone(),
+                            arguments: record.arguments.clone(),
+                            expansion: text,
+                        }),
+                    ),
+                    None => (text, None),
+                };
                 rows.push(Item {
                     key: entry.id.clone(),
                     rev: entry.revision,
@@ -581,6 +594,7 @@ fn project_turn(
                         text,
                         attachments,
                         local: message.status != PromptStatus::Sent,
+                        command,
                     },
                 });
                 if message.status == PromptStatus::Failed {
@@ -799,6 +813,15 @@ fn build_tool_call(entry: &ToolCallEntry) -> ToolCall {
     call
 }
 
+/// `/name arguments`, as the user typed it.
+fn typed_command(name: &str, arguments: &str) -> String {
+    if arguments.is_empty() {
+        format!("/{name}")
+    } else {
+        format!("/{name} {arguments}")
+    }
+}
+
 fn compaction_row(entry: &CompactionEntry, interrupted: bool) -> Compaction {
     let status = match entry.state {
         CompactionState::Completed => CompactionStatus::Completed,
@@ -829,6 +852,10 @@ fn compaction_row(entry: &CompactionEntry, interrupted: bool) -> Compaction {
         }),
         tokens_before: count("tokensBefore"),
         tokens_after: count("tokensAfter"),
+        requested: entry
+            .slash_command
+            .as_ref()
+            .map(|record| record.arguments.clone()),
     }
 }
 
@@ -1289,6 +1316,149 @@ mod tests {
             (live_row.tokens_before, live_row.tokens_after)
         );
         assert_eq!(row.detail(), live_row.detail());
+    }
+
+    fn record(name: &str, arguments: &str, source: &str, effect: &str) -> Value {
+        json!({ "name": name, "arguments": arguments, "source": source, "effect": effect })
+    }
+
+    /// A live user message whose blocks are `text`, with an optional record.
+    fn user_text(id: &str, text: &str, command: Option<Value>) -> SessionInput {
+        let mut update = json!({ "sessionUpdate": "user_message_chunk", "messageId": id,
+                                 "content": { "type": "text", "text": text } });
+        if let Some(command) = command {
+            update["_meta"] = json!({ "querymt": { "slashCommand": command } });
+        }
+        live(update)
+    }
+
+    fn user_rows(p: &Projection) -> Vec<(String, Option<UserCommand>)> {
+        p.items
+            .iter()
+            .filter_map(|i| match &i.kind {
+                ItemKind::User { text, command, .. } => Some((text.clone(), command.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    const TEMPLATE: &str = "The user invoked the slash command `/explain` with: closures";
+
+    #[test]
+    fn user_defined_command_shows_what_was_typed() {
+        let mut p = Projection::new("s1");
+        p.feed(&[user_text(
+            "u1",
+            TEMPLATE,
+            Some(record("explain", "closures", "project", "prompt")),
+        )]);
+        assert_eq!(
+            user_rows(&p),
+            vec![(
+                "/explain closures".to_owned(),
+                Some(UserCommand {
+                    name: "explain".into(),
+                    arguments: "closures".into(),
+                    expansion: TEMPLATE.into(),
+                })
+            )]
+        );
+        // A command with no arguments reads as `/name`.
+        let mut bare = Projection::new("s1");
+        bare.feed(&[user_text(
+            "u1",
+            "Do the thing.",
+            Some(record("thing", "", "global", "prompt")),
+        )]);
+        assert_eq!(user_rows(&bare)[0].0, "/thing");
+    }
+
+    #[test]
+    fn reloaded_prompt_command() {
+        let mut live_view = Projection::new("s1");
+        live_view.feed(&[user_text(
+            "u1",
+            TEMPLATE,
+            Some(record("explain", "closures", "project", "prompt")),
+        )]);
+        let mut reloaded = Projection::new("s1");
+        reloaded.feed(&[snapshot(
+            vec![history_event(
+                1,
+                "prompt_received",
+                json!({ "content": TEMPLATE, "message_id": "u1",
+                        "slash_command": record("explain", "closures", "project", "prompt") }),
+            )],
+            json!({}),
+        )]);
+        assert_eq!(user_rows(&reloaded), user_rows(&live_view));
+        assert!(user_rows(&reloaded)[0].1.is_some());
+    }
+
+    #[test]
+    fn compact_with_instructions() {
+        let mut p = Projection::new("s1");
+        p.feed(&[
+            user("u1", None),
+            live(json!({ "sessionUpdate": "compaction_update", "compactionId": "c1",
+                         "status": "in_progress",
+                         "_meta": { "querymt": { "slashCommand":
+                             record("compact", "keep the API decisions", "builtin", "action") } } })),
+        ]);
+        assert_eq!(
+            compaction_of(&p).requested.as_deref(),
+            Some("keep the API decisions")
+        );
+    }
+
+    #[test]
+    fn compact_without_instructions() {
+        let mut p = Projection::new("s1");
+        p.feed(&[
+            user("u1", None),
+            live(
+                json!({ "sessionUpdate": "compaction_update", "compactionId": "c1",
+                         "status": "in_progress",
+                         "_meta": { "querymt": { "slashCommand":
+                             record("compact", "", "builtin", "action") } } }),
+            ),
+        ]);
+        assert_eq!(compaction_of(&p).requested.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn automatic_compaction() {
+        let mut p = Projection::new("s1");
+        p.feed(&[
+            user("u1", None),
+            live(
+                json!({ "sessionUpdate": "compaction_update", "compactionId": "c1",
+                         "status": "in_progress" }),
+            ),
+        ]);
+        assert_eq!(compaction_of(&p).requested, None);
+    }
+
+    #[test]
+    fn agent_without_records() {
+        let mut p = Projection::new("s1");
+        p.feed(&[
+            user_text("u1", "/worktree list", None),
+            agent("a1", "No worktrees.", None),
+        ]);
+        assert_eq!(user_rows(&p), vec![("/worktree list".to_owned(), None)]);
+        assert!(
+            p.items
+                .iter()
+                .any(|i| matches!(&i.kind, ItemKind::Agent { text } if text == "No worktrees."))
+        );
+    }
+
+    #[test]
+    fn prompt_that_only_starts_with_a_slash() {
+        let mut p = Projection::new("s1");
+        p.feed(&[user_text("u1", "/tmp is full, why?", None)]);
+        assert_eq!(user_rows(&p), vec![("/tmp is full, why?".to_owned(), None)]);
     }
 
     #[test]

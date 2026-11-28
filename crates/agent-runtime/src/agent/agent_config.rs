@@ -130,8 +130,11 @@ pub struct AgentConfig {
     pub knowledge_store: Option<Arc<dyn crate::knowledge::KnowledgeStore>>,
     /// Per-session todo lists for the `todowrite` / `todoread` tools.
     pub todo_store: Arc<crate::tools::builtins::todo::TodoStore>,
-    /// Slash command registry for prompt expansion and ACP advertising.
-    pub slash_command_registry: crate::slash_commands::SlashCommandRegistry,
+    /// Agent-level slash command registry for prompt expansion and ACP
+    /// advertising, used by sessions without a registry of their own. It is
+    /// replaceable and shared by every clone of this config, so a reload of
+    /// the global command folder reaches all of them.
+    pub slash_command_registry: Arc<arc_swap::ArcSwap<crate::slash_commands::SlashCommandRegistry>>,
     /// The slash command discovery configuration, retained so workspace-bound
     /// sessions can re-resolve prompt sources from their bound checkout.
     pub slash_commands_config: Option<crate::config::SlashCommandsConfig>,

@@ -55,7 +55,8 @@ impl SlashCommandRegistry {
         config: &crate::config::SlashCommandsConfig,
         workspace_root: &Path,
     ) -> Self {
-        let sources = discovery::search_paths(
+        let sources = discovery::search_paths_with_global(
+            config.global_dir.as_deref(),
             Some(workspace_root),
             config.include_global,
             config.include_project,
@@ -63,6 +64,41 @@ impl SlashCommandRegistry {
         );
         let (registry, _diagnostics) = Self::from_sources(&sources, &config.scripts);
         registry
+    }
+
+    /// Resolve the project root of a session working directory: the root of
+    /// the Git checkout containing `cwd`, or `cwd` itself when it is not in
+    /// a Git repository (or the repository cannot be read). Folders above
+    /// that root are never searched.
+    pub fn project_root_for_cwd(cwd: &Path) -> PathBuf {
+        crate::worktree::resolve_repository(cwd)
+            .map(|repo| repo.checkout.root)
+            .unwrap_or_else(|_| cwd.to_path_buf())
+    }
+
+    /// Build the registry of a local session from its working directory.
+    ///
+    /// Project commands come from [`Self::project_root_for_cwd`]; global and
+    /// configured sources, the scripts policy and the discovery switches
+    /// follow the agent's `slash_commands` config. Materialization, the idle
+    /// catalog and reloads all use this one rule.
+    pub fn registry_for_session_cwd(
+        config: &crate::config::SlashCommandsConfig,
+        cwd: &Path,
+    ) -> Self {
+        Self::registry_with_root_for_session_cwd(config, cwd).1
+    }
+
+    /// Like [`Self::registry_for_session_cwd`], but also returns the project
+    /// root the registry was built from, for callers that must watch or
+    /// reload that same root.
+    pub fn registry_with_root_for_session_cwd(
+        config: &crate::config::SlashCommandsConfig,
+        cwd: &Path,
+    ) -> (PathBuf, Self) {
+        let root = Self::project_root_for_cwd(cwd);
+        let registry = Self::registry_for_workspace(config, &root);
+        (root, registry)
     }
 
     /// Register a single command. Later registrations of the same name overwrite.
@@ -173,6 +209,7 @@ mod tests {
 
     fn make_command(name: &str, description: &str, requires_script: bool) -> SlashCommand {
         SlashCommand {
+            arguments: None,
             name: name.to_string(),
             source: SlashCommandSource::Global(PathBuf::from("/test")),
             path: PathBuf::from(format!("/test/{}.md", name)),
@@ -271,6 +308,69 @@ mod tests {
         let other = TempDir::new().unwrap();
         let other_registry = SlashCommandRegistry::registry_for_workspace(&config, other.path());
         assert!(other_registry.get("deploy").is_none());
+    }
+
+    fn project_only_config() -> crate::config::SlashCommandsConfig {
+        crate::config::SlashCommandsConfig {
+            enabled: true,
+            include_global: false,
+            include_project: true,
+            ..Default::default()
+        }
+    }
+
+    fn write_command(root: &Path, name: &str) {
+        let commands = root.join(".qmt/commands");
+        fs::create_dir_all(&commands).unwrap();
+        fs::write(
+            commands.join(format!("{name}.md")),
+            "---\ndescription: A command\n---\nBody\n",
+        )
+        .unwrap();
+    }
+
+    fn git_init(root: &Path) {
+        let status = std::process::Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .arg(root)
+            .status()
+            .expect("run git init");
+        assert!(status.success());
+    }
+
+    #[test]
+    fn session_registry_uses_the_git_root_of_a_subfolder() {
+        let repo = TempDir::new().unwrap();
+        git_init(repo.path());
+        write_command(repo.path(), "deploy");
+        let sub = repo.path().join("crates/api");
+        fs::create_dir_all(&sub).unwrap();
+
+        let registry = SlashCommandRegistry::registry_for_session_cwd(&project_only_config(), &sub);
+        assert!(registry.get("deploy").is_some());
+    }
+
+    #[test]
+    fn session_registry_uses_a_non_git_folder_itself() {
+        let folder = TempDir::new().unwrap();
+        write_command(folder.path(), "explain");
+
+        let registry =
+            SlashCommandRegistry::registry_for_session_cwd(&project_only_config(), folder.path());
+        assert!(registry.get("explain").is_some());
+    }
+
+    #[test]
+    fn session_registry_does_not_search_parents_outside_git() {
+        let parent = TempDir::new().unwrap();
+        write_command(parent.path(), "lint");
+        let child = parent.path().join("scratch");
+        fs::create_dir_all(&child).unwrap();
+
+        let registry =
+            SlashCommandRegistry::registry_for_session_cwd(&project_only_config(), &child);
+        assert!(registry.get("lint").is_none());
     }
 
     #[test]
@@ -382,22 +482,20 @@ mod tests {
         assert!(reg.get("old").is_some());
 
         let dir = TempDir::new().unwrap();
+        let commands = dir.path().join(".qmt/commands");
+        fs::create_dir_all(&commands).unwrap();
         fs::write(
-            dir.path().join("new.md"),
+            commands.join("new.md"),
             "---\ndescription: New command\n---\nBody\n",
         )
         .unwrap();
 
         let scripts_config = SlashCommandScriptsConfig::default();
-        let diags = reg.reload(Some(dir.path()), true, true, &[], &scripts_config);
+        let diags = reg.reload(Some(dir.path()), false, true, &[], &scripts_config);
         assert!(diags.is_empty());
 
-        // Old command is gone
         assert!(reg.get("old").is_none());
-        // New command from project discovery (under .qmt/commands)
-        // But .qmt/commands doesn't exist in the temp dir, so let's check reload
-        // actually cleared old and didn't add anything (no .qmt/commands dir)
-        assert!(reg.is_empty());
+        assert!(reg.get("new").is_some());
     }
 
     #[test]

@@ -1928,11 +1928,23 @@ impl Message<crate::agent::messages::GetSessionSlashRegistry> for SessionActor {
         _msg: crate::agent::messages::GetSessionSlashRegistry,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        Ok(Arc::new(
-            self.runtime
-                .effective_slash_registry(&self.config.slash_command_registry)
-                .clone(),
-        ))
+        Ok(self
+            .runtime
+            .effective_slash_registry(&self.config.slash_command_registry))
+    }
+}
+
+impl Message<crate::agent::messages::ReloadSlashCommands> for SessionActor {
+    type Reply = Result<(), kameo::error::Infallible>;
+
+    async fn handle(
+        &mut self,
+        _msg: crate::agent::messages::ReloadSlashCommands,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        crate::agent::slash_reload::reload_session(&self.config, &self.runtime, &self.session_id)
+            .await;
+        Ok(())
     }
 }
 
@@ -3108,6 +3120,14 @@ impl Message<SubmitSessionInput> for SessionActor {
                 // Steered text would reach the model verbatim; reject built-ins
                 // regardless of which path submitted them.
                 Builtin::parse_for(&input.prompt, Submission::Steer)?;
+                // So would a user command's text, unexpanded: a command is a
+                // new task, not a correction to the running one.
+                crate::slash_commands::expander::reject_steered_command(
+                    &input.prompt,
+                    &self
+                        .runtime
+                        .effective_slash_registry(&self.config.slash_command_registry),
+                )?;
                 let llm_config = self
                     .config
                     .provider
@@ -4255,6 +4275,13 @@ async fn execute_prompt_inner_unboxed(
                     &mut turn,
                     crate::agent::execution::TRIGGER_MANUAL,
                     instructions,
+                    Some(querymt_agent_core::events::SlashCommandRecord {
+                        name: command.builtin.command_name().to_string(),
+                        arguments: command.args.clone(),
+                        source: querymt_agent_core::events::SlashCommandSource::Builtin,
+                        effect: querymt_agent_core::events::SlashCommandEffect::Action,
+                        client_prompt_id: client_prompt_id.clone(),
+                    }),
                     unresolved,
                 )
                 .await
@@ -4321,20 +4348,34 @@ async fn execute_prompt_inner_unboxed(
 
     // 4. Slash command expansion (before storing user messages)
     let mut req = req;
-    // Managed sessions expand against the registry resolved from their
-    // bound checkout, matching the advertised catalog; legacy local
-    // sessions keep the agent-level registry built at startup.
+    // Sessions expand against the registry resolved from their own project
+    // root, matching the advertised catalog; a session without one uses the
+    // agent-level registry.
+    // Loaded once: this turn keeps the commands it started with.
     let slash_registry = runtime.effective_slash_registry(&config.slash_command_registry);
+    // What the user typed, kept next to the expansion the model receives.
+    let mut slash_record: Option<querymt_agent_core::events::SlashCommandRecord> = None;
     if !restricted
         && let Some(crate::acp::protocol::ContentBlock::Text(text_content)) = req.prompt.first()
         && let Some(expansion) =
-            crate::slash_commands::try_expand(&text_content.text, slash_registry)
+            crate::slash_commands::try_expand(&text_content.text, &slash_registry)
     {
         log::info!(
             "Session {}: expanding slash command '/{}'",
             session_id,
             expansion.invocation.name
         );
+        // The record describes what ran: the command of the registry this
+        // session expands with, not the catalog advertised earlier.
+        slash_record = slash_registry
+            .get(&expansion.invocation.name)
+            .map(|command| querymt_agent_core::events::SlashCommandRecord {
+                name: expansion.invocation.name.clone(),
+                arguments: expansion.invocation.arguments.clone(),
+                source: command.source.wire(),
+                effect: querymt_agent_core::events::SlashCommandEffect::Prompt,
+                client_prompt_id: client_prompt_id.clone(),
+            });
         // Replace the first text block with the expanded prompt
         req.prompt[0] = crate::acp::protocol::ContentBlock::Text(
             crate::acp::protocol::TextContent::new(expansion.prompt_text),
@@ -4441,6 +4482,7 @@ async fn execute_prompt_inner_unboxed(
         config.emit_event(
             &session_id,
             AgentEventKind::UserPromptBlock {
+                slash_command: slash_record.clone(),
                 message_id: message_id.clone(),
                 client_prompt_id: client_prompt_id.clone(),
                 block: block.clone(),
@@ -4451,6 +4493,7 @@ async fn execute_prompt_inner_unboxed(
         .emit_event_persisted(
             &session_id,
             AgentEventKind::PromptReceived {
+                slash_command: slash_record.clone(),
                 content: display_content.clone(),
                 message_id: Some(message_id.clone()),
             },
@@ -5250,6 +5293,20 @@ mod tests {
         }
 
         async fn with_session_id(session_id: &str) -> Self {
+            Self::build(session_id, None).await
+        }
+
+        /// A fixture whose agent has `commands` as its user slash commands.
+        async fn with_slash_commands(
+            commands: crate::slash_commands::SlashCommandRegistry,
+        ) -> Self {
+            Self::build("test-session", Some(commands)).await
+        }
+
+        async fn build(
+            session_id: &str,
+            slash_commands: Option<crate::slash_commands::SlashCommandRegistry>,
+        ) -> Self {
             let mut llm = MockLlmProvider::new();
             llm.expect_chat().returning(|_| {
                 Ok(crate::test_utils::MockChatResponse::text_only("actor fixture reply").into())
@@ -5413,11 +5470,13 @@ mod tests {
                 LLMParams::new().provider("mock").model("mock-model"),
             ));
             let event_journal = Arc::new(FailNextAppendJournal::new(mock_storage.event_journal()));
-            let config = Arc::new(
+            let mut builder =
                 AgentConfigBuilder::from_provider(mock_storage, provider, event_journal.clone())
-                    .with_tool_policy(ToolPolicy::ProviderOnly)
-                    .build(),
-            );
+                    .with_tool_policy(ToolPolicy::ProviderOnly);
+            if let Some(commands) = slash_commands {
+                builder = builder.with_slash_command_registry(commands);
+            }
+            let config = Arc::new(builder.build());
 
             let runtime = crate::agent::core::SessionRuntime::new(
                 None,
@@ -5830,6 +5889,84 @@ mod tests {
             })) => assert_eq!(message, expected),
             other => panic!("expected InvalidPromptContent, got {other:?}"),
         }
+    }
+
+    /// An actor of `f`'s session that has a run in progress, so steering can
+    /// reach it: the one run `run-1` of its own making.
+    fn actor_with_running_run(f: &ActorFixture) -> (kameo::actor::ActorRef<SessionActor>, String) {
+        let run_id = querymt_agent_core::model::TurnId::new();
+        let mut actor = SessionActor::new(
+            f.config.clone(),
+            f._session_id.clone(),
+            crate::agent::core::SessionRuntime::new(
+                None,
+                HashMap::new(),
+                crate::agent::core::McpToolState::empty(),
+            ),
+        );
+        actor.run = RunSlot::Running(
+            ActiveRun::new(run_id, 1, CancellationToken::new()),
+            TurnAuthority::Local,
+        );
+        (SessionActor::spawn(actor), run_id.to_string())
+    }
+
+    fn steer(f: &ActorFixture, run_id: &str, text: &str) -> SubmitSessionInput {
+        let mut submit = text_submit(&f._session_id, text);
+        submit.input.delivery = InputDelivery::Steer;
+        submit.input.expected_run_id = Some(run_id.to_string());
+        submit
+    }
+
+    #[tokio::test]
+    async fn steered_user_defined_command_is_rejected() {
+        let mut commands = crate::slash_commands::SlashCommandRegistry::new();
+        commands.register(slash_test_command("explain", "Explain $ARGUMENTS", None));
+        let f = ActorFixture::with_slash_commands(commands).await;
+        let (actor_ref, run_id) = actor_with_running_run(&f);
+
+        let result = actor_ref.ask(steer(&f, &run_id, "/explain closures")).await;
+
+        match result {
+            Err(kameo::error::SendError::HandlerError(AgentError::InvalidPromptContent {
+                message,
+            })) => {
+                assert!(message.contains("/explain"), "{message}");
+                assert!(message.contains("queue it"), "{message}");
+                assert!(
+                    !message.contains("slash_command_not_steerable"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected InvalidPromptContent, got {other:?}"),
+        }
+        let status = actor_ref.ask(GetRuntimeStatus).await.unwrap();
+        assert_eq!(
+            status.pending_steering_count, 0,
+            "nothing of the submission reaches the running turn"
+        );
+        actor_ref.tell(Shutdown).await.expect("shutdown actor");
+    }
+
+    #[tokio::test]
+    async fn steered_unknown_slash_text_is_accepted() {
+        let mut commands = crate::slash_commands::SlashCommandRegistry::new();
+        commands.register(slash_test_command("explain", "Explain $ARGUMENTS", None));
+        let f = ActorFixture::with_slash_commands(commands).await;
+        let (actor_ref, run_id) = actor_with_running_run(&f);
+
+        let result = actor_ref
+            .ask(steer(&f, &run_id, "/tmp/build.log is empty"))
+            .await
+            .expect("text that names no command is steered as before");
+
+        assert!(
+            matches!(result, SubmitInputResult::Steered { position: 1, .. }),
+            "{result:?}"
+        );
+        let status = actor_ref.ask(GetRuntimeStatus).await.unwrap();
+        assert_eq!(status.pending_steering_count, 1);
+        actor_ref.tell(Shutdown).await.expect("shutdown actor");
     }
 
     #[tokio::test]
@@ -9364,5 +9501,284 @@ mod tests {
         let ids = hook_turn_ids(&captured_inputs(&capture), "pre_compaction");
         assert_eq!(ids, vec![started[1].clone()], "compaction hook turn_id");
         assert_ne!(ids[0], started[0], "not the earlier prompt's run id");
+    }
+
+    // ── slash command records (slash-commands) ──────────────────────────
+
+    fn slash_test_command(
+        name: &str,
+        template: &str,
+        arguments: Option<crate::slash_commands::types::ArgumentsNeed>,
+    ) -> crate::slash_commands::SlashCommand {
+        crate::slash_commands::SlashCommand {
+            name: name.to_string(),
+            source: crate::slash_commands::SlashCommandSource::Project(std::path::PathBuf::from(
+                "/proj",
+            )),
+            path: std::path::PathBuf::from(format!("/proj/{name}.md")),
+            description: format!("{name} command"),
+            argument_hint: None,
+            tags: Vec::new(),
+            template: template.to_string(),
+            script: None,
+            requires_script: false,
+            arguments,
+        }
+    }
+
+    async fn slash_fixture() -> (crate::test_utils::UndoTestFixture, String) {
+        use crate::slash_commands::types::ArgumentsNeed;
+        let mut commands = crate::slash_commands::SlashCommandRegistry::new();
+        commands.register(slash_test_command("explain", "Explain $ARGUMENTS", None));
+        commands.register(slash_test_command(
+            "needs-input",
+            "Handle $ARGUMENTS",
+            Some(ArgumentsNeed::Required),
+        ));
+        let fixture = crate::test_utils::UndoTestFixture::with_provider_and_slash_commands(
+            text_provider(),
+            commands,
+        )
+        .await
+        .unwrap();
+        let session = fixture.create_session().await.unwrap();
+        crate::agent::undo_integration_tests::bind_mock_llm(&fixture, &session)
+            .await
+            .unwrap();
+        (fixture, session)
+    }
+
+    /// Every event of `session` up to and including the completion of the
+    /// first run that started after `events` was subscribed.
+    async fn events_until_run_completed(
+        events: &mut tokio::sync::broadcast::Receiver<
+            Arc<querymt_agent_core::events::EventEnvelope>,
+        >,
+        session: &str,
+    ) -> Vec<AgentEventKind> {
+        let mut seen = Vec::new();
+        let wait = async {
+            loop {
+                let envelope = events.recv().await.expect("event stream open");
+                if envelope.session_id() != session {
+                    continue;
+                }
+                let done = matches!(envelope.kind(), AgentEventKind::RunCompleted { .. });
+                seen.push(envelope.kind().clone());
+                if done {
+                    return;
+                }
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), wait)
+            .await
+            .expect("the run completes");
+        seen
+    }
+
+    fn client_prompt_meta(id: &str) -> crate::acp::protocol::Meta {
+        crate::acp::protocol::Meta::from_iter([(
+            "querymt".to_string(),
+            serde_json::json!({ "client_prompt_id": id }),
+        )])
+    }
+
+    /// Submit `prompt` with `session/prompt` and collect the run's events.
+    async fn prompt_events(
+        fixture: &crate::test_utils::UndoTestFixture,
+        session: &str,
+        prompt: Vec<crate::acp::protocol::ContentBlock>,
+        client_prompt_id: Option<&str>,
+    ) -> Vec<AgentEventKind> {
+        use crate::send_agent::SendAgent;
+        let mut events = fixture.handle.config.subscribe_events();
+        let mut request = crate::acp::protocol::PromptRequest::new(session.to_owned(), prompt);
+        if let Some(id) = client_prompt_id {
+            request = request.meta(client_prompt_meta(id));
+        }
+        SendAgent::prompt(&fixture.handle, request)
+            .await
+            .expect("prompt");
+        events_until_run_completed(&mut events, session).await
+    }
+
+    fn text_block(text: &str) -> crate::acp::protocol::ContentBlock {
+        crate::acp::protocol::ContentBlock::Text(crate::acp::protocol::TextContent::new(text))
+    }
+
+    fn prompt_blocks(
+        events: &[AgentEventKind],
+    ) -> Vec<(
+        &Option<querymt_agent_core::events::SlashCommandRecord>,
+        String,
+    )> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEventKind::UserPromptBlock {
+                    slash_command,
+                    block,
+                    ..
+                } => Some((slash_command, serde_json::to_string(block).unwrap())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn prompt_received_record(
+        events: &[AgentEventKind],
+    ) -> Option<querymt_agent_core::events::SlashCommandRecord> {
+        events.iter().find_map(|event| match event {
+            AgentEventKind::PromptReceived { slash_command, .. } => Some(slash_command.clone()),
+            _ => None,
+        })?
+    }
+
+    fn explain_record(
+        arguments: &str,
+        client_prompt_id: Option<&str>,
+    ) -> querymt_agent_core::events::SlashCommandRecord {
+        querymt_agent_core::events::SlashCommandRecord {
+            name: "explain".into(),
+            arguments: arguments.into(),
+            source: querymt_agent_core::events::SlashCommandSource::Project,
+            effect: querymt_agent_core::events::SlashCommandEffect::Prompt,
+            client_prompt_id: client_prompt_id.map(str::to_owned),
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_command_user_message_carries_the_record() {
+        let (fixture, session) = slash_fixture().await;
+        let events = prompt_events(
+            &fixture,
+            &session,
+            vec![text_block("/explain closures")],
+            Some("c1"),
+        )
+        .await;
+
+        let blocks = prompt_blocks(&events);
+        assert_eq!(blocks.len(), 1, "{events:?}");
+        let (record, block) = &blocks[0];
+        assert_eq!(**record, Some(explain_record("closures", Some("c1"))));
+        // The content stays the expansion the model receives.
+        assert!(
+            block.contains("The user invoked the slash command"),
+            "{block}"
+        );
+        assert!(block.contains("Explain closures"), "{block}");
+        assert_eq!(
+            prompt_received_record(&events),
+            Some(explain_record("closures", Some("c1")))
+        );
+    }
+
+    #[tokio::test]
+    async fn attachment_chunks_of_a_prompt_command_carry_the_record() {
+        let (fixture, session) = slash_fixture().await;
+        let attachment = crate::acp::protocol::ContentBlock::ResourceLink(
+            crate::acp::protocol::ResourceLink::new("diagram.png", "file:///tmp/diagram.png"),
+        );
+        let events = prompt_events(
+            &fixture,
+            &session,
+            vec![text_block("/explain this diagram"), attachment],
+            None,
+        )
+        .await;
+
+        let blocks = prompt_blocks(&events);
+        assert_eq!(blocks.len(), 2, "{events:?}");
+        for (record, _) in &blocks {
+            assert_eq!(**record, Some(explain_record("this diagram", None)));
+        }
+        assert!(blocks[1].1.contains("diagram.png"), "{}", blocks[1].1);
+    }
+
+    #[tokio::test]
+    async fn unknown_slash_text_carries_no_record() {
+        let (fixture, session) = slash_fixture().await;
+        let events = prompt_events(
+            &fixture,
+            &session,
+            vec![text_block("/tmp/build.log is empty")],
+            Some("c1"),
+        )
+        .await;
+
+        let blocks = prompt_blocks(&events);
+        assert_eq!(blocks.len(), 1, "{events:?}");
+        assert!(blocks[0].0.is_none());
+        assert!(blocks[0].1.contains("/tmp/build.log is empty"));
+        assert_eq!(prompt_received_record(&events), None);
+    }
+
+    #[tokio::test]
+    async fn command_name_case_must_match() {
+        let (fixture, session) = slash_fixture().await;
+        // The built-in is `/compact`; a user command is `explain`.
+        for text in ["/COMPACT", "/EXPLAIN closures"] {
+            let events = prompt_events(&fixture, &session, vec![text_block(text)], None).await;
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, AgentEventKind::CompactionStart { .. })),
+                "{text}: no compaction starts"
+            );
+            let blocks = prompt_blocks(&events);
+            assert_eq!(blocks.len(), 1, "{text}: {events:?}");
+            assert!(blocks[0].0.is_none(), "{text}");
+            assert!(blocks[0].1.contains(text), "{text}: {}", blocks[0].1);
+            assert_eq!(prompt_received_record(&events), None, "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_command_record_has_no_client_prompt_id() {
+        use crate::send_agent::SendAgent;
+        let (fixture, session) = slash_fixture().await;
+        let mut events = fixture.handle.config.subscribe_events();
+        let params = serde_json::json!({
+            "session_id": session,
+            "prompt": [{"type": "text", "text": "/explain closures"}],
+        })
+        .to_string();
+        SendAgent::ext_method(
+            &fixture.handle,
+            crate::acp::protocol::ExtRequest::new(
+                "querymt/session/queue",
+                serde_json::value::RawValue::from_string(params)
+                    .unwrap()
+                    .into(),
+            ),
+        )
+        .await
+        .expect("queue the command");
+        let events = events_until_run_completed(&mut events, &session).await;
+
+        let blocks = prompt_blocks(&events);
+        assert_eq!(blocks.len(), 1, "{events:?}");
+        assert_eq!(blocks[0].0, &Some(explain_record("closures", None)));
+    }
+
+    #[tokio::test]
+    async fn required_input_is_not_enforced() {
+        let (fixture, session) = slash_fixture().await;
+        let events =
+            prompt_events(&fixture, &session, vec![text_block("/needs-input")], None).await;
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEventKind::RunStarted { .. })),
+            "the turn starts: {events:?}"
+        );
+        let blocks = prompt_blocks(&events);
+        assert_eq!(blocks.len(), 1);
+        let record = blocks[0].0.as_ref().expect("the command is recorded");
+        assert_eq!(record.name, "needs-input");
+        assert_eq!(record.arguments, "");
+        assert!(blocks[0].1.contains("Handle "), "{}", blocks[0].1);
     }
 }

@@ -1749,6 +1749,7 @@ mod stdio_tests {
             origin: querymt_agent_core::events::EventOrigin::Local,
             source_node: None,
             kind: querymt_agent_core::events::AgentEventKind::PromptReceived {
+                slash_command: None,
                 content: "flattened summary".to_string(),
                 message_id: Some("stored-message-id".to_string()),
             },
@@ -1889,6 +1890,7 @@ mod stdio_tests {
             .emit_event_persisted(
                 &session_id,
                 querymt_agent_core::events::AgentEventKind::PromptReceived {
+                    slash_command: None,
                     content: "flattened summary".to_string(),
                     message_id: Some("stored-message-id".to_string()),
                 },

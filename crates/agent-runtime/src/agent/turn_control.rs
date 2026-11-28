@@ -92,8 +92,6 @@ pub enum TurnControlError {
     QueueFull,
     #[error("steering input is too large ({bytes} bytes, maximum {max_bytes})")]
     InputTooLarge { bytes: usize, max_bytes: usize },
-    #[error("slash commands cannot be delivered as steering; queue the input instead")]
-    SlashCommandNotSteerable,
     #[error("submission session mismatch: expected {expected}, received {received}")]
     SessionMismatch { expected: String, received: String },
 }
@@ -107,7 +105,6 @@ impl TurnControlError {
             Self::RunClosing { .. } => "run_closing",
             Self::QueueFull => "queue_full",
             Self::InputTooLarge { .. } => "input_too_large",
-            Self::SlashCommandNotSteerable => "slash_command_not_steerable",
             Self::SessionMismatch { .. } => "session_mismatch",
         }
     }
@@ -162,11 +159,6 @@ impl SteeringInbox {
                 bytes,
                 max_bytes: MAX_STEERING_INPUT_BYTES,
             });
-        }
-        if let Some(ContentBlock::Text(text)) = blocks.first()
-            && text.text.trim_start().starts_with('/')
-        {
-            return Err(TurnControlError::SlashCommandNotSteerable);
         }
 
         let mut state = self.state.lock().await;
@@ -277,17 +269,5 @@ mod tests {
             inbox.push("c".into(), None, text("three")).await,
             Err(TurnControlError::RunClosing { .. })
         ));
-    }
-
-    #[tokio::test]
-    async fn inbox_rejects_slash_commands() {
-        let inbox = SteeringInbox::new(TurnId::new());
-        assert_eq!(
-            inbox
-                .push("a".into(), None, text(" /compact"))
-                .await
-                .unwrap_err(),
-            TurnControlError::SlashCommandNotSteerable
-        );
     }
 }

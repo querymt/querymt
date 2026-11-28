@@ -784,6 +784,7 @@ mod tests {
                 &f.storage,
                 &sid,
                 AgentEventKind::PromptReceived {
+                    slash_command: None,
                     content: format!("prompt {i}"),
                     message_id: Some(message_id.clone()),
                 },
@@ -832,6 +833,78 @@ mod tests {
                 .unwrap();
         }
         sid
+    }
+
+    /// The record of a prompt command survives the journal and reaches the
+    /// snapshot's `prompt_received` event, next to the prompt record that
+    /// holds the expansion.
+    #[tokio::test]
+    async fn load_snapshot_keeps_the_record_of_a_prompt_command() {
+        use crate::session::run_reconcile::tests::seed;
+        use querymt_agent_core::events::{
+            AgentEventKind, SlashCommandEffect, SlashCommandRecord, SlashCommandSource,
+        };
+
+        let f = crate::session::run_reconcile::tests::fixture().await;
+        let sid = f
+            .storage
+            .create_session(None, None, None, None)
+            .await
+            .unwrap()
+            .public_id;
+        let record = SlashCommandRecord {
+            name: "explain".into(),
+            arguments: "closures".into(),
+            source: SlashCommandSource::Project,
+            effect: SlashCommandEffect::Prompt,
+            client_prompt_id: Some("c1".into()),
+        };
+        seed(
+            &f.storage,
+            &sid,
+            AgentEventKind::PromptReceived {
+                slash_command: Some(record.clone()),
+                content: "The user invoked the slash command `/explain`.".into(),
+                message_id: Some("prompt-0".into()),
+            },
+        )
+        .await;
+        f.storage
+            .add_message(
+                &sid,
+                querymt_agent_core::model::AgentMessage {
+                    id: "prompt-0".into(),
+                    session_id: sid.clone(),
+                    role: querymt::chat::ChatRole::User,
+                    parts: vec![querymt_agent_core::model::MessagePart::Prompt {
+                        blocks: vec![crate::acp::protocol::ContentBlock::Text(
+                            crate::acp::protocol::TextContent::new(
+                                "The user invoked the slash command `/explain`.",
+                            ),
+                        )],
+                    }],
+                    created_at: 1_000,
+                    parent_message_id: None,
+                    source_provider: None,
+                    source_model: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let snapshot = windowed(&f, &sid, 10).await;
+
+        let carried: Vec<_> = snapshot
+            .audit
+            .events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                AgentEventKind::PromptReceived { slash_command, .. } => Some(slash_command),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(carried, vec![&Some(record)]);
+        assert_eq!(prompt_ids(&snapshot), vec!["prompt-0".to_string()]);
     }
 
     fn prompt_ids(snapshot: &SessionLoadSnapshot) -> Vec<String> {
@@ -1070,6 +1143,7 @@ mod tests {
                 &f.storage,
                 &sid,
                 AgentEventKind::PromptReceived {
+                    slash_command: None,
                     content: format!("prompt {i}"),
                     message_id: Some(prompt_id.clone()),
                 },

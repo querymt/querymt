@@ -336,6 +336,7 @@ mod tests {
 
     fn text(content: impl Into<String>) -> AgentEventKind {
         AgentEventKind::PromptReceived {
+            slash_command: None,
             content: content.into(),
             message_id: None,
         }

@@ -1,5 +1,39 @@
+use crate::acp::protocol::ContentBlock;
 use crate::slash_commands::registry::SlashCommandRegistry;
 use crate::slash_commands::types::{SlashCommandExpansion, SlashCommandInvocation};
+
+/// A steering submission that names a command of the session's catalog.
+///
+/// A command is a new task, not a correction to the running one, so it is
+/// never steered into a live turn.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("/{name} cannot be steered into a running turn; queue it or submit it with session/prompt")]
+pub struct SteeredCommandError {
+    /// The command's name, without the slash.
+    pub name: String,
+}
+
+/// Reject a steering `prompt` whose first text block names a command of
+/// `registry`. Text that names no command passes, as does any prompt whose
+/// first block is not text.
+///
+/// # Errors
+///
+/// [`SteeredCommandError`] naming the recognised command.
+pub fn reject_steered_command(
+    prompt: &[ContentBlock],
+    registry: &SlashCommandRegistry,
+) -> Result<(), SteeredCommandError> {
+    let Some(ContentBlock::Text(text)) = prompt.first() else {
+        return Ok(());
+    };
+    match try_parse_invocation(&text.text, registry) {
+        Some(invocation) => Err(SteeredCommandError {
+            name: invocation.name,
+        }),
+        None => Ok(()),
+    }
+}
 
 /// Try to parse a slash command invocation from user text.
 ///
@@ -106,6 +140,7 @@ mod tests {
         let mut reg = SlashCommandRegistry::new();
         for (name, template) in commands {
             reg.register(SlashCommand {
+                arguments: None,
                 name: name.to_string(),
                 source: crate::slash_commands::types::SlashCommandSource::Global(PathBuf::from(
                     "/test",

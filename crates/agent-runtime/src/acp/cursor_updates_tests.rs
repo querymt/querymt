@@ -50,6 +50,7 @@ fn turn() -> Vec<AgentEvent> {
         agent_event(
             1,
             AgentEventKind::PromptReceived {
+                slash_command: None,
                 content: "hello".into(),
                 message_id: Some("u1".into()),
             },
@@ -91,6 +92,7 @@ fn compaction() -> Vec<AgentEvent> {
         agent_event(
             5,
             AgentEventKind::CompactionStart {
+                slash_command: None,
                 token_estimate: 100,
                 compaction_id: Some("cmp-1".into()),
             },
@@ -404,6 +406,7 @@ fn announced_cursor_memory_is_bounded() {
         envelope(&agent_event(
             n as i64,
             AgentEventKind::PromptReceived {
+                slash_command: None,
                 content: "hi".into(),
                 message_id: Some(format!("u{n}")),
             },
@@ -442,6 +445,7 @@ fn structured_prompt_cursor_follows_all_of_its_blocks() {
         agent_event(
             1,
             AgentEventKind::UserPromptBlock {
+                slash_command: None,
                 message_id: "u1".into(),
                 client_prompt_id: None,
                 block: ContentBlock::Text(TextContent::new(text)),
@@ -454,6 +458,7 @@ fn structured_prompt_cursor_follows_all_of_its_blocks() {
         agent_event(
             2,
             AgentEventKind::PromptReceived {
+                slash_command: None,
                 content: "first second".into(),
                 message_id: Some("u1".into()),
             },
