@@ -596,6 +596,16 @@ mod ui_tests {
         })
     }
 
+    fn clear_composer(cx: &mut TestAppContext, rig: &Rig) {
+        let select_all = if cfg!(target_os = "macos") {
+            "cmd-a backspace"
+        } else {
+            "ctrl-a backspace"
+        };
+        keys(cx, rig, select_all);
+        assert!(text(cx, rig).is_empty(), "the composer was not cleared");
+    }
+
     /// Names in the list as it renders now (empty when it is not shown).
     fn listed(cx: &mut TestAppContext, rig: &Rig) -> Vec<String> {
         cx.update_window(rig.handle, |_, window, cx| {
@@ -773,7 +783,7 @@ mod ui_tests {
         type_text(cx, &rig, "see a/b");
         assert!(listed(cx, &rig).is_empty());
         // Also a command word after other text, and past the first word.
-        keys(cx, &rig, "cmd-a backspace");
+        clear_composer(cx, &rig);
         type_text(cx, &rig, "/compact focus /w");
         assert!(listed(cx, &rig).is_empty());
     }
@@ -855,8 +865,9 @@ mod ui_tests {
             "the highlighted command completes"
         );
         // A new query starts at the best match again.
-        keys(cx, &rig, "cmd-a backspace");
+        clear_composer(cx, &rig);
         type_text(cx, &rig, "/");
+        assert!(!listed(cx, &rig).is_empty(), "the list reopened");
         assert_eq!(
             rig.app.read_with(cx, |a, cx| a.pane.read(cx).slash_cursor),
             0
@@ -1007,7 +1018,7 @@ mod ui_tests {
         // The same after the palette puts `/compact ` in the composer.
         type_text(cx, &rig, "focus");
         assert!(!hint_shown(cx), "arguments typed: the hint is gone");
-        keys(cx, &rig, "cmd-a backspace");
+        clear_composer(cx, &rig);
         assert!(!hint_shown(cx), "no command, no hint");
         cx.update_window(rig.handle, |_, window, cx| {
             rig.app.update(cx, |app, cx| {
@@ -1019,7 +1030,7 @@ mod ui_tests {
         assert_eq!(text(cx, &rig), "/compact ");
         assert!(hint_shown(cx), "the palette path shows it too");
         // A command without a hint shows none.
-        keys(cx, &rig, "cmd-a backspace");
+        clear_composer(cx, &rig);
         type_text(cx, &rig, "/worktree ");
         assert!(!hint_shown(cx));
     }
