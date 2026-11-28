@@ -418,16 +418,119 @@ impl DelegationOrchestrator {
     async fn claim_delegation(&self, delegation_id: &str) -> SessionResult<DelegationClaim> {
         const MAX_ATTEMPTS: usize = 3;
         let mut attempt = 1;
+        // Recorded on the enclosing `delegation.claim` span; i64 so the OTel
+        // exporter keeps it numeric.
+        let span = tracing::Span::current();
         loop {
             match self.store.claim_delegation(delegation_id).await {
-                Ok(result) => return Ok(result),
+                Ok(result) => {
+                    span.record("attempts", attempt as i64);
+                    return Ok(result);
+                }
                 Err(err) if err.is_transient() && attempt < MAX_ATTEMPTS => {
                     attempt += 1;
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    span.record("attempts", attempt as i64);
+                    return Err(err);
+                }
             }
         }
+    }
+
+    /// Binds the request to this orchestrator's profile and claims it.
+    /// Returns whether this orchestrator should execute the delegation.
+    /// Runs under the `delegation.claim` span.
+    async fn claim_request(
+        &self,
+        delegator: &Arc<crate::agent::LocalAgentHandle>,
+        session_id: &str,
+        delegation: &Delegation,
+    ) -> bool {
+        if let Some(profile_id) = self.profile_id.as_deref() {
+            let mut last_error = None;
+            let mut binding_result = None;
+            for attempt in 0..3 {
+                match self.store.get_profile_binding(session_id).await {
+                    Ok(result) => {
+                        binding_result = Some(result);
+                        break;
+                    }
+                    Err(err) => {
+                        last_error = Some(err);
+                        if attempt < 2 {
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        }
+                    }
+                }
+            }
+
+            match binding_result {
+                Some(Some(owner)) if owner == profile_id => {}
+                Some(Some(_)) => return false,
+                // Live profile sessions must already be bound. Legacy support belongs in
+                // session loading, where one deterministic profile could be backfilled.
+                Some(None) => {
+                    error!(
+                        "Ignoring delegation {} from unbound session {}",
+                        delegation.public_id, session_id
+                    );
+                    return false;
+                }
+                None => {
+                    let error_message = format!(
+                        "Failed to resolve profile owner for delegation {} after retries: {}",
+                        delegation.public_id,
+                        last_error
+                            .as_ref()
+                            .map(|e| e.to_string())
+                            .unwrap_or_else(|| "unknown error".to_string())
+                    );
+                    self.fail_unclaimed_delegation(delegation, session_id, &error_message)
+                        .await;
+                    return false;
+                }
+            }
+        }
+        match self.claim_delegation(&delegation.public_id).await {
+            Ok(DelegationClaim::Claimed) => {}
+            Ok(DelegationClaim::AlreadyClaimed) => {
+                debug!(
+                    "Delegation {} was already claimed; ignoring duplicate request",
+                    delegation.public_id
+                );
+                return false;
+            }
+            Ok(DelegationClaim::NotFound) => {
+                emit_delegation_event(
+                    delegator,
+                    session_id,
+                    AgentEventKind::DelegationFailed {
+                        delegation_id: delegation.public_id.clone(),
+                        error: "Delegation record was not found".to_string(),
+                    },
+                );
+                return false;
+            }
+            Ok(DelegationClaim::InvalidState(status)) => {
+                debug!(
+                    "Delegation {} is already terminal ({status:?}); ignoring request",
+                    delegation.public_id
+                );
+                return false;
+            }
+            Err(err) => {
+                self.fail_unclaimed_delegation(
+                    delegation,
+                    session_id,
+                    &format!("Failed to claim delegation before execution: {err}"),
+                )
+                .await;
+                return false;
+            }
+        }
+        true
     }
 
     /// Process a single event envelope.
@@ -448,87 +551,14 @@ impl DelegationOrchestrator {
                 ..
             } => {
                 tracing::Span::current().record("event_kind", "DelegationRequested");
-                if let Some(profile_id) = self.profile_id.as_deref() {
-                    let mut last_error = None;
-                    let mut binding_result = None;
-                    for attempt in 0..3 {
-                        match self.store.get_profile_binding(session_id).await {
-                            Ok(result) => {
-                                binding_result = Some(result);
-                                break;
-                            }
-                            Err(err) => {
-                                last_error = Some(err);
-                                if attempt < 2 {
-                                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                                }
-                            }
-                        }
-                    }
-
-                    match binding_result {
-                        Some(Some(owner)) if owner == profile_id => {}
-                        Some(Some(_)) => return,
-                        // Live profile sessions must already be bound. Legacy support belongs in
-                        // session loading, where one deterministic profile could be backfilled.
-                        Some(None) => {
-                            error!(
-                                "Ignoring delegation {} from unbound session {}",
-                                delegation.public_id, session_id
-                            );
-                            return;
-                        }
-                        None => {
-                            let error_message = format!(
-                                "Failed to resolve profile owner for delegation {} after retries: {}",
-                                delegation.public_id,
-                                last_error
-                                    .as_ref()
-                                    .map(|e| e.to_string())
-                                    .unwrap_or_else(|| "unknown error".to_string())
-                            );
-                            self.fail_unclaimed_delegation(delegation, session_id, &error_message)
-                                .await;
-                            return;
-                        }
-                    }
-                }
-                match self.claim_delegation(&delegation.public_id).await {
-                    Ok(DelegationClaim::Claimed) => {}
-                    Ok(DelegationClaim::AlreadyClaimed) => {
-                        debug!(
-                            "Delegation {} was already claimed; ignoring duplicate request",
-                            delegation.public_id
-                        );
-                        return;
-                    }
-                    Ok(DelegationClaim::NotFound) => {
-                        emit_delegation_event(
-                            &delegator,
-                            session_id,
-                            AgentEventKind::DelegationFailed {
-                                delegation_id: delegation.public_id.clone(),
-                                error: "Delegation record was not found".to_string(),
-                            },
-                        );
-                        return;
-                    }
-                    Ok(DelegationClaim::InvalidState(status)) => {
-                        debug!(
-                            "Delegation {} is already terminal ({status:?}); ignoring request",
-                            delegation.public_id
-                        );
-                        return;
-                    }
-                    Err(err) => {
-                        self.fail_unclaimed_delegation(
-                            delegation,
-                            session_id,
-                            &format!("Failed to claim delegation before execution: {err}"),
-                        )
-                        .await;
-                        return;
-                    }
+                let claim_span =
+                    tracing::info_span!("delegation.claim", attempts = tracing::field::Empty);
+                if !self
+                    .claim_request(&delegator, session_id, delegation)
+                    .instrument(claim_span)
+                    .await
+                {
+                    return;
                 }
 
                 let target_handle = self
@@ -604,10 +634,21 @@ impl DelegationOrchestrator {
                 let handle = tokio::spawn(
                     async move {
                         let delegator = delegator_for_task;
-                        if start_rx.await.is_err() {
-                            return;
+                        // Sibling of `delegation.execute` under the handler span:
+                        // the permit is taken before execution starts. Opened here
+                        // so the hand-off from `handle_envelope` is covered too.
+                        let permit = async {
+                            if start_rx.await.is_err() {
+                                return None;
+                            }
+                            Some(max_parallel.acquire_owned().await)
                         }
-                        let _permit = match max_parallel.acquire_owned().await {
+                        .instrument(tracing::info_span!("delegation.queue_wait"))
+                        .await;
+                        let Some(permit) = permit else {
+                            return;
+                        };
+                        let _permit = match permit {
                             Ok(permit) => permit,
                             Err(_) => {
                                 fail_delegation(
@@ -1045,6 +1086,14 @@ async fn execute_delegation_unboxed(
             mesh.as_ref(),
         )
         .await?;
+        tracing::Span::current().record(
+            "authority",
+            match &authority {
+                TurnAuthority::Local => "local",
+                #[cfg(feature = "remote")]
+                TurnAuthority::Peer(_) => "peer",
+            },
+        );
         #[cfg(not(feature = "remote"))]
         let restricted = false;
         #[cfg(feature = "remote")]
@@ -1070,6 +1119,10 @@ async fn execute_delegation_unboxed(
         };
         Ok::<_, anyhow::Error>((authority, restricted))
     }
+    .instrument(tracing::info_span!(
+        "delegation.admission",
+        authority = tracing::field::Empty,
+    ))
     .await;
     let (authority, restricted) = match admission {
         Ok(admitted) => admitted,
@@ -1238,132 +1291,128 @@ async fn execute_delegation_inner_unboxed(
         return;
     }
 
-    // Snapshot the parent's current per-session setting. UI changes persist this value
-    // before returning, so delegation inherits the value active when it starts.
-    let parent_reasoning_effort = match ctx.store.get_session_llm_config(&parent_session_id).await {
-        Ok(Some(config)) => match reasoning_effort_from_llm_config(&config) {
-            Ok(effort) => effort,
-            Err(err) => {
-                let error_message = format!(
-                    "Failed to read reasoning effort from parent session '{}': {err}",
-                    parent_session_id
-                );
-                fail_delegation(
-                    DelegationFailureContext {
-                        delegator: &ctx.delegator,
-                        store: &ctx.store,
-                        hooks: Some(&ctx.hooks),
-                        parent_session_id: &parent_session_id,
-                        delegation_id: &delegation.public_id,
-                        target_agent_id: Some(&delegation.target_agent_id),
-                        objective: Some(&delegation.objective),
-                        child_session: None,
-                        execution_cwd: None,
-                    },
-                    &error_message,
-                )
-                .await;
-                ctx.active_delegations.lock().await.remove(&delegation_id);
-                return;
-            }
-        },
-        Ok(None) => {
-            let error_message = format!(
-                "Parent session '{}' has no LLM configuration",
-                parent_session_id
-            );
-            fail_delegation(
-                DelegationFailureContext {
-                    delegator: &ctx.delegator,
-                    store: &ctx.store,
-                    hooks: Some(&ctx.hooks),
-                    parent_session_id: &parent_session_id,
-                    delegation_id: &delegation.public_id,
-                    target_agent_id: Some(&delegation.target_agent_id),
-                    objective: Some(&delegation.objective),
-                    child_session: None,
-                    execution_cwd: None,
-                },
-                &error_message,
-            )
-            .await;
-            ctx.active_delegations.lock().await.remove(&delegation_id);
-            return;
-        }
-        Err(err) => {
-            let error_message = format!(
-                "Failed to load LLM configuration for parent session '{}': {err}",
-                parent_session_id
-            );
-            fail_delegation(
-                DelegationFailureContext {
-                    delegator: &ctx.delegator,
-                    store: &ctx.store,
-                    hooks: Some(&ctx.hooks),
-                    parent_session_id: &parent_session_id,
-                    delegation_id: &delegation.public_id,
-                    target_agent_id: Some(&delegation.target_agent_id),
-                    objective: Some(&delegation.objective),
-                    child_session: None,
-                    execution_cwd: None,
-                },
-                &error_message,
-            )
-            .await;
-            ctx.active_delegations.lock().await.remove(&delegation_id);
-            return;
-        }
-    };
+    // Resolve everything the delegation inherits from its parent under one
+    // span: reasoning effort, effective cwd and, for a fresh isolated
+    // delegation, the parent's workspace record. A failure carries the
+    // message and the execution cwd to report.
+    let resolve_parent_span =
+        tracing::info_span!("delegation.resolve_parent", bound = tracing::field::Empty,);
+    let resolved: Result<_, (String, Option<PathBuf>)> = async {
+        // Snapshot the parent's current per-session setting. UI changes persist this value
+        // before returning, so delegation inherits the value active when it starts.
+        let parent_reasoning_effort =
+            match ctx.store.get_session_llm_config(&parent_session_id).await {
+                Ok(Some(config)) => reasoning_effort_from_llm_config(&config).map_err(|err| {
+                    (
+                        format!(
+                            "Failed to read reasoning effort from parent session '{}': {err}",
+                            parent_session_id
+                        ),
+                        None,
+                    )
+                })?,
+                Ok(None) => {
+                    return Err((
+                        format!(
+                            "Parent session '{}' has no LLM configuration",
+                            parent_session_id
+                        ),
+                        None,
+                    ));
+                }
+                Err(err) => {
+                    return Err((
+                        format!(
+                            "Failed to load LLM configuration for parent session '{}': {err}",
+                            parent_session_id
+                        ),
+                        None,
+                    ));
+                }
+            };
 
-    // 1. Create session via AgentHandle trait
-    // Resolve the parent's effective cwd through the single session-cwd
-    // resolution path (worktree::WorkspaceService::resolve_session_cwd):
-    // the durable workspace binding wins over the persisted row cwd, which
-    // a fork copies from its source checkout. A bound parent whose
-    // workspace cannot be resolved fails the delegation closed — the child
-    // is never launched into a shared or source checkout as a fallback.
-    let persisted_parent_cwd = match ctx.store.get_session(&parent_session_id).await {
-        Ok(Some(session)) => session.cwd,
-        Ok(None) => {
-            warn!("Parent session not found for cwd lookup, using orchestrator default");
-            None
-        }
-        Err(_) => {
-            warn!("Failed to lookup parent session cwd, using orchestrator default");
-            None
-        }
-    };
-    let effective_cwd = match ctx.workspace_service.as_ref() {
-        Some(service) => {
-            match service
+        // 1. Create session via AgentHandle trait
+        // Resolve the parent's effective cwd through the single session-cwd
+        // resolution path (worktree::WorkspaceService::resolve_session_cwd):
+        // the durable workspace binding wins over the persisted row cwd, which
+        // a fork copies from its source checkout. A bound parent whose
+        // workspace cannot be resolved fails the delegation closed — the child
+        // is never launched into a shared or source checkout as a fallback.
+        let persisted_parent_cwd = match ctx.store.get_session(&parent_session_id).await {
+            Ok(Some(session)) => session.cwd,
+            Ok(None) => {
+                warn!("Parent session not found for cwd lookup, using orchestrator default");
+                None
+            }
+            Err(_) => {
+                warn!("Failed to lookup parent session cwd, using orchestrator default");
+                None
+            }
+        };
+        let effective_cwd = match ctx.workspace_service.as_ref() {
+            Some(service) => service
                 .resolve_session_cwd(&parent_session_id, persisted_parent_cwd.clone())
                 .await
-            {
-                Ok(resolved) => resolved,
-                Err(err) => {
-                    fail_delegation(
-                        DelegationFailureContext {
-                            delegator: &ctx.delegator,
-                            store: &ctx.store,
-                            hooks: Some(&ctx.hooks),
-                            parent_session_id: &parent_session_id,
-                            delegation_id: &delegation.public_id,
-                            target_agent_id: Some(&delegation.target_agent_id),
-                            objective: Some(&delegation.objective),
-                            execution_cwd: None,
-                            child_session: None,
-                        },
-                        &format!("failed to resolve parent execution workspace: {err}"),
+                .map_err(|err| {
+                    (
+                        format!("failed to resolve parent execution workspace: {err}"),
+                        None,
                     )
-                    .await;
-                    ctx.active_delegations.lock().await.remove(&delegation_id);
-                    return;
-                }
-            }
+                })?,
+            None => persisted_parent_cwd,
         }
-        None => persisted_parent_cwd,
+        .or(ctx.config.cwd.clone());
+
+        // A fresh isolated delegation allocates from the parent's workspace
+        // record (a handoff takes over an existing worktree instead). Without a
+        // parent cwd the allocation branch fails before it needs the record.
+        let parent_record = match ctx.workspace_service.as_ref() {
+            Some(service)
+                if delegation.isolation == crate::worktree::DelegationIsolation::Isolated
+                    && ctx.handoff_from.is_none()
+                    && effective_cwd.is_some() =>
+            {
+                let record = service
+                    .registry()
+                    .get_workspace_by_session(&parent_session_id)
+                    .await
+                    .map_err(|err| {
+                        (
+                            format!("cannot resolve parent workspace: {err}"),
+                            effective_cwd.clone(),
+                        )
+                    })?;
+                tracing::Span::current().record("bound", record.is_some());
+                record
+            }
+            _ => None,
+        };
+        Ok((parent_reasoning_effort, effective_cwd, parent_record))
     }
-    .or(ctx.config.cwd.clone());
+    .instrument(resolve_parent_span)
+    .await;
+    let (parent_reasoning_effort, effective_cwd, parent_record) = match resolved {
+        Ok(resolved) => resolved,
+        Err((error_message, execution_cwd)) => {
+            fail_delegation(
+                DelegationFailureContext {
+                    delegator: &ctx.delegator,
+                    store: &ctx.store,
+                    hooks: Some(&ctx.hooks),
+                    parent_session_id: &parent_session_id,
+                    delegation_id: &delegation.public_id,
+                    target_agent_id: Some(&delegation.target_agent_id),
+                    objective: Some(&delegation.objective),
+                    child_session: None,
+                    execution_cwd,
+                },
+                &error_message,
+            )
+            .await;
+            ctx.active_delegations.lock().await.remove(&delegation_id);
+            return;
+        }
+    };
     let source_parent_cwd = effective_cwd.clone();
 
     // 1a. Isolated delegates allocate their private workspace BEFORE the
@@ -1394,7 +1443,20 @@ async fn execute_delegation_inner_unboxed(
             };
             let begun = match refusal {
                 Some(message) => Err(message),
-                None => begin_delegation_handoff(&ctx, service, &parent_session_id, source).await,
+                None => {
+                    let allocate_span = tracing::info_span!(
+                        "delegation.allocate_workspace",
+                        workspace_id = tracing::field::Empty,
+                        handoff = true,
+                    );
+                    let begun = begin_delegation_handoff(&ctx, service, &parent_session_id, source)
+                        .instrument(allocate_span.clone())
+                        .await;
+                    if let Ok((binding, _)) = &begun {
+                        allocate_span.record("workspace_id", binding.record.id.as_str());
+                    }
+                    begun
+                }
             };
             match begun {
                 Ok((binding, pending)) => {
@@ -1442,39 +1504,29 @@ async fn execute_delegation_inner_unboxed(
                 ctx.active_delegations.lock().await.remove(&delegation_id);
                 return;
             };
-            let parent_record = match service
-                .registry()
-                .get_workspace_by_session(&parent_session_id)
-                .await
-            {
-                Ok(record) => record,
-                Err(err) => {
-                    fail_delegation(
-                        DelegationFailureContext {
-                            delegator: &ctx.delegator,
-                            store: &ctx.store,
-                            hooks: Some(&ctx.hooks),
-                            parent_session_id: &parent_session_id,
-                            delegation_id: &delegation.public_id,
-                            target_agent_id: Some(&delegation.target_agent_id),
-                            objective: Some(&delegation.objective),
-                            execution_cwd: Some(parent_cwd.clone()),
-                            child_session: None,
-                        },
-                        &format!("cannot resolve parent workspace: {err}"),
-                    )
-                    .await;
-                    ctx.active_delegations.lock().await.remove(&delegation_id);
-                    return;
+            let allocate_span = tracing::info_span!(
+                "delegation.allocate_workspace",
+                workspace_id = tracing::field::Empty,
+                handoff = false,
+            );
+            // Gate construction canonicalizes the checkout path: blocking
+            // filesystem work stays off the async workers.
+            let parent_gate = match parent_record.as_ref() {
+                Some(record) => {
+                    let storage_root = service.storage_root().to_path_buf();
+                    let checkout = record.checkout_path.clone();
+                    tokio::task::spawn_blocking(move || {
+                        crate::worktree::CheckoutMutationGate::new(storage_root, checkout).ok()
+                    })
+                    .instrument(allocate_span.clone())
+                    .await
+                    .unwrap_or_else(|error| {
+                        warn!("parent checkout gate construction did not complete: {error}");
+                        None
+                    })
                 }
+                None => None,
             };
-            let parent_gate = parent_record.as_ref().and_then(|record| {
-                crate::worktree::CheckoutMutationGate::new(
-                    service.storage_root(),
-                    &record.checkout_path,
-                )
-                .ok()
-            });
             let batch_id = ctx
                 .batch_id
                 .clone()
@@ -1505,9 +1557,13 @@ async fn execute_delegation_inner_unboxed(
                         Ok(())
                     },
                 )
+                .instrument(allocate_span.clone())
                 .await
             {
-                Ok(binding) => Some(binding),
+                Ok(binding) => {
+                    allocate_span.record("workspace_id", binding.record.id.as_str());
+                    Some(binding)
+                }
                 Err(err) => {
                     fail_delegation(
                         DelegationFailureContext {
@@ -1546,6 +1602,8 @@ async fn execute_delegation_inner_unboxed(
     // delegate's actual execution root (the child workspace when isolated,
     // the parent's checkout otherwise) rather than the orchestrator default.
     // Its additional context feeds the delegate's planning prompt below.
+    let start_hook_span =
+        tracing::info_span!("delegation.start_hook", contexts = tracing::field::Empty);
     let start_hook = ctx
         .hooks
         .run_delegation_start(DelegationStartRequest {
@@ -1563,9 +1621,11 @@ async fn execute_delegation_inner_unboxed(
             expected_output: delegation.expected_output.clone(),
             status: "requested".to_string(),
         })
+        .instrument(start_hook_span.clone())
         .await;
     match start_hook {
         Ok(result) => {
+            start_hook_span.record("contexts", result.additional_contexts.len() as i64);
             emit_hook_notices(&ctx.delegator, &parent_session_id, result.notices);
             if !result.additional_contexts.is_empty() {
                 planning_context_additions = format!(
@@ -2044,16 +2104,29 @@ async fn execute_delegation_inner_unboxed(
                     None
                 }
             };
+            let summary_span = tracing::info_span!(
+                "delegation.summarize",
+                history_messages = history.len() as i64,
+                summary_bytes = tracing::field::Empty,
+                strategy = tracing::field::Empty,
+                outcome = tracing::field::Empty,
+            );
             let summary = async {
-                let operation = operation.as_ref()?;
+                let Some(operation) = operation.as_ref() else {
+                    tracing::Span::current().record("outcome", "skipped");
+                    return None;
+                };
                 match summarizer
                     .summarize(&history, &delegation.objective, operation)
                     .await
                 {
                     Ok(summary) => {
-                        tracing::Span::current().record("summary_bytes", summary.len() as u64);
+                        tracing::Span::current().record("summary_bytes", summary.len() as i64);
                         Some(summary)
                     }
+                    // The summarizer records `outcome` on this span for every
+                    // failure (a refused dispatch included), so it is not
+                    // recorded again here.
                     Err(_) => {
                         // The parent cycle's price cap refused the paid summary
                         // dispatch: nothing was sent. Not a generation failure.
@@ -2069,12 +2142,7 @@ async fn execute_delegation_inner_unboxed(
                     }
                 }
             }
-            .instrument(tracing::info_span!(
-                "delegation.summarize",
-                history_messages = history.len(),
-                summary_bytes = tracing::field::Empty,
-                strategy = tracing::field::Empty,
-            ))
+            .instrument(summary_span.clone())
             .await;
 
             if let Some(summary) = summary {
@@ -2093,7 +2161,7 @@ async fn execute_delegation_inner_unboxed(
                     "\n\n<planning-context>\n{}{}\n</planning-context>",
                     summary, planning_context_additions
                 );
-                let summary_bytes = formatted_summary.len();
+                let summary_bytes = formatted_summary.len() as i64;
                 async {
                     if session_ref
                         .set_planning_context(formatted_summary)
@@ -2101,7 +2169,9 @@ async fn execute_delegation_inner_unboxed(
                         .is_err()
                     {
                         warn!("Failed to inject planning summary via SetPlanningContext");
+                        summary_span.record("outcome", "skipped");
                     } else {
+                        summary_span.record("outcome", "injected");
                         log::info!(
                             "Injected planning summary into delegate session {} via kameo",
                             child_session_id

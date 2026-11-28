@@ -18,14 +18,14 @@ use tokio::sync::Notify;
 const WAIT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
-enum Terminal {
+pub(super) enum Terminal {
     Completed(String),
     Failed(String),
     Cancelled,
 }
 
 impl Terminal {
-    fn completed(self) -> String {
+    pub(super) fn completed(self) -> String {
         match self {
             Self::Completed(text) => text,
             other => panic!("expected the delegation to complete, got {other:?}"),
@@ -60,7 +60,7 @@ impl SessionMcpAttachmentSource for FailingAttachments {
 
 /// Records a delegation of the harness's parent session and asks the
 /// orchestrator to run it on behalf of `parent_session`.
-async fn request(
+pub(super) async fn request(
     h: &TestHarness,
     parent_session: &str,
     target: &str,
@@ -98,7 +98,7 @@ async fn request(
     (delegation, events)
 }
 
-async fn wait_terminal(
+pub(super) async fn wait_terminal(
     events: &mut tokio::sync::broadcast::Receiver<Arc<querymt_agent_core::events::EventEnvelope>>,
     delegation_id: &str,
 ) -> Terminal {
@@ -130,7 +130,7 @@ async fn wait_terminal(
 }
 
 /// Run a delegation of the harness's parent session to its end.
-async fn delegate(
+pub(super) async fn delegate(
     h: &TestHarness,
     target: &str,
     isolation: DelegationIsolation,

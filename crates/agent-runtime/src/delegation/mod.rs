@@ -25,3 +25,5 @@ mod handoff_tests;
 mod member_tests;
 #[cfg(test)]
 pub(crate) mod root_tests;
+#[cfg(test)]
+mod startup_span_tests;
