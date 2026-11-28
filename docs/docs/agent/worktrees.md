@@ -650,8 +650,10 @@ changed. A tracked file whose stat data matches its real-index entry, and which
 is not racily clean, reuses the entry's object id and is not opened. Modified
 and untracked files, entries with special index flags, files whose
 attributes or configuration convert content, and anything else that cannot be
-proven unchanged are read. An object the repository already holds is not
-written again. The baseline still contains the raw working bytes and on-disk
+proven unchanged are read. An index entry is reused only when its blob's size
+equals the file's size, so blobs normalised under earlier settings (for example
+a `core.autocrlf` that has since been turned off) are read again. An object the
+repository already holds is not written again. The baseline still contains the raw working bytes and on-disk
 modes.
 
 Validation compares fingerprints (HEAD, index entries and the stat data of
