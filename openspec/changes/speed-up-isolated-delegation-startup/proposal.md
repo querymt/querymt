@@ -26,6 +26,7 @@ The code explains most of it. `capture_working_state_validated` runs three full 
   - entries flagged assume-unchanged, skip-worktree, fsmonitor-valid or intent-to-add;
   - entries whose kind changed (regular file vs symbolic link);
   - files whose attributes or config convert content (line endings, `ident`, working-tree encoding);
+  - files whose index blob size, from its object header, differs from the file size (a blob staged under earlier conversion settings);
   - non-ignored untracked files, regardless of `status.showUntrackedFiles`.
 
   A blob is hashed before it is written, and an object that already exists is not written again. Large files (16 MiB or more) are hashed by streaming first and only written when the repository does not hold them. The baseline still holds raw working bytes and on-disk modes, as today.

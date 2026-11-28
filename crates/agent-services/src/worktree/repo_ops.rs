@@ -26,8 +26,9 @@ use gix::refs::Target;
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 
 use crate::worktree::capture_scan::{
-    ConversionDetector, changed_during_capture, disk_kind, hash_file_stream, index_kind,
-    mark_uptodate, open_real_index, read_err, reuse_predicate, walk_untracked_and_ignored,
+    ConversionDetector, blob_size_matches, changed_during_capture, disk_kind, hash_file_stream,
+    index_kind, mark_uptodate, open_real_index, read_err, reuse_predicate,
+    walk_untracked_and_ignored,
 };
 
 /// A linked-worktree registration observed in the shared repository.
@@ -1714,22 +1715,35 @@ fn classify_and_reconcile(
                     uptodate.push(position);
                 }
             }
-            // Cheap stat rules first; resolve attributes only for entries
-            // that would otherwise be reused.
-            let reused = if reuse_predicate(real_entry, &md, index_timestamp, stat_opts, false) {
-                if conversions.is_none() {
-                    conversions = Some(ConversionDetector::new(repo, real_state)?);
-                }
-                let converts = conversions
-                    .as_mut()
-                    .expect("initialized above")
-                    .has_conversion(path.as_bstr())?;
-                reuse_predicate(real_entry, &md, index_timestamp, stat_opts, converts)
+            // Cheap stat rules first; resolve attributes, then the blob's
+            // header size, only for entries that would otherwise be reused.
+            let reused =
+                if reuse_predicate(real_entry, &md, index_timestamp, stat_opts, false, true) {
+                    if conversions.is_none() {
+                        conversions = Some(ConversionDetector::new(repo, real_state)?);
+                    }
+                    let converts = conversions
+                        .as_mut()
+                        .expect("initialized above")
+                        .has_conversion(path.as_bstr())?;
+                    // Header lookup only: no blob content is read.
+                    let size_matches = !converts
+                        && real_entry.is_some_and(|real_entry| {
+                            blob_size_matches(repo, real_entry.id, md.len())
+                        });
+                    reuse_predicate(
+                        real_entry,
+                        &md,
+                        index_timestamp,
+                        stat_opts,
+                        converts,
+                        size_matches,
+                    )
                     .then(|| real_entry.map(|real_entry| real_entry.id))
                     .flatten()
-            } else {
-                None
-            };
+                } else {
+                    None
+                };
             let kind = file_kind_on_disk(&abs)?;
             entry.id = match reused {
                 Some(id) => {

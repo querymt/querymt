@@ -49,12 +49,17 @@ Baseline capture SHALL read a tracked file whose real-index entry is racily clea
 - **AND** the baseline records a symbolic link with its target
 
 ### Requirement: Baselines hold raw working contents
-The baseline SHALL hold the raw working bytes and on-disk modes of the checkout, and SHALL equal one built by reading every candidate file. Baseline capture SHALL read a tracked file whose effective attributes or configuration convert its content between the index and the working tree.
+The baseline SHALL hold the raw working bytes and on-disk modes of the checkout, and SHALL equal one built by reading every candidate file. Baseline capture SHALL read a tracked file whose effective attributes or configuration convert its content between the index and the working tree. Baseline capture SHALL read a tracked file whose index blob size differs from the file size.
 
 #### Scenario: Line-ending converted file keeps working bytes
 - **WHEN** a tracked file's attributes convert line endings between the index and the working tree
 - **THEN** the capture reads that file
 - **AND** the baseline holds its working bytes, as a capture that reads every file would
+
+#### Scenario: Index blob normalised under earlier settings is read
+- **WHEN** a tracked file's index blob was converted under earlier settings that no longer apply, and its stat data matches the index entry
+- **THEN** the capture reads that file
+- **AND** the baseline holds its working bytes
 
 #### Scenario: Selective capture matches a full read
 - **WHEN** a checkout holds a tracked deletion, an edited file, a staged-only addition, an executable, a symlink and a non-ignored untracked file

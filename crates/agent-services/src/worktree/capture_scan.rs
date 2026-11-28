@@ -98,20 +98,24 @@ pub(crate) fn disk_kind(md: &gix::index::fs::Metadata) -> Option<NodeKind> {
 
 /// Whether the real-index `entry` (`None`: the path is not in the real index)
 /// may stand in for reading the file `md` describes. Pure function of its
-/// inputs (design D2, rules 2-5).
+/// inputs (design D2, rules 2-5). `blob_size_matches` says the size of the
+/// entry's blob (from its object header) equals the file's size on disk; a
+/// blob staged under earlier conversion settings keeps matching stat data
+/// while its bytes differ from the file's.
 pub(crate) fn reuse_predicate(
     entry: Option<&gix::index::Entry>,
     md: &gix::index::fs::Metadata,
     index_timestamp: FileTime,
     opts: StatOptions,
     has_conversion: bool,
+    blob_size_matches: bool,
 ) -> bool {
     let Some(entry) = entry else {
         return false;
     };
     let hidden =
         Flags::SKIP_WORKTREE | Flags::ASSUME_VALID | Flags::FSMONITOR_VALID | Flags::INTENT_TO_ADD;
-    if entry.flags.intersects(hidden) || has_conversion {
+    if entry.flags.intersects(hidden) || has_conversion || !blob_size_matches {
         return false;
     }
     let Some(kind) = index_kind(entry.mode) else {
@@ -124,6 +128,18 @@ pub(crate) fn reuse_predicate(
         return false;
     };
     entry.stat.matches(&disk_stat, opts) && !entry.stat.is_racy(index_timestamp, opts)
+}
+
+/// Whether the blob `id` has the size `disk_size`, by object header only (no
+/// content read). A failed lookup or a non-blob object is `false`: the file
+/// is then read.
+pub(crate) fn blob_size_matches(
+    repo: &gix::Repository,
+    id: gix::hash::ObjectId,
+    disk_size: u64,
+) -> bool {
+    repo.find_header(id)
+        .is_ok_and(|header| header.kind() == gix::object::Kind::Blob && header.size() == disk_size)
 }
 
 /// Resolves whether a path's content is converted between the index and the
@@ -579,12 +595,17 @@ mod tests {
 
     impl Case {
         fn reusable(&self, has_conversion: bool) -> bool {
+            self.reusable_with(has_conversion, true)
+        }
+
+        fn reusable_with(&self, has_conversion: bool, blob_size_matches: bool) -> bool {
             reuse_predicate(
                 Some(&self.entry_state.entries()[0]),
                 &self.metadata,
                 self.timestamp,
                 self.opts,
                 has_conversion,
+                blob_size_matches,
             )
         }
     }
@@ -613,6 +634,9 @@ mod tests {
 
         // Conversion forces a read.
         assert!(!base.reusable(true));
+
+        // So does a blob whose header size differs from the file's.
+        assert!(!base.reusable_with(false, false));
 
         // Each flag that can hide working content forces a read.
         for flag in [
@@ -649,7 +673,8 @@ mod tests {
             &missing.metadata,
             missing.timestamp,
             missing.opts,
-            false
+            false,
+            true
         ));
     }
 }

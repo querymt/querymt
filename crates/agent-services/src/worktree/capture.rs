@@ -1838,6 +1838,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn index_blob_normalised_under_earlier_settings_is_read() {
+        let repo = init_repo();
+        run_git_ok(repo.path(), &["config", "core.autocrlf", "true"]);
+        write_file(repo.path(), "a.txt", "one\r\ntwo\r\n");
+        write_file(repo.path(), "plain.txt", "plain");
+        // Aged before staging, so the entries are stat-clean and not racy.
+        age_tree(repo.path(), 3600);
+        commit_all(repo.path(), "init");
+        assert_eq!(blob_bytes(repo.path(), "HEAD", "a.txt"), b"one\ntwo\n");
+        // The setting no longer applies: nothing converts a.txt any more, yet
+        // its entry still matches the file's stat data.
+        run_git_ok(repo.path(), &["config", "core.autocrlf", "false"]);
+
+        let (captured, stats) = capture_stats(&GixRepoOps::new(), repo.path()).await;
+
+        assert_eq!(
+            blob_bytes(repo.path(), &captured.tree, "a.txt"),
+            b"one\r\ntwo\r\n"
+        );
+        assert_eq!(stats.files_read, 1, "only the normalised file is read");
+        assert_eq!(stats.reused_index_entries, 1);
+    }
+
+    #[tokio::test]
     async fn repeated_delegation_from_the_same_dirty_state() {
         let repo = aged_repo(&[("a.txt", "one"), ("dir/b.txt", "two")]);
         write_file(repo.path(), "a.txt", "dirty a");
@@ -2063,9 +2087,53 @@ mod tests {
         );
     }
 
+    /// Delegating from `repo` through a `WorkspaceService` whose writer acts
+    /// on every capture fails with the bounded-attempts error and leaves no
+    /// workspace record, checkout, worktree registration or ref behind.
+    async fn assert_delegation_fails_without_allocating(repo: &Path, always: FlakyWriterOps) {
+        use crate::worktree::WorkspaceService;
+        use querymt_agent_sqlite::repo_workspace::SqliteWorkspaceRepository;
+        use std::sync::Arc;
+
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        querymt_agent_sqlite::session::schema::init_schema(&mut conn).unwrap();
+        let registry = Arc::new(SqliteWorkspaceRepository::new(Arc::new(
+            parking_lot::Mutex::new(conn),
+        )));
+        let storage = TempDir::new().unwrap();
+        let svc = WorkspaceService::new(Arc::new(always), registry, storage.path());
+        let state = |repo: &Path| {
+            (
+                out_git(repo, &["for-each-ref"]),
+                out_git(repo, &["worktree", "list", "--porcelain"]),
+            )
+        };
+        let before = state(repo);
+
+        let err = svc
+            .allocate_for_delegation("parent", None, repo, None, "delegate", Some("batch".into()))
+            .await
+            .unwrap_err();
+
+        let message = err.to_string();
+        assert!(
+            message.contains("source changed during capture")
+                && message.contains("known-inconsistent"),
+            "{message}"
+        );
+        assert!(svc.registry().list_workspaces().await.unwrap().is_empty());
+        assert_eq!(state(repo), before, "no ref or worktree was created");
+        let leftovers: Vec<_> = fs::read_dir(storage.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name != "batch-locks" && name != "gates")
+            .collect();
+        assert!(leftovers.is_empty(), "no checkout dir: {leftovers:?}");
+    }
+
     /// The second attempt is the only one that can succeed when the writer
     /// acts on the first capture only; a writer acting on every capture
-    /// exhausts the attempts without a baseline.
+    /// exhausts the attempts without a baseline or a workspace.
     async fn assert_retried_then_bounded_failure(
         repo: &Path,
         once: FlakyWriterOps,
@@ -2082,13 +2150,7 @@ mod tests {
         );
         drop(guard);
 
-        let err = validated(&always, repo).await.unwrap_err();
-        let message = err.to_string();
-        assert!(
-            message.contains("source changed during capture")
-                && message.contains("known-inconsistent"),
-            "{message}"
-        );
+        assert_delegation_fails_without_allocating(repo, always).await;
     }
 
     #[tokio::test]
@@ -2170,11 +2232,7 @@ mod tests {
         let always = FlakyWriterOps::with_hook(move |root, call| {
             rewrite(root, if call % 2 == 0 { "dddd" } else { "eeee" });
         });
-        let err = validated(&always, repo.path()).await.unwrap_err();
-        assert!(
-            err.to_string().contains("source changed during capture"),
-            "{err}"
-        );
+        assert_delegation_fails_without_allocating(repo.path(), always).await;
     }
 
     #[tokio::test]
