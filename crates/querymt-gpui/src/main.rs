@@ -214,137 +214,238 @@ pub fn run(app: Application, panel_only: bool) {
     });
 }
 
+/// The icons the web build embeds: the stock wasm loader fetches lazily over
+/// HTTP and never redraws, so every icon the app or its widgets draw must be
+/// listed. On wasm this is the `WebIcons` asset source; in tests, the names,
+/// so `web_icons_cover_the_app` catches an icon used but not listed.
+macro_rules! web_icons {
+    ($($icon:ident),* $(,)?) => {
+        #[cfg(target_family = "wasm")]
+        gpui_kit::assets::icon_assets!(WebIcons, [$($icon),*]);
+        #[cfg(test)]
+        const WEB_ICONS: &[&str] = &[$(stringify!($icon)),*];
+    };
+}
+
+web_icons!(
+    // Every icon the app names (`IconName::…`; a test keeps this in step).
+    Archive,
+    ArchiveRestore,
+    ArrowDownLeft,
+    ArrowDownToLine,
+    ArrowLeft,
+    ArrowUpRight,
+    ArrowUpToLine,
+    AudioLines,
+    BookmarkPlus,
+    Bot,
+    Braces,
+    Brain,
+    Bug,
+    CalendarClock,
+    Check,
+    ChevronDown,
+    ChevronLeft,
+    ChevronRight,
+    ChevronsDown,
+    ChevronsDownUp,
+    ChevronsUp,
+    ChevronsUpDown,
+    ChevronUp,
+    Circle,
+    CircleAlert,
+    CircleArrowUp,
+    CircleCheck,
+    CircleCheckBig,
+    CircleDashed,
+    CircleDot,
+    CircleQuestionMark,
+    CircleStop,
+    Clock,
+    CloudOff,
+    Copy,
+    Diff,
+    Ellipsis,
+    EllipsisVertical,
+    Eraser,
+    ExternalLink,
+    Eye,
+    FileCode,
+    FileCog,
+    FilePenLine,
+    FileText,
+    FingerprintPattern,
+    Folder,
+    FolderClock,
+    FolderOpen,
+    FolderPlus,
+    FolderSearch,
+    FoldVertical,
+    Gauge,
+    GitBranch,
+    GitBranchPlus,
+    GitCommitHorizontal,
+    GitFork,
+    Globe,
+    HardDrive,
+    Image,
+    Inbox,
+    Info,
+    Keyboard,
+    KeyRound,
+    LayoutDashboard,
+    LayoutGrid,
+    Link,
+    List,
+    ListChecks,
+    ListTodo,
+    Lock,
+    LogIn,
+    LogOut,
+    MessageCircleQuestionMark,
+    MessageSquare,
+    MessageSquarePlus,
+    MessagesSquare,
+    Monitor,
+    Moon,
+    Navigation,
+    Network,
+    Palette,
+    PanelLeftClose,
+    PanelLeftOpen,
+    Paperclip,
+    Pause,
+    Pencil,
+    Pin,
+    PinOff,
+    Play,
+    Plug,
+    PlugZap,
+    Plus,
+    Power,
+    PowerOff,
+    QrCode,
+    Redo2,
+    RefreshCw,
+    RotateCcw,
+    Scissors,
+    ScrollText,
+    Search,
+    SearchX,
+    SendHorizontal,
+    Settings,
+    Settings2,
+    SlidersHorizontal,
+    Sparkles,
+    Square,
+    SquareSlash,
+    SquareTerminal,
+    Sun,
+    Terminal,
+    TextWrap,
+    Ticket,
+    Trash,
+    TriangleAlert,
+    Type,
+    Undo2,
+    Video,
+    Wand,
+    WandSparkles,
+    Waypoints,
+    WindowClose,
+    WindowMaximize,
+    WindowMinimize,
+    WindowRestore,
+    Wrench,
+    X,
+    Zap,
+    // Used internally by gpui-kit / gpui-component widgets.
+    ArrowDown,
+    ArrowUp,
+    Asterisk,
+    Ban,
+    BookOpen,
+    Calendar,
+    CaseSensitive,
+    CircleX,
+    Close,
+    EyeOff,
+    Github,
+    Inspector,
+    Loader,
+    LoaderCircle,
+    Maximize,
+    Mic,
+    Minimize,
+    Minus,
+    PanelBottom,
+    PanelBottomOpen,
+    PanelLeft,
+    PanelRight,
+    PanelRightClose,
+    PanelRightOpen,
+    Replace,
+    SortAscending,
+    SortDescending,
+    Star,
+    StarFill,
+    User,
+);
+
 /// Browser entry point. `wasm-bindgen` calls this when the module loads.
 #[cfg(target_family = "wasm")]
 mod web {
     use wasm_bindgen::prelude::*;
 
-    // Embed exactly the icons the app and the components it uses need: the
-    // stock wasm loader fetches lazily over HTTP and never redraws.
-    gpui_kit::assets::icon_assets!(
-        WebIcons,
-        [
-            // app
-            LayoutDashboard,
-            Inbox,
-            MessagesSquare,
-            Bot,
-            Network,
-            Settings,
-            Sun,
-            Moon,
-            FolderOpen,
-            TriangleAlert,
-            CircleAlert,
-            SendHorizontal,
-            X,
-            Plus,
-            RefreshCw,
-            Globe,
-            Terminal,
-            Info,
-            Pencil,
-            Square,
-            Play,
-            ArrowLeft,
-            ArrowUp,
-            CircleStop,
-            CircleCheck,
-            CircleX,
-            CircleDashed,
-            Circle,
-            Wrench,
-            FilePen,
-            FileSearch,
-            SquareTerminal,
-            SquareSlash,
-            ListChecks,
-            ShieldAlert,
-            Hand,
-            MessageSquare,
-            ExternalLink,
-            Brain,
-            RotateCcw,
-            FoldVertical,
-            Undo2,
-            Redo2,
-            ToggleLeft,
-            ToggleRight,
-            Trash,
-            WindowMinimize,
-            WindowMaximize,
-            WindowRestore,
-            WindowClose,
-            PanelLeftOpen,
-            PanelLeftClose,
-            Palette,
-            Keyboard,
-            KeyRound,
-            Ticket,
-            SlidersHorizontal,
-            Paperclip,
-            Pin,
-            PinOff,
-            File,
-            FileText,
-            Image,
-            Clock,
-            Archive,
-            Brain,
-            Ellipsis,
-            // session view + composer
-            EllipsisVertical,
-            Sparkles,
-            FilePenLine,
-            FileCog,
-            ListTodo,
-            MessageCircleQuestionMark,
-            Navigation,
-            Settings2,
-            Diff,
-            ArrowDown,
-            ArrowUpRight,
-            // sessions page
-            GitFork,
-            GitBranch,
-            CircleQuestionMark,
-            Folder,
-            ArchiveRestore,
-            MessageSquarePlus,
-            SearchX,
-            PlugZap,
-            CircleDot,
-            CircleCheckBig,
-            // model picker
-            Gauge,
-            Type,
-            AudioLines,
-            Video,
-            // used internally by gpui-component widgets
-            Check,
-            ChevronDown,
-            ChevronUp,
-            ChevronLeft,
-            ChevronRight,
-            ChevronsUpDown,
-            Close,
-            CircleX,
-            Search,
-            Copy,
-            Eye,
-            EyeOff,
-            Loader,
-            LoaderCircle,
-            Minus,
-            CircleCheck,
-        ]
-    );
-
     #[wasm_bindgen(start)]
     pub fn start() {
         gpui_kit::platform::web_init();
         // Single-threaded: works on any static server, no COOP/COEP headers.
-        let app = gpui_kit::platform::single_threaded_web().with_assets(super::AppAssets(WebIcons));
+        let app = gpui_kit::platform::single_threaded_web()
+            .with_assets(super::AppAssets(super::WebIcons));
         super::run(app, false);
+    }
+}
+
+#[cfg(test)]
+mod web_icon_tests {
+    /// Every `IconName::…` the app's source names is embedded in the web
+    /// build: an icon missing from `web_icons!` draws nothing there.
+    #[test]
+    fn web_icons_cover_the_app() {
+        fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    sources(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        sources(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        let mut missing = std::collections::BTreeSet::new();
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            for (at, _) in text.match_indices("IconName::") {
+                let name: String = text[at + "IconName::".len()..]
+                    .chars()
+                    .take_while(char::is_ascii_alphanumeric)
+                    .collect();
+                if name.starts_with(|c: char| c.is_ascii_uppercase())
+                    && !super::WEB_ICONS.contains(&name.as_str())
+                {
+                    missing.insert(name);
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "add to web_icons! in src/main.rs: {missing:?}"
+        );
     }
 }
