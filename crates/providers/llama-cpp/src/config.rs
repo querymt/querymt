@@ -116,6 +116,31 @@ pub struct LlamaCppConfig {
     /// of some precision. Requires flash_attention to be "auto" or "enabled".
     /// Common values: "f16" (default), "q8_0" (half memory), "q4_0" (quarter).
     pub kv_cache_type_v: Option<String>,
+    /// Keep a full-size KV cache for sliding-window attention (SWA) layers.
+    ///
+    /// Defaults to `false`, as in llama.cpp's own tools: SWA layers only cache
+    /// their window, which for models such as Inkling-2 saves a very large
+    /// amount of memory at long contexts. `true` lets llama.cpp reuse older
+    /// cached prompt prefixes at the cost of a full-size cache on every layer,
+    /// and can exhaust GPU memory (`Decode Error -3`).
+    pub swa_full: Option<bool>,
+    /// Fit the model to free device memory when it is loaded, as `llama-cli`
+    /// does by default (llama.cpp `--fit`). Defaults to `false`.
+    ///
+    /// Chooses `n_gpu_layers`, the tensor split and which expert tensors stay
+    /// on the CPU so that the model and its KV cache fit. When `n_ctx` is not
+    /// set it also picks the largest context that fits (at least
+    /// `fit_min_ctx`). Like llama.cpp, fitting only changes what is still
+    /// unset, so it is skipped (with a log message) when `n_gpu_layers`, a
+    /// device placement (`devices`, `tensor_split`, `split_mode`,
+    /// `main_gpu`) or `speculative` decoding is configured.
+    pub fit: Option<bool>,
+    /// Smallest context size `fit` may choose when `n_ctx` is not set.
+    /// Defaults to 4096.
+    pub fit_min_ctx: Option<u32>,
+    /// Free memory, in MiB, that `fit` leaves unused on each device.
+    /// Defaults to 1024.
+    pub fit_margin_mib: Option<u32>,
     /// Optional path to multimodal projection file (mmproj).
     ///
     /// If not set, the provider will attempt to use built-in vision
@@ -511,7 +536,7 @@ pub enum LlamaCppLogMode {
 }
 
 /// Flash attention policy for llama.cpp context.
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FlashAttentionPolicy {
     /// Let llama.cpp decide based on backend capabilities.
@@ -690,5 +715,24 @@ lora = [{ path = "/models/style-lora.gguf", scale = 0.8 }]
         assert!(config(3, 0, -0.1).params().is_err());
         assert!(config(3, 0, 1.1).params().is_err());
         assert!(config(i32::MAX as u32 + 1, 0, 0.0).params().is_err());
+    }
+
+    #[test]
+    fn memory_options_default_to_unset_and_deserialize() {
+        let cfg: LlamaCppConfig = serde_json::from_str(r#"{"model": "m.gguf"}"#).unwrap();
+        assert_eq!(cfg.swa_full, None);
+        assert_eq!(cfg.fit, None);
+        assert_eq!(cfg.fit_min_ctx, None);
+        assert_eq!(cfg.fit_margin_mib, None);
+
+        let cfg: LlamaCppConfig = serde_json::from_str(
+            r#"{"model": "m.gguf", "swa_full": true, "fit": true,
+                "fit_min_ctx": 8192, "fit_margin_mib": 2048}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.swa_full, Some(true));
+        assert_eq!(cfg.fit, Some(true));
+        assert_eq!(cfg.fit_min_ctx, Some(8192));
+        assert_eq!(cfg.fit_margin_mib, Some(2048));
     }
 }

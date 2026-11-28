@@ -297,7 +297,23 @@ fn render_template(
     })
 }
 
+/// Whether `token` is an id of a vocabulary with `n_tokens` entries.
+///
+/// Special-token getters such as `bos()` return `LLAMA_TOKEN_NULL` (-1) when
+/// the model does not define that token. llama.cpp looks token ids up with
+/// `std::vector::at`, so passing a null or out-of-range id to
+/// `token_to_piece` throws a C++ exception. Rust cannot unwind through it and
+/// the process aborts, so such ids must never reach llama.cpp.
+pub(crate) fn token_in_vocab(token: llama_cpp_2::token::LlamaToken, n_tokens: i32) -> bool {
+    (0..n_tokens).contains(&token.0)
+}
+
+/// The text of a special token, or an empty string when the model does not
+/// define it (as Hugging Face tooling renders a missing `bos_token`).
 fn token_piece(model: &LlamaModel, token: llama_cpp_2::token::LlamaToken) -> String {
+    if !token_in_vocab(token, model.vocab().n_tokens()) {
+        return String::new();
+    }
     let bytes = model.vocab().token_to_piece(token, true, None);
     crate::generation::decode_piece(&mut encoding_rs::UTF_8.new_decoder(), &bytes)
         .unwrap_or_default()
@@ -578,5 +594,41 @@ mod tests {
         let rendered =
             render_template_source(QWEN_TEMPLATE, &context(false, effort, None, None)).unwrap();
         assert_eq!(rendered, "thinking=disabled");
+    }
+
+    #[test]
+    fn null_and_out_of_range_tokens_are_not_in_vocab() {
+        use llama_cpp_2::token::LlamaToken;
+
+        // LLAMA_TOKEN_NULL, as returned by `bos()` for a model without BOS.
+        assert!(!token_in_vocab(LlamaToken(-1), 100));
+        assert!(!token_in_vocab(LlamaToken(i32::MIN), 100));
+        assert!(!token_in_vocab(LlamaToken(100), 100));
+        assert!(!token_in_vocab(LlamaToken(0), 0));
+        assert!(token_in_vocab(LlamaToken(0), 100));
+        assert!(token_in_vocab(LlamaToken(99), 100));
+    }
+
+    /// llama.cpp throws a C++ exception for a null token id, which aborts the
+    /// process; this must come back as an empty string instead.
+    #[cfg(feature = "common")]
+    #[test]
+    fn token_piece_of_a_missing_special_token_is_empty() {
+        use crate::test_vocab::{self, Vocab};
+        use llama_cpp_2::token::LlamaToken;
+
+        let Some(model) = test_vocab::vocab_model(Vocab::Qwen35) else {
+            return;
+        };
+        let n = model.vocab().n_tokens();
+        assert_eq!(token_piece(&model, LlamaToken(-1)), "");
+        assert_eq!(token_piece(&model, LlamaToken(n)), "");
+        assert_eq!(token_piece(&model, LlamaToken(i32::MAX)), "");
+        // What `bos()` reports, whether or not this vocabulary defines it.
+        let _ = token_piece(&model, model.vocab().bos());
+        let eos = model.vocab().eos();
+        if token_in_vocab(eos, n) {
+            assert!(!token_piece(&model, eos).is_empty());
+        }
     }
 }

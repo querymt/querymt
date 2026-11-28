@@ -1,8 +1,6 @@
 use crate::backend::llama_backend;
 use crate::config::LlamaCppConfig;
-use crate::context::{
-    apply_context_params, estimate_context_memory, resolve_n_batch, resolve_n_ubatch,
-};
+use crate::context::{ContextSettings, estimate_context_memory};
 use crate::lora::{Models, new_target_context};
 use crate::multimodal::MediaInputs;
 use llama_cpp_2::context::LlamaContext;
@@ -66,8 +64,9 @@ pub(crate) fn prefill_for_tool_generation<'a>(
             model.n_ctx_train(),
         )?;
 
-        let n_batch = resolve_n_batch(cfg, n_ctx.get());
-        let n_ubatch = resolve_n_ubatch(cfg, n_batch, true);
+        let settings = ContextSettings::from_config(cfg);
+        let n_batch = settings.n_batch(n_ctx.get());
+        let n_ubatch = settings.n_ubatch(n_batch, true);
 
         let mut ctx_params = LlamaContextParams::default();
         ctx_params = ctx_params.with_n_ctx(Some(n_ctx));
@@ -79,7 +78,7 @@ pub(crate) fn prefill_for_tool_generation<'a>(
         if let Some(n_threads_batch) = cfg.n_threads_batch {
             ctx_params = ctx_params.with_n_threads_batch(n_threads_batch);
         }
-        ctx_params = apply_context_params(cfg, ctx_params)?;
+        ctx_params = settings.apply(ctx_params)?;
 
         let mut ctx =
             new_target_context(models, &backend, ctx_params, None, &cfg.lora).map_err(|err| {
@@ -99,7 +98,7 @@ pub(crate) fn prefill_for_tool_generation<'a>(
 
         // Vision models decode media chunks non-causally, which requires each media
         // chunk to fit in a single physical micro-batch.
-        let n_ubatch = resolve_n_ubatch(cfg, n_batch, true) as usize;
+        let n_ubatch = settings.n_ubatch(n_batch, true) as usize;
         for i in 0..chunks.len() {
             if let Some(chunk) = chunks.get(i)
                 && chunk.chunk_type() != MtmdInputChunkType::Text
@@ -140,8 +139,9 @@ pub(crate) fn prefill_for_tool_generation<'a>(
     let (input_tokens, n_len_total, n_ctx) =
         prefill_bounds(tokens.len(), max_tokens, cfg.n_ctx, model.n_ctx_train())?;
 
-    let n_batch = resolve_n_batch(cfg, n_ctx.get());
-    let n_ubatch = resolve_n_ubatch(cfg, n_batch, false);
+    let settings = ContextSettings::from_config(cfg);
+    let n_batch = settings.n_batch(n_ctx.get());
+    let n_ubatch = settings.n_ubatch(n_batch, false);
 
     let mut ctx_params = LlamaContextParams::default();
     ctx_params = ctx_params.with_n_ctx(Some(n_ctx));
@@ -153,7 +153,7 @@ pub(crate) fn prefill_for_tool_generation<'a>(
     if let Some(n_threads_batch) = cfg.n_threads_batch {
         ctx_params = ctx_params.with_n_threads_batch(n_threads_batch);
     }
-    ctx_params = apply_context_params(cfg, ctx_params)?;
+    ctx_params = settings.apply(ctx_params)?;
 
     let mut ctx =
         new_target_context(models, &backend, ctx_params, None, &cfg.lora).map_err(|err| {

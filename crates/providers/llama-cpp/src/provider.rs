@@ -1,6 +1,6 @@
 use crate::backend::{install_abort_callback, llama_backend};
 use crate::config::{DEFAULT_MAX_TOKENS, LlamaCppConfig, LlamaCppLogMode, SpeculativeConfig};
-use crate::context::estimate_context_memory;
+use crate::context::{ContextSettings, estimate_context_memory};
 use crate::generation::{
     build_prompt, build_prompt_with, build_raw_prompt, generate, generate_streaming_with_thinking,
 };
@@ -34,21 +34,48 @@ use std::thread;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ModelCacheKey {
     /// Resolved absolute path to the GGUF file.
-    pub model_path: String,
-    /// Number of GPU layers (affects Metal/CUDA offloading).
-    pub n_gpu_layers: Option<u32>,
+    pub model_path: PathBuf,
+    /// How the target's GPU offload is chosen (affects Metal/CUDA offloading).
+    pub offload: Offload,
     /// Device selection, tensor split, split mode and main GPU. The sidecar's
     /// placement is derived from this, so it needs no separate key field.
     pub placement: ResolvedPlacement,
     /// Whether bundled MTP (NextN) tensors are loaded into the target model.
     pub load_mtp: bool,
     /// Resolved MTP sidecar path, when configured.
-    pub mtp_model_path: Option<String>,
+    pub mtp_model_path: Option<PathBuf>,
     /// Sidecar GPU layers.
     pub mtp_n_gpu_layers: Option<u32>,
     /// Resolved adapter paths in config order. Scales are deliberately not
     /// part of the key: they are applied per generation.
-    pub lora_paths: Box<[String]>,
+    pub lora_paths: Box<[PathBuf]>,
+}
+
+impl ModelCacheKey {
+    /// Whether the target is fitted to free device memory at load time.
+    fn is_fitted(&self) -> bool {
+        matches!(self.offload, Offload::Fit(_))
+    }
+
+    /// Load params for the target model, and the context size a fit chose
+    /// when `n_ctx` is not configured.
+    fn target_params(
+        &self,
+    ) -> Result<(std::pin::Pin<Box<LlamaModelParams>>, Option<u32>), LLMError> {
+        match &self.offload {
+            Offload::Fixed(n_gpu_layers) => Ok((
+                Box::pin(target_model_params(
+                    &self.placement,
+                    *n_gpu_layers,
+                    self.load_mtp,
+                )?),
+                None,
+            )),
+            Offload::Fit(fit) => {
+                fit_target_params(&self.model_path, fit, &self.placement, self.load_mtp)
+            }
+        }
+    }
 }
 
 /// A cached model + multimodal context, shared across provider instances.
@@ -58,6 +85,8 @@ pub(crate) struct CachedModel {
     pub multimodal: Option<Arc<MultimodalContext>>,
     pub mtp_model: Option<Arc<LlamaModel>>,
     pub loras: Arc<LoraSet>,
+    /// Context size chosen by the fit when `n_ctx` was not configured.
+    pub fitted_n_ctx: Option<u32>,
 }
 
 /// Whether MTP speculative decoding should use tensors bundled in the target GGUF.
@@ -101,6 +130,152 @@ fn sidecar_model_params(
     placement.for_sidecar().apply(params)
 }
 
+/// Smallest context the fit may pick when `fit_min_ctx` is not configured.
+const DEFAULT_FIT_MIN_CTX: u32 = 4096;
+/// Memory left free on each device when `fit_margin_mib` is not configured.
+const DEFAULT_FIT_MARGIN_MIB: u32 = 1024;
+
+/// How the target model's GPU offload is chosen.
+///
+/// A fit and a configured `n_gpu_layers` exclude each other: llama.cpp only
+/// changes parameters that are still unset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Offload {
+    /// `n_gpu_layers` as configured (`None` leaves it to llama.cpp).
+    Fixed(Option<u32>),
+    /// Fitted to free device memory at load time (`fit = true`).
+    Fit(FitSettings),
+}
+
+/// Settings of a fit to free device memory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FitSettings {
+    n_ctx_min: u32,
+    margin_bytes: usize,
+    /// What the fit measures against.
+    context: ContextSettings,
+}
+
+/// The offload to use for `cfg`.
+///
+/// `fit = true` has no effect when something it would choose is already
+/// configured, so that falls back to [`Offload::Fixed`].
+fn offload(cfg: &LlamaCppConfig, placement: &ResolvedPlacement) -> Offload {
+    match fit_settings(cfg, placement) {
+        Some(fit) => Offload::Fit(fit),
+        None => Offload::Fixed(cfg.n_gpu_layers),
+    }
+}
+
+/// The fit to run for `cfg`, or `None` when it is off or cannot apply.
+///
+/// llama.cpp only changes parameters that still hold their defaults, so a
+/// configured `n_gpu_layers` or placement leaves nothing to fit, and the MTP
+/// sidecar and bundled MTP tensors are not measured.
+fn fit_settings(cfg: &LlamaCppConfig, placement: &ResolvedPlacement) -> Option<FitSettings> {
+    if cfg.fit != Some(true) {
+        return None;
+    }
+    let skipped = if cfg.n_gpu_layers.is_some() {
+        Some("n_gpu_layers is set")
+    } else if !placement.is_default() {
+        Some("device placement is configured")
+    } else if cfg.speculative.is_some() {
+        Some("speculative decoding is configured")
+    } else {
+        None
+    };
+    if let Some(why) = skipped {
+        log::info!("fit = true has no effect: {why}; fitting only changes unset parameters");
+        return None;
+    }
+    Some(FitSettings {
+        n_ctx_min: cfg.fit_min_ctx.unwrap_or(DEFAULT_FIT_MIN_CTX),
+        margin_bytes: (cfg.fit_margin_mib.unwrap_or(DEFAULT_FIT_MARGIN_MIB) as usize) << 20,
+        context: ContextSettings::from_config(cfg),
+    })
+}
+
+/// Model-load params for the target, fitted to free device memory.
+///
+/// Also returns the context size the fit chose, when `n_ctx` is not
+/// configured. When no allocation fits, the unfitted params are used and the
+/// load is left to succeed or fail on its own, as `llama-cli` does.
+#[cfg(feature = "common")]
+fn fit_target_params(
+    model_path: &Path,
+    settings: &FitSettings,
+    placement: &ResolvedPlacement,
+    load_mtp: bool,
+) -> Result<(std::pin::Pin<Box<LlamaModelParams>>, Option<u32>), LLMError> {
+    use llama_cpp_2::model::params::FitError;
+
+    let unfitted = || target_model_params(placement, None, load_mtp).map(Box::pin);
+    let Some(path) = model_path
+        .to_str()
+        .and_then(|p| std::ffi::CString::new(p).ok())
+    else {
+        log::warn!("fit skipped: model path is not valid UTF-8 without NUL bytes");
+        return Ok((unfitted()?, None));
+    };
+    let mut params = unfitted()?;
+    let mut cparams = settings.context.fit_params()?;
+    let mut margins = vec![settings.margin_bytes; llama_cpp_2::max_devices()];
+    // 4 is GGML_LOG_LEVEL_ERROR: fit output below it goes to llama.cpp's debug log.
+    let fitted =
+        params
+            .as_mut()
+            .fit_params(&path, &mut cparams, &mut margins, settings.n_ctx_min, 4);
+    match fitted {
+        Ok(result) => {
+            log::info!(
+                "Fitted model to device memory: n_gpu_layers={}, n_ctx={}, cpu expert overrides={}",
+                params.n_gpu_layers(),
+                result.n_ctx,
+                params.tensor_buft_override_patterns().len(),
+            );
+            Ok((
+                params,
+                settings.context.n_ctx.is_none().then_some(result.n_ctx),
+            ))
+        }
+        Err(FitError::Failure) => {
+            log::warn!(
+                "No allocation fits the free device memory (fit_min_ctx={}); \
+                 loading with the default parameters",
+                settings.n_ctx_min
+            );
+            Ok((unfitted()?, None))
+        }
+        Err(FitError::Error) => Err(LLMError::ProviderError(format!(
+            "Failed to fit {} to device memory",
+            model_path.display()
+        ))),
+    }
+}
+
+#[cfg(not(feature = "common"))]
+fn fit_target_params(
+    _model_path: &Path,
+    _settings: &FitSettings,
+    placement: &ResolvedPlacement,
+    load_mtp: bool,
+) -> Result<(std::pin::Pin<Box<LlamaModelParams>>, Option<u32>), LLMError> {
+    log::warn!("fit = true needs the `common` feature and is ignored");
+    Ok((
+        Box::pin(target_model_params(placement, None, load_mtp)?),
+        None,
+    ))
+}
+
+/// `cfg` with the context size a fit chose, unless one is configured.
+fn with_fitted_n_ctx(mut cfg: LlamaCppConfig, fitted_n_ctx: Option<u32>) -> LlamaCppConfig {
+    if cfg.n_ctx.is_none() {
+        cfg.n_ctx = fitted_n_ctx;
+    }
+    cfg
+}
+
 /// The cache key for a model load. Adapter scales are not part of it.
 fn cache_key(
     cfg: &LlamaCppConfig,
@@ -110,20 +285,17 @@ fn cache_key(
     placement: ResolvedPlacement,
 ) -> ModelCacheKey {
     ModelCacheKey {
-        model_path: model_path.to_string_lossy().to_string(),
-        n_gpu_layers: cfg.n_gpu_layers,
+        model_path: model_path.to_path_buf(),
+        offload: offload(cfg, &placement),
         placement,
         load_mtp: bundled_mtp_requested(cfg),
-        mtp_model_path: mtp_model_path.map(|p| p.to_string_lossy().to_string()),
+        mtp_model_path: mtp_model_path.map(Path::to_path_buf),
         mtp_n_gpu_layers: cfg
             .speculative
             .as_ref()
             .and_then(|m| m.n_gpu_layers)
             .or(cfg.n_gpu_layers),
-        lora_paths: lora_paths
-            .iter()
-            .map(|p| p.to_string_lossy().to_string())
-            .collect(),
+        lora_paths: lora_paths.into(),
     }
 }
 
@@ -137,47 +309,35 @@ fn resolve_placement(cfg: &LlamaCppConfig) -> Result<ResolvedPlacement, LLMError
     Ok(placement)
 }
 
-/// An MTP sidecar model to load next to the target.
-#[derive(Clone, Copy)]
-struct Sidecar<'a> {
-    path: &'a Path,
-    n_gpu_layers: Option<u32>,
-}
-
 /// Models produced by [`load_models`].
 struct LoadedModels {
     model: Arc<LlamaModel>,
     mtp_model: Option<Arc<LlamaModel>>,
     loras: Arc<LoraSet>,
+    /// Context size the fit chose when `n_ctx` was not configured.
+    fitted_n_ctx: Option<u32>,
 }
 
-/// Load the target model, its LoRA adapters and, when configured, the MTP sidecar.
+/// Load the target model, its LoRA adapters and, when configured, the MTP sidecar,
+/// as described by `key`.
 ///
 /// The single place where placement is applied to model loading. Adapters go
 /// onto the target model only, never onto the sidecar.
 fn load_models(
     backend: &llama_cpp_2::llama_backend::LlamaBackend,
-    model_path: &Path,
-    n_gpu_layers: Option<u32>,
-    placement: &ResolvedPlacement,
-    load_mtp: bool,
-    sidecar: Option<Sidecar<'_>>,
-    lora_paths: &[PathBuf],
+    key: &ModelCacheKey,
 ) -> Result<LoadedModels, LLMError> {
-    let target = LlamaModel::load_from_file(
-        backend,
-        model_path,
-        &target_model_params(placement, n_gpu_layers, load_mtp)?,
-    )
-    .map_err(|e| LLMError::ProviderError(e.to_string()))?;
-    let (model, loras) = LoraSet::load(target, lora_paths)?;
+    let (params, fitted_n_ctx) = key.target_params()?;
+    let target = LlamaModel::load_from_file(backend, &key.model_path, &params)
+        .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+    let (model, loras) = LoraSet::load(target, &key.lora_paths)?;
     let loras = Arc::new(loras);
-    let mtp_model = match sidecar {
-        Some(Sidecar { path, n_gpu_layers }) => Some(Arc::new(
+    let mtp_model = match key.mtp_model_path.as_deref() {
+        Some(path) => Some(Arc::new(
             LlamaModel::load_from_file(
                 backend,
                 path,
-                &sidecar_model_params(placement, n_gpu_layers)?,
+                &sidecar_model_params(&key.placement, key.mtp_n_gpu_layers)?,
             )
             .map_err(|e| LLMError::ProviderError(format!("Failed to load MTP sidecar: {e}")))?,
         )),
@@ -187,6 +347,7 @@ fn load_models(
         model,
         mtp_model,
         loras,
+        fitted_n_ctx,
     })
 }
 
@@ -283,27 +444,20 @@ impl LlamaCppProvider {
             .and_then(|m| m.model.as_deref())
             .map(Self::resolve_model_path)
             .transpose()?;
-        let placement = resolve_placement(&cfg)?;
+        let key = cache_key(
+            &cfg,
+            &model_path,
+            sidecar_path.as_deref(),
+            &lora_paths,
+            resolve_placement(&cfg)?,
+        );
         let LoadedModels {
             model,
             mtp_model,
             loras,
-        } = load_models(
-            &backend,
-            &model_path,
-            cfg.n_gpu_layers,
-            &placement,
-            bundled_mtp_requested(&cfg),
-            sidecar_path.as_deref().map(|path| Sidecar {
-                path,
-                n_gpu_layers: cfg
-                    .speculative
-                    .as_ref()
-                    .and_then(|m| m.n_gpu_layers)
-                    .or(cfg.n_gpu_layers),
-            }),
-            &lora_paths,
-        )?;
+            fitted_n_ctx,
+        } = load_models(&backend, &key)?;
+        let cfg = with_fitted_n_ctx(cfg, fitted_n_ctx);
 
         let model_hf_repo = match parse_model_ref(&cfg.model) {
             Ok(ModelRef::Hf(hf_ref)) => Some(hf_ref.repo),
@@ -319,7 +473,7 @@ impl LlamaCppProvider {
             mtp_model,
             loras,
         };
-        Self::log_memory_advisory(&provider);
+        Self::log_memory_advisory(&provider, key.is_fitted());
         Ok(provider)
     }
 
@@ -368,7 +522,7 @@ impl LlamaCppProvider {
         {
             return Ok(Self {
                 model: Arc::clone(&cached.model),
-                cfg,
+                cfg: with_fitted_n_ctx(cfg, cached.fitted_n_ctx),
                 multimodal: cached.multimodal.as_ref().map(Arc::clone),
                 mtp_model: cached.mtp_model.as_ref().map(Arc::clone),
                 loras: Arc::clone(&cached.loras),
@@ -376,7 +530,7 @@ impl LlamaCppProvider {
         }
         drop(guard);
 
-        let model_path = Path::new(&key.model_path);
+        let model_path = key.model_path.as_path();
         if !model_path.exists() {
             return Err(LLMError::InvalidRequest(format!(
                 "Model path does not exist: {}",
@@ -387,19 +541,11 @@ impl LlamaCppProvider {
             model,
             mtp_model,
             loras,
-        } = load_models(
-            &backend,
-            model_path,
-            key.n_gpu_layers,
-            &key.placement,
-            key.load_mtp,
-            key.mtp_model_path.as_deref().map(|path| Sidecar {
-                path: Path::new(path),
-                n_gpu_layers: key.mtp_n_gpu_layers,
-            }),
-            &lora_paths,
-        )?;
+            fitted_n_ctx,
+        } = load_models(&backend, &key)?;
+        let cfg = with_fitted_n_ctx(cfg, fitted_n_ctx);
 
+        let fitted = key.is_fitted();
         let model_hf_repo = match parse_model_ref(&cfg.model) {
             Ok(ModelRef::Hf(hf_ref)) => Some(hf_ref.repo),
             _ => None,
@@ -414,6 +560,7 @@ impl LlamaCppProvider {
             multimodal: multimodal.as_ref().map(Arc::clone),
             mtp_model: mtp_model.as_ref().map(Arc::clone),
             loras: Arc::clone(&loras),
+            fitted_n_ctx,
         });
 
         let provider = Self {
@@ -423,12 +570,16 @@ impl LlamaCppProvider {
             mtp_model,
             loras,
         };
-        Self::log_memory_advisory(&provider);
+        Self::log_memory_advisory(&provider, fitted);
         Ok(provider)
     }
 
     /// Log advisory memory warnings at startup.
-    fn log_memory_advisory(provider: &Self) {
+    ///
+    /// `fitted` means llama.cpp already fitted the model to free memory. The
+    /// estimate here assumes a full-size KV cache on every layer, which is
+    /// pessimistic for sliding-window models, so it only informs then.
+    fn log_memory_advisory(provider: &Self, fitted: bool) {
         if let Some(n_ctx) = provider.cfg.n_ctx {
             let est = estimate_context_memory(&provider.model, &provider.cfg, n_ctx);
             log::info!(
@@ -442,7 +593,7 @@ impl LlamaCppProvider {
                 },
                 est.summary(),
             );
-            if est.gpu_memory_bytes > 0 && est.total_bytes > est.gpu_memory_bytes {
+            if !fitted && est.gpu_memory_bytes > 0 && est.total_bytes > est.gpu_memory_bytes {
                 let suggestions = MemoryEstimate::suggestions(
                     n_ctx,
                     provider.cfg.kv_cache_type_k.is_some()
@@ -796,7 +947,8 @@ impl LLMProvider for LlamaCppProvider {}
 #[cfg(test)]
 mod tests {
     use super::{
-        ModelCacheKey, bundled_mtp_requested, cache_key, sidecar_model_params, target_model_params,
+        ModelCacheKey, Offload, bundled_mtp_requested, cache_key, fit_settings, offload,
+        sidecar_model_params, target_model_params, with_fitted_n_ctx,
     };
     use crate::config::{
         LlamaCppConfig, LoraAdapterConfig, LoraScale, SpeculativeConfig, SpeculativeType,
@@ -886,8 +1038,8 @@ mod tests {
     #[test]
     fn cache_key_distinguishes_placement() {
         let base = ModelCacheKey {
-            model_path: "/path/to/model.gguf".to_string(),
-            n_gpu_layers: None,
+            model_path: PathBuf::from("/path/to/model.gguf"),
+            offload: Offload::Fixed(None),
             placement: placement_for(r#""tensor_split":[3,1]"#),
             load_mtp: false,
             mtp_model_path: None,
@@ -973,8 +1125,8 @@ mod tests {
     #[test]
     fn cache_key_distinguishes_bundled_mtp() {
         let base = ModelCacheKey {
-            model_path: "/path/to/model.gguf".to_string(),
-            n_gpu_layers: None,
+            model_path: PathBuf::from("/path/to/model.gguf"),
+            offload: Offload::Fixed(None),
             placement: ResolvedPlacement::default(),
             load_mtp: false,
             mtp_model_path: None,
@@ -984,5 +1136,172 @@ mod tests {
         let mut with_mtp = base.clone();
         with_mtp.load_mtp = true;
         assert_ne!(base, with_mtp, "load_mtp must invalidate the cache key");
+    }
+
+    fn fit_config() -> LlamaCppConfig {
+        let mut cfg = base_config();
+        cfg.fit = Some(true);
+        cfg
+    }
+
+    #[test]
+    fn fit_is_off_unless_requested() {
+        let placement = ResolvedPlacement::default();
+        assert_eq!(fit_settings(&base_config(), &placement), None);
+        let mut cfg = base_config();
+        cfg.fit = Some(false);
+        assert_eq!(fit_settings(&cfg, &placement), None);
+    }
+
+    #[test]
+    fn fit_uses_llama_cli_defaults() {
+        let settings = fit_settings(&fit_config(), &ResolvedPlacement::default()).unwrap();
+        assert_eq!(settings.n_ctx_min, 4096);
+        assert_eq!(settings.margin_bytes, 1024 << 20);
+
+        let mut cfg = fit_config();
+        cfg.fit_min_ctx = Some(8192);
+        cfg.fit_margin_mib = Some(512);
+        let settings = fit_settings(&cfg, &ResolvedPlacement::default()).unwrap();
+        assert_eq!(settings.n_ctx_min, 8192);
+        assert_eq!(settings.margin_bytes, 512 << 20);
+    }
+
+    #[test]
+    fn fit_is_skipped_when_nothing_is_left_to_fit() {
+        let default = ResolvedPlacement::default();
+
+        let mut cfg = fit_config();
+        cfg.n_gpu_layers = Some(99);
+        assert_eq!(fit_settings(&cfg, &default), None, "n_gpu_layers is set");
+
+        let mut cfg = fit_config();
+        cfg.speculative = speculative(None);
+        assert_eq!(fit_settings(&cfg, &default), None, "speculative decoding");
+
+        let split = placement_for(r#""tensor_split":[3,1]"#);
+        assert_eq!(fit_settings(&fit_config(), &split), None, "placement set");
+    }
+
+    #[test]
+    fn cache_key_follows_what_the_fit_measured() {
+        let fitted = |edit: fn(&mut LlamaCppConfig)| {
+            let mut cfg = fit_config();
+            edit(&mut cfg);
+            key_for(&cfg, &[])
+        };
+        let base = fitted(|_| {});
+        assert_eq!(base, fitted(|_| {}));
+        assert_ne!(base, key_for(&base_config(), &[]), "fit on vs off");
+        assert_ne!(base, fitted(|c| c.n_ctx = Some(120_000)));
+        assert_ne!(base, fitted(|c| c.kv_cache_type_k = Some("q8_0".into())));
+        assert_ne!(base, fitted(|c| c.swa_full = Some(true)));
+        assert_ne!(base, fitted(|c| c.fit_min_ctx = Some(8192)));
+        assert_ne!(base, fitted(|c| c.fit_margin_mib = Some(2048)));
+    }
+
+    #[test]
+    fn fit_and_n_gpu_layers_are_exclusive_in_the_offload() {
+        let default = ResolvedPlacement::default();
+        assert_eq!(offload(&base_config(), &default), Offload::Fixed(None));
+
+        let mut cfg = base_config();
+        cfg.n_gpu_layers = Some(99);
+        assert_eq!(offload(&cfg, &default), Offload::Fixed(Some(99)));
+
+        assert!(matches!(offload(&fit_config(), &default), Offload::Fit(_)));
+
+        // `fit = true` with `n_gpu_layers` set has nothing to fit: the
+        // configured layer count wins.
+        let mut cfg = fit_config();
+        cfg.n_gpu_layers = Some(99);
+        assert_eq!(offload(&cfg, &default), Offload::Fixed(Some(99)));
+    }
+
+    #[test]
+    fn fixed_offload_loads_with_the_configured_layers_and_no_fitted_context() {
+        let mut cfg = base_config();
+        cfg.n_gpu_layers = Some(99);
+        let key = key_for(&cfg, &[]);
+        assert!(!key.is_fitted());
+        let (params, fitted_n_ctx) = key.target_params().unwrap();
+        assert_eq!(params.n_gpu_layers(), 99);
+        assert_eq!(fitted_n_ctx, None);
+    }
+
+    #[test]
+    fn sidecar_key_carries_its_path_and_gpu_layers() {
+        let mut cfg = base_config();
+        cfg.n_gpu_layers = Some(20);
+        cfg.speculative = speculative(Some("/models/draft.gguf"));
+
+        let key = cache_key(
+            &cfg,
+            Path::new("/path/to/model.gguf"),
+            Some(Path::new("/models/draft.gguf")),
+            &[],
+            ResolvedPlacement::default(),
+        );
+        assert_eq!(key.model_path, Path::new("/path/to/model.gguf"));
+        assert_eq!(
+            key.mtp_model_path.as_deref(),
+            Some(Path::new("/models/draft.gguf"))
+        );
+        assert!(!key.load_mtp, "a sidecar replaces the bundled tensors");
+        // The sidecar follows the target's layer count unless it sets its own.
+        assert_eq!(key.mtp_n_gpu_layers, Some(20));
+
+        cfg.speculative.as_mut().unwrap().n_gpu_layers = Some(5);
+        let key = cache_key(
+            &cfg,
+            Path::new("/path/to/model.gguf"),
+            Some(Path::new("/models/draft.gguf")),
+            &[],
+            ResolvedPlacement::default(),
+        );
+        assert_eq!(key.mtp_n_gpu_layers, Some(5));
+        assert_eq!(
+            key.offload,
+            Offload::Fixed(Some(20)),
+            "target is unaffected"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_key_keeps_non_utf8_paths_intact() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = Path::new(OsStr::from_bytes(b"/models/caf\xe9.gguf"));
+        let key = cache_key(
+            &base_config(),
+            path,
+            None,
+            &[],
+            ResolvedPlacement::default(),
+        );
+        assert_eq!(key.model_path, path, "a lossy conversion would change it");
+        let other = Path::new(OsStr::from_bytes(b"/models/caf\xe8.gguf"));
+        let other = cache_key(
+            &base_config(),
+            other,
+            None,
+            &[],
+            ResolvedPlacement::default(),
+        );
+        assert_ne!(key, other, "distinct paths are distinct keys");
+    }
+
+    #[test]
+    fn fitted_context_never_overrides_a_configured_one() {
+        let mut cfg = base_config();
+        assert_eq!(
+            with_fitted_n_ctx(cfg.clone(), Some(32_768)).n_ctx,
+            Some(32_768)
+        );
+        assert_eq!(with_fitted_n_ctx(cfg.clone(), None).n_ctx, None);
+        cfg.n_ctx = Some(8192);
+        assert_eq!(with_fitted_n_ctx(cfg, Some(32_768)).n_ctx, Some(8192));
     }
 }
