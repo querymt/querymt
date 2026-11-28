@@ -1,0 +1,119 @@
+# Tasks
+
+## 1. Worktree spans and lock offloading (querymt-agent-services)
+
+- [ ] 1.1 Add the `worktree.lock.wait` span to `worktree/lock.rs` `with_lock_file`, covering acquisition only, with fields `lock` (batch/admin/gate, passed by the callers in `service.rs`, `allocate.rs` and `gate.rs`), `checkout` (the gate's canonical checkout root, set by `CheckoutMutationGate::run` only) and `polls` (design D1). In the same change, move the lock-file `create_dir_all` and `open` into `spawn_blocking`; keep `try_lock` and the 25 ms poll sleep on the async task (design D5). Covers `isolated-delegation` / "Contended gate is visible" with test `contended_gate_is_visible`: it holds a `CheckoutMutationGate` from one task, runs `capture_batch_baseline` from another, and asserts through an `opentelemetry_sdk` in-memory exporter (dev-dependency already present) that the gate's wait span lasts longer than zero, has `polls` > 0 and records the gate's canonical checkout in `checkout`. Verify with `cargo t-services -E 'test(/contended_gate_is_visible|admin_lock_serializes_concurrent_holders|admin_lock_blocks_across_processes/)'`.
+- [ ] 1.2 Move `CheckoutMutationGate::new`, `resolve_repository` and `relative_cwd` in `allocate_for_delegation_checked` into one `spawn_blocking` call (design D5). Verify the existing allocation tests still pass with `cargo t-services -E 'test(/allocate_for_delegation|isolated/)'`.
+- [ ] 1.3 Add the `worktree.provision` span (`workspace_id`) around `WorktreeAllocator::provision` and the `worktree.checkout` span (`files`) around `add_worktree` in `GixRepoOps` (design D1). Verify with a test `provision_spans_record_workspace_and_files` that allocates a workspace from a three-file fixture repository and asserts both spans, `worktree.checkout` nested under `worktree.provision`, and `files = 3`: `cargo t-services -E 'test(/provision_spans_record_workspace_and_files/)'`.
+
+## 2. Selective, hash-first baseline capture (querymt-agent-services)
+
+- [ ] 2.1 Add `pub struct CaptureStats { files_read, bytes_read, objects_written, reused_index_entries }` and the provided method `RepositoryOps::capture_working_state_with_stats(&self, checkout, commit_message) -> WorktreeResult<(CapturedWorkingState, CaptureStats)>`. Its default calls `capture_working_state` and returns `CaptureStats::default()`. `GixRepoOps` overrides it; `CapturedWorkingState` gains no fields (design D2, "Stats without an API break"). `capture_working_state_validated` calls the new method, opens the `worktree.capture` span and records `attempts` plus the summed stats on it (design D1). Re-export `CaptureStats` next to `CapturedState` in `worktree/mod.rs`. Verify that the existing `RepositoryOps` test mocks compile unchanged: `cargo check -p querymt-agent-services --all-targets`.
+- [ ] 2.2 Replace the gix status pass in `classify_and_reconcile` (`worktree/repo_ops.rs`) with the D2 procedure:
+  - untracked and ignored files come from `Repository::dirwalk`, with today's options;
+  - for each tracked path, a pure reuse predicate takes the real-index entry, `symlink_metadata`, `index.timestamp()`, `repo.stat_options()`, the entry flags and a has-conversion flag (resolved through the attribute stack, as `find_external_filter` does);
+  - reused entries keep the index object id and take their mode from disk metadata;
+  - all other paths are read.
+
+  Add these tests:
+  - unit test `reuse_predicate_rules` covers each predicate branch: stat match, stat mismatch, racy, each skip flag, conversion, path missing from the index;
+  - integration tests in `worktree/capture.rs`, using the 2.1 counters: `clean_checkout_reads_no_file_content`, `one_edited_file_is_the_only_file_read`, `staged_then_edited_file_keeps_working_contents`, `racily_clean_entry_is_read`, `assume_unchanged_file_edited_is_captured` and `crlf_converted_file_keeps_working_bytes`.
+
+  Test set-up notes:
+  - In `clean_checkout_reads_no_file_content`, wait one timestamp tick (or move the file mtimes back with `std::fs::File::set_modified`) before writing the index, so no entry is racy.
+  - `racily_clean_entry_is_read` sets `core.trustctime=false`. It runs `git add`, rewrites the file with same-size content, restores its recorded mtime with `File::set_modified`, and makes sure the index timestamp is not after that mtime. It asserts the file was read and its new content is in the baseline.
+  - `crlf_converted_file_keeps_working_bytes` uses `.gitattributes` `*.txt text eol=crlf` and asserts the baseline blob holds the CRLF working bytes.
+
+  Covers these `isolated-delegation` scenarios: "Clean checkout reads no file content", "One edited file is the only file read", "Staged then edited file keeps working contents", "Racily clean entry is read", "Assume-unchanged file edited is captured" and "Line-ending converted file keeps working bytes". Verify with `cargo t-services -E 'test(/reuse_predicate_rules|clean_checkout_reads_no_file_content|one_edited_file_is_the_only_file_read|staged_then_edited_file_keeps_working_contents|racily_clean_entry_is_read|assume_unchanged_file_edited_is_captured|crlf_converted_file_keeps_working_bytes/)'`.
+- [ ] 2.3 Replace `write_blob_from_disk`'s unconditional `write_blob_stream` with a hash-first write: files below 16 MiB read into memory and go through `Repository::write_blob`, larger files keep streaming (design D2). Use a named constant in `worktree/` documented as matching the snapshot store's `Limits::stream_bytes`. Covers `isolated-delegation` / "Repeated delegation from the same dirty state" and "New untracked file is written once", with tests of those names asserting `objects_written == 0` on the second capture and that exactly the new file's blob is written. Verify with `cargo t-services -E 'test(/repeated_delegation_from_the_same_dirty_state|new_untracked_file_is_written_once/)'`.
+- [ ] 2.4 Add test `selective_capture_matches_a_full_read`. It builds the mixed fixture from the existing "Mixed local changes" capture test: a tracked deletion, an edited file, a staged-only addition, an executable, a symlink, a non-ignored untracked file, an ignored file, plus an assume-unchanged edited file. It compares the captured tree with one built by reading every candidate file raw: a test helper that writes each surviving tracked or untracked path's raw bytes with its disk mode into a private index and writes the tree. The fixture has no conversion attributes, so the test also cross-checks against `git add -A` into a temporary `GIT_INDEX_FILE` plus `git write-tree`, after clearing the assume-unchanged bit in that temporary index. Covers `isolated-delegation` / "Selective capture matches a full read". Verify with `cargo t-services -E 'test(/selective_capture_matches_a_full_read/)'` and the whole capture suite `cargo t-services -E 'test(/worktree::capture/)'`.
+
+## 3. Stat-fingerprint capture validation (querymt-agent-services)
+
+- [ ] 3.1 Replace `source_manifest` with `(HEAD id, index manifest, path fingerprints)` (design D3):
+  - The path set is the tracked union plus the non-ignored untracked files from the same ignore-aware `dirwalk` as 2.2.
+  - Fingerprints are `(path, size, mtime_ns, mode)` plus `ctime` and `ino` under `cfg(unix)`, and file attributes elsewhere. `ctime` and nanoseconds follow `repo.stat_options()` (`core.trustctime`, `core.checkStat`).
+  - Record `capture_start` before the before-manifest.
+  - Accept an attempt when all of these hold: the manifests are equal; `captured.source_head` equals the manifest HEAD; the captured tree's path set equals the manifest's path set minus paths absent from disk; and every captured path with after-manifest mtime ≥ `capture_start − 2 s` re-hashes (without writing) to its captured id.
+  - Record a `worktree.capture.manifest` span (`paths`) per manifest and `racy_rehashed` on `worktree.capture`.
+
+  Covers `isolated-delegation` / "Quiet checkout needs one attempt" with test `quiet_checkout_needs_one_attempt`. It ages the fixture's mtimes beyond the racy window with `File::set_modified`, then asserts `attempts == 1`, `racy_rehashed == 0` and each changed file read once. Verify with `cargo t-services -E 'test(/quiet_checkout_needs_one_attempt/)'`.
+- [ ] 3.2 Add tests `external_edit_to_an_already_dirty_file_during_capture`, `untracked_file_created_during_capture` and `same_size_rewrite_after_the_read_is_detected`. They use a `RepositoryOps` test wrapper (as the existing mock in `worktree/capture.rs` tests does) that acts on the first attempt only:
+  - the first two edit an already dirty file, or create a new file, after the before-manifest;
+  - the third runs with `core.trustctime=false`. It rewrites a captured file with same-size content after `capture_working_state_with_stats` returns, then restores its previous mtime with `File::set_modified`, so only the racy re-hash can detect the change. The file's mtime is inside the racy window.
+
+  Each asserts that a second attempt runs and the baseline holds the new content. A variant that changes the file on every attempt asserts the "source changed during capture" error and that no workspace is allocated. Covers `isolated-delegation` / "External edit to an already dirty file during capture", "Untracked file created during capture" and "Same-size rewrite after the read is detected". Verify with `cargo t-services -E 'test(/external_edit_to_an_already_dirty_file_during_capture|untracked_file_created_during_capture|same_size_rewrite_after_the_read_is_detected/)'`.
+- [ ] 3.3 Add test `capture_span_explains_a_slow_capture`: a fixture with 100 untracked files of 100 KiB, with mtimes aged beyond the racy window, captured once, asserts the `worktree.capture` span records `attempts = 1`, `files_read = 100` and `bytes_read = 10240000`. Covers `isolated-delegation` / "Capture span explains a slow capture". Verify with `cargo t-services -E 'test(/capture_span_explains_a_slow_capture/)'`.
+- [ ] 3.4 Package checks: `cargo check -p querymt-agent-services --all-targets`, `cargo t-services`, `cargo fmt -p querymt-agent-services -- --check`, `cargo cl-services`.
+
+## 4. Snapshot store linked to the source's baseline objects (services + runtime)
+
+- [ ] 4.1 Add the provided method `SnapshotBackend::link_object_source(&self, worktree, objects_dir, baseline_commit)` (no-op default) in `snapshot/snapshot_backend.rs`. Implement it in `GitSnapshotBackend` (design D4):
+  - open or create the store;
+  - read the source's `extensions.objectFormat` from its config file (default `sha1`) and skip with a debug log on mismatch;
+  - under `SnapshotLock::try_exclusive` (or a blocking exclusive lock), ensure `objects/info/alternates` lists `objects_dir` exactly once and `qmt-baseline` holds `baseline_commit`, each written to a temporary file and renamed into place.
+
+  Covers `workspace-snapshots` / "Source repository with a different object format" with test `source_repository_with_a_different_object_format`. It links to a SHA-256 repository created with `git init --object-format=sha256` (skipped with a message if the installed git lacks it) and asserts no alternates entry and a normal snapshot. Add `link_object_source_is_idempotent`, which links twice and asserts a single alternates line. Verify with `cargo t-services -E 'test(/source_repository_with_a_different_object_format|link_object_source/)'`.
+- [ ] 4.2 Add a crate-private `ObjectSink` in `snapshot/git` and route every object write through it: the blob write in `write_file_blob`, the streaming write in `write_stream_blob`, the tree write in `capture.rs` and the snapshot commit.
+  - For an unlinked store it behaves exactly as today.
+  - For a linked store it computes the id first. It skips the write if the id is in the store's own loose `objects/` or in the baseline set (all tree and blob ids reachable from the `qmt-baseline` commit's tree, collected once per `create_snapshot` without loading blobs). Otherwise it writes into the store's own loose `objects/`, bypassing the alternates-aware existence check.
+  - Large files keep streaming and are always written.
+  - Confirm with `rg -n 'write_blob|write_object|\.commit\(|loose::Store' crates/agent-services/src/snapshot/git` that no write site remains outside the sink.
+
+  Verify with the existing suite `cargo t-services -E 'test(/snapshot::git/)'`.
+- [ ] 4.3 Add services tests `fresh_delegate_workspace_snapshot_writes_no_baseline_content`, `content_edited_in_the_workspace_is_stored_in_the_snapshot_store` and `large_baseline_file_is_stored_in_the_snapshot_store`.
+  - Each allocates a delegate workspace from a fixture repository, calls `link_object_source` with its common `objects` dir and baseline commit, and takes a snapshot.
+  - The first asserts, via `snapshot.git.track` and a loose-object count, that no blob is written and every in-scope file is recorded. It then edits one file, snapshots again, and asserts exactly that blob lands in the store's own `objects/`.
+  - The large-file test uses a small `Limits::stream_bytes` through `with_limits`. It asserts the large baseline blob is in the store's own `objects/` and that restore reports it in `streamed_files`.
+
+  Covers `workspace-snapshots` / "Fresh delegate workspace snapshot writes no baseline content", "Content edited in the workspace is stored in the snapshot store" and "Large baseline file is stored in the snapshot store". Verify with `cargo t-services -E 'test(/fresh_delegate_workspace_snapshot_writes_no_baseline_content|content_edited_in_the_workspace_is_stored_in_the_snapshot_store|large_baseline_file_is_stored_in_the_snapshot_store/)'`.
+- [ ] 4.4 Add test `undo_after_the_source_branch_moves`:
+  1. Allocate, link and snapshot.
+  2. In the source, run `git reset --hard HEAD~1`, `git reflog expire --expire=now --all` and `git gc --prune=now`.
+  3. Restore the first snapshot and assert the baseline content is back.
+  4. Run `git -C <store> fsck --connectivity-only` to show the store stays readable by `git`.
+  5. Run snapshot GC on the linked store and assert it succeeds.
+
+  Covers `workspace-snapshots` / "Undo after the source branch moves". Verify with `cargo t-services -E 'test(/undo_after_the_source_branch_moves/)'`.
+- [ ] 4.5 Add test `content_committed_in_the_workspace_survives_source_pruning`:
+  1. Allocate and link.
+  2. Create and `git commit` a new file inside the workspace, so its blob lands in the source's common object directory, then snapshot.
+  3. Delete the workspace branch after detaching the workspace HEAD, and run `git reflog expire --expire=now --all` plus `git gc --prune=now` in the source.
+  4. Restore the snapshot and assert the committed file's contents.
+  5. Assert `git -C <store> fsck --connectivity-only` passes and snapshot GC succeeds.
+
+  Covers `workspace-snapshots` / "Content committed in the workspace survives source pruning". Verify with `cargo t-services -E 'test(/content_committed_in_the_workspace_survives_source_pruning/)'`.
+- [ ] 4.6 Call `link_object_source` from the runtime when a session runtime is created with a cwd from a managed `WorkspaceBinding` whose record has a baseline. That covers fresh and handoff delegates (`agent/session_materializer.rs` `PreallocatedWorkspace`) and the top-level and fork isolated creation paths that bind a workspace. Pass `record.repository.common_dir.join("objects")` and `record.baseline.baseline_commit`, before the first pre-turn snapshot. Covers `workspace-snapshots` / "Unmanaged checkout keeps a self-contained store" with runtime test `unmanaged_checkout_keeps_a_self_contained_store`. It starts a plain local session in a git repository, runs one turn, and asserts the snapshot store has no `objects/info/alternates`. A companion test, `isolated_delegate_store_links_to_source_objects`, asserts that an isolated delegate's store has the alternates entry and a `qmt-baseline` naming the workspace's baseline commit. Verify with `cargo t-runtime -E 'test(/unmanaged_checkout_keeps_a_self_contained_store|isolated_delegate_store_links_to_source_objects/)'`.
+- [ ] 4.7 Package checks: `cargo check -p querymt-agent-services --all-targets`, `cargo t-services`, `cargo fmt -p querymt-agent-services -- --check`, `cargo cl-services`.
+
+## 5. Delegation startup spans (querymt-agent-runtime)
+
+- [ ] 5.1 In `delegation/core.rs` add these spans (design D1):
+  - `delegation.claim`: profile binding lookup and `claim_delegation`, field `attempts`;
+  - `delegation.queue_wait`: opened in the spawned task before `start_rx.await` and closed when `max_parallel.acquire_owned()` returns. It nests under `delegation.orchestrator.handle_event` through the task's `in_current_span`, as a sibling of `delegation.execute`;
+  - `delegation.admission`: the `admission` block of `execute_delegation_unboxed`;
+  - `delegation.resolve_parent`: LLM config, `get_session`, `resolve_session_cwd`, `get_workspace_by_session`; field `bound`;
+  - `delegation.allocate_workspace`: allocation or `begin_delegation_handoff`; fields `workspace_id`, `handoff`;
+  - `delegation.start_hook`.
+
+  Verify with `cargo check -p querymt-agent-runtime --features remote,oauth,plugin-loaders,api --all-targets`.
+- [ ] 5.2 Record `summary_bytes`, `strategy` and a new `outcome` field (`injected`, `rejected`, `timeout`, `skipped`) on the existing `delegation.summarize` span, and add the field to the span declaration. Verify with test `summarize_span_records_rejected_outcome`: a scripted summarizer returning `finish_reason = length` asserts `outcome = "rejected"` and no `delegation.inject_planning_context` span. Run it with `cargo t-runtime -E 'test(/summarize_span_records_rejected_outcome/)'`.
+- [ ] 5.3 Add runtime test `no_unattributed_startup_time`. It runs an isolated delegation against a git fixture with a workspace service and a scripted delegate, using the in-memory OTel exporter pattern of `agent/delegation_loop_tests.rs`. It takes the interval from the end of `delegation.claim` to the start of `remote.session_ref.prompt`, sums the time in it not covered by any descendant of the delegation's `delegation.orchestrator.handle_event` span, and asserts at most 50 ms. It also asserts that `delegation.queue_wait` and `delegation.execute` share that parent and that the capture, lock-wait, provisioning, hook and session-creation spans are descendants of `delegation.execute`. Covers `isolated-delegation` / "No unattributed startup time". Verify with `cargo t-runtime -E 'test(/no_unattributed_startup_time/)'`.
+- [ ] 5.4 Add runtime tests `queued_delegation_shows_its_wait` (with `max_parallel = 1` and two delegations, the second's `delegation.queue_wait` lasts until the first finishes) and `shared_delegation_has_no_allocation_spans` (no `delegation.allocate_workspace`, `worktree.capture` or `worktree.provision` span for a shared delegation). Covers `isolated-delegation` / "Queued delegation shows its wait" and "Shared delegation has no allocation spans". Verify with `cargo t-runtime -E 'test(/queued_delegation_shows_its_wait|shared_delegation_has_no_allocation_spans/)'`.
+- [ ] 5.5 Package checks: `cargo check -p querymt-agent-runtime --features remote,oauth,plugin-loaders,api --all-targets`, `cargo t-runtime -E 'test(/delegation/)'`, `cargo fmt -p querymt-agent-runtime -- --check`, `cargo cl-runtime`.
+
+## 6. Documentation
+
+- [ ] 6.1 In the docs page that covers tracing or worktrees under `docs/docs/agent/` (find it with `rg -l "snapshot.git.track|worktree" docs/docs`), document:
+  - the delegation startup spans, their parents and fields;
+  - the linked snapshot store of managed workspaces (alternates, `qmt-baseline`, baseline-only deduplication, large files always stored).
+
+  Verify the page builds with the docs workflow's mkdocs command, or by rendering it locally if mkdocs is installed.
+- [ ] 6.2 Add a CHANGELOG "Unreleased" entry under Behavior changes: faster isolated delegation startup, the new spans, and the snapshot-store alternates and `qmt-baseline` files of managed workspaces (not breaking). Add an entry for the additive API: `CaptureStats`, `RepositoryOps::capture_working_state_with_stats` and `SnapshotBackend::link_object_source`, all provided methods or new types. Verify by reading the entry against the proposal's Impact list.
+
+## 7. Integration checks
+
+- [ ] 7.1 Downstream build: `cargo t-agent --no-run`. Also `cargo check -p querymt-mobile-ffi` and `cargo check -p querymt-agent-py` with `PYO3_PYTHON` set to Python 3.10 or newer. Record skips if a toolchain is missing.
+- [ ] 7.2 Run `cargo t-agent -E 'test(/coder_team_profile_loads|delegat/)'` to confirm the facade's delegation tests still pass.
+- [ ] 7.3 Manual measurement on the querymt checkout with otelite: run the `coder-team` profile, delegate one isolated task, and record in the PR description the `worktree.capture`, `worktree.checkout`, `worktree.provision` and `snapshot.git.track` durations and counters before and after. The Goals target is allocation under 1 s, and a first delegate snapshot with no blobs below 16 MiB written. Note the `worktree.checkout` share for the copy-on-write follow-up (design Open Questions).
+- [ ] 7.4 `openspec validate speed-up-isolated-delegation-startup --strict` passes.
