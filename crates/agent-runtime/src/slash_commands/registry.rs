@@ -482,22 +482,20 @@ mod tests {
         assert!(reg.get("old").is_some());
 
         let dir = TempDir::new().unwrap();
+        let commands = dir.path().join(".qmt/commands");
+        fs::create_dir_all(&commands).unwrap();
         fs::write(
-            dir.path().join("new.md"),
+            commands.join("new.md"),
             "---\ndescription: New command\n---\nBody\n",
         )
         .unwrap();
 
         let scripts_config = SlashCommandScriptsConfig::default();
-        let diags = reg.reload(Some(dir.path()), true, true, &[], &scripts_config);
+        let diags = reg.reload(Some(dir.path()), false, true, &[], &scripts_config);
         assert!(diags.is_empty());
 
-        // Old command is gone
         assert!(reg.get("old").is_none());
-        // New command from project discovery (under .qmt/commands)
-        // But .qmt/commands doesn't exist in the temp dir, so let's check reload
-        // actually cleared old and didn't add anything (no .qmt/commands dir)
-        assert!(reg.is_empty());
+        assert!(reg.get("new").is_some());
     }
 
     #[test]

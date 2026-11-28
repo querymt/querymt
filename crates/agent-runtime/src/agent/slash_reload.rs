@@ -26,17 +26,19 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// Whether `changes` touches a command file (`*.md`) under `commands_dir`.
-///
-/// Anything else, including other files of the same folder, is not a reason
-/// to read the folder again.
-fn touches_commands(changes: &FileChangeSet, commands_dir: &Path) -> bool {
-    let is_command = |path: &Path| {
-        path.starts_with(commands_dir) && path.extension().is_some_and(|ext| ext == "md")
+/// Whether `changes` touches a command file or its directory below `watch_root`.
+fn touches_commands(changes: &FileChangeSet, commands_dir: &Path, watch_root: &Path) -> bool {
+    let touches = |path: &Path| {
+        let is_command =
+            path.starts_with(commands_dir) && path.extension().is_some_and(|ext| ext == "md");
+        // A new or moved subtree can arrive before the recursive watcher sees its files.
+        let is_command_dir =
+            path != watch_root && path.starts_with(watch_root) && commands_dir.starts_with(path);
+        is_command || is_command_dir
     };
     changes.changes.iter().any(|change| {
-        is_command(&change.path)
-            || matches!(&change.kind, FileChangeKind::Renamed { from } if is_command(from))
+        touches(&change.path)
+            || matches!(&change.kind, FileChangeKind::Renamed { from } if touches(from))
     })
 }
 
@@ -142,26 +144,30 @@ async fn watch_session(
             return;
         }
     };
-    let commands_dir = handle.file_watcher.root().join(".qmt/commands");
-    let mut changes = handle.file_watcher.subscribe_changes();
-
-    // Files may have changed before the subscription existed.
-    match runtime.upgrade() {
-        Some(runtime) => reload_session(&config, &runtime, &session_id).await,
-        None => return,
-    }
+    let watcher = &handle.file_watcher;
+    let watch_root = watcher.root();
+    let commands_dir = watch_root.join(".qmt/commands");
+    let mut changes = watcher.subscribe_changes();
 
     loop {
-        match changes.recv().await {
-            Ok(set) if !touches_commands(&set, &commands_dir) => continue,
-            // A lagged receiver lost changes, which may include ours.
-            Ok(_) | Err(RecvError::Lagged(_)) => {}
-            Err(RecvError::Closed) => return,
-        }
         let Some(runtime) = runtime.upgrade() else {
             return;
         };
-        reload_session(&config, &runtime, &session_id).await;
+        // Also catch changes made before subscribing, without bypassing the
+        // watcher's ignore rules. Ignored project folders are read on open.
+        if watcher.tracks_path(&commands_dir, true) {
+            reload_session(&config, &runtime, &session_id).await;
+        }
+        drop(runtime);
+
+        loop {
+            match changes.recv().await {
+                Ok(set) if !touches_commands(&set, &commands_dir, watch_root) => continue,
+                // A lagged receiver lost changes, which may include ours.
+                Ok(_) | Err(RecvError::Lagged(_)) => break,
+                Err(RecvError::Closed) => return,
+            }
+        }
     }
 }
 
@@ -196,7 +202,7 @@ where
         let rebuild = Arc::new(rebuild);
         loop {
             match changes.recv().await {
-                Ok(set) if !touches_commands(&set, &commands_dir) => continue,
+                Ok(set) if !touches_commands(&set, &commands_dir, &commands_dir) => continue,
                 Ok(_) | Err(RecvError::Lagged(_)) => {}
                 Err(RecvError::Closed) => return,
             }
@@ -241,13 +247,29 @@ mod tests {
     #[test]
     fn only_markdown_files_in_the_commands_folder_count() {
         let dir = Path::new("/p/.qmt/commands");
-        let hit =
-            |path: &str| touches_commands(&set(vec![change(path, FileChangeKind::Modified)]), dir);
+        let hit = |path: &str| {
+            touches_commands(
+                &set(vec![change(path, FileChangeKind::Modified)]),
+                dir,
+                Path::new("/p"),
+            )
+        };
         assert!(hit("/p/.qmt/commands/explain.md"));
         assert!(hit("/p/.qmt/commands/sub/nested.md"));
         assert!(!hit("/p/.qmt/commands/notes.txt"));
         assert!(!hit("/p/.qmt/other/explain.md"));
         assert!(!hit("/p/src/main.rs"));
+    }
+
+    #[test]
+    fn a_command_directory_can_arrive_without_child_events() {
+        let root = Path::new("/p");
+        let dir = root.join(".qmt/commands");
+        let changes = set(vec![FileChange {
+            is_dir: true,
+            ..change("/p/.qmt", FileChangeKind::Created)
+        }]);
+        assert!(touches_commands(&changes, &dir, root));
     }
 
     #[test]
@@ -258,6 +280,7 @@ mod tests {
         assert!(touches_commands(
             &set(vec![change("/p/elsewhere/old.md", renamed)]),
             Path::new("/p/.qmt/commands"),
+            Path::new("/p"),
         ));
     }
 }

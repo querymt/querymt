@@ -562,6 +562,8 @@ async fn unrelated_file_changes_send_no_update() {
     )
     .await;
     let folder = tempfile::TempDir::new().unwrap();
+    git_init(folder.path());
+    std::fs::create_dir_all(folder.path().join(".qmt/commands")).unwrap();
     let session = open_session(&f, folder.path()).await;
     let mut events = f.handle.subscribe_events();
     wait_for_watcher(&mut events, &session, folder.path()).await;
@@ -592,9 +594,14 @@ async fn configured_paths_are_read_at_startup_only() {
     )
     .await;
     let folder = tempfile::TempDir::new().unwrap();
+    git_init(folder.path());
+    std::fs::create_dir_all(folder.path().join(".qmt/commands")).unwrap();
     let session = open_session(&f, folder.path()).await;
     let mut events = f.handle.subscribe_events();
     wait_for_watcher(&mut events, &session, folder.path()).await;
+    // The catch-up scan can announce the probe before its debounced file event.
+    // Let that event drain before testing the configured path in isolation.
+    expect_no_update(&mut events, &session).await;
 
     std::fs::write(
         extra.path().join("configured.md"),

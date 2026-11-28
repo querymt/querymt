@@ -206,9 +206,8 @@ pub struct FileIndexWatcher {
     /// and subscribers never copy the file list.
     index: Arc<ArcSwapOption<FileIndex>>,
     /// Current gitignore matcher, swapped atomically when .gitignore changes.
-    /// Kept alive here so the Arc isn't dropped; the task holds a clone.
-    #[allow(dead_code)]
     gitignore: Arc<ArcSwap<Gitignore>>,
+    overrides: Override,
     root: PathBuf,
     config: FileIndexConfig,
 
@@ -528,6 +527,7 @@ impl FileIndexWatcher {
         Ok(Self {
             index,
             gitignore,
+            overrides,
             root,
             config,
             index_tx,
@@ -557,7 +557,7 @@ impl FileIndexWatcher {
 
     /// Force an immediate index rebuild.
     pub async fn refresh(&self) -> Result<Arc<FileIndex>, FileIndexError> {
-        let overrides = compile_overrides(&self.root, &self.config)?;
+        let overrides = self.overrides.clone();
         let root = self.root.clone();
         let config = self.config.clone();
 
@@ -565,6 +565,18 @@ impl FileIndexWatcher {
             build_file_index_blocking(root, config, overrides, "Failed to refresh index").await?;
 
         Ok(publish_index(&self.index, &self.index_tx, new_index))
+    }
+
+    /// Whether an absolute path is in scope for change notifications.
+    pub fn tracks_path(&self, path: &Path, is_dir: bool) -> bool {
+        path.strip_prefix(&self.root).is_ok_and(|relative| {
+            !is_ignored(
+                &relative.to_string_lossy(),
+                is_dir,
+                &self.overrides,
+                &self.gitignore.load(),
+            )
+        })
     }
 
     /// Get the root directory being watched.
