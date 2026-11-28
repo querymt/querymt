@@ -21,7 +21,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="zensical-0.1.3">
+      <meta name="generator" content="zensical-0.1.4">
     
     
       
@@ -32,7 +32,7 @@
       
         
       
-      <link rel="stylesheet" href="../../assets/stylesheets/modern/main.e2cf241e.min.css">
+      <link rel="stylesheet" href="../../assets/stylesheets/modern/main.5cb9f1ba.min.css">
       
         
           
@@ -1857,154 +1857,209 @@
 <p>A session advertises to ACP clients exactly the commands it can run: its user
 commands plus the native built-ins available on its host. A session hosted on a
 remote mesh node currently advertises only <code>/compact</code>.</p>
-<h3 id="help-command"><code>/help [command]</code></h3>
-<p>Show available slash commands or detailed help for a specific command.</p>
+<h3 id="command-descriptor">Command descriptor</h3>
+<p>Every advertised command (built-in or user-defined) carries a descriptor in
+the <code>_meta.querymt</code> of its <code>available_commands_update</code> entry, so a client can
+tell what a command is without guessing from its name:</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Values</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>source</code></td>
+<td><code>builtin</code>, <code>global</code>, <code>project</code>, <code>configured</code></td>
+<td>Where the command comes from. A command defined in several places reports the source that won.</td>
+</tr>
+<tr>
+<td><code>effect</code></td>
+<td><code>prompt</code>, <code>action</code></td>
+<td><code>prompt</code>: the command becomes a model turn. <code>action</code>: the agent runs it itself.</td>
+</tr>
+<tr>
+<td><code>input</code></td>
+<td><code>none</code>, <code>optional</code>, <code>required</code></td>
+<td>What the command asks of the user's input.</td>
+</tr>
+<tr>
+<td><code>accepts</code></td>
+<td><code>prompt</code>, <code>queue</code></td>
+<td>The submissions the command runs from.</td>
+</tr>
+</tbody>
+</table>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-5-1">1</a></span>
 <span class="normal"><a href="#__codelineno-5-2">2</a></span>
 <span class="normal"><a href="#__codelineno-5-3">3</a></span>
-<span class="normal"><a href="#__codelineno-5-4">4</a></span>
-<span class="normal"><a href="#__codelineno-5-5">5</a></span>
-<span class="normal"><a href="#__codelineno-5-6">6</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1"></a><span class="c1"># List all commands</span>
-<a id="__codelineno-5-2" name="__codelineno-5-2"></a>&gt;<span class="w"> </span>/help
-<a id="__codelineno-5-3" name="__codelineno-5-3"></a>
-<a id="__codelineno-5-4" name="__codelineno-5-4"></a><span class="c1"># Show help for specific command</span>
-<a id="__codelineno-5-5" name="__codelineno-5-5"></a>&gt;<span class="w"> </span>/help<span class="w"> </span>mcp
-<a id="__codelineno-5-6" name="__codelineno-5-6"></a>&gt;<span class="w"> </span>/help<span class="w"> </span>optimize
+<span class="normal"><a href="#__codelineno-5-4">4</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1"></a><span class="p">{</span><span class="w"> </span><span class="nt">"name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"explain"</span><span class="p">,</span><span class="w"> </span><span class="nt">"description"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Explain a topic"</span><span class="p">,</span>
+<a id="__codelineno-5-2" name="__codelineno-5-2"></a><span class="w">  </span><span class="nt">"input"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">"hint"</span><span class="p">:</span><span class="w"> </span><span class="s2">"[topic]"</span><span class="w"> </span><span class="p">},</span>
+<a id="__codelineno-5-3" name="__codelineno-5-3"></a><span class="w">  </span><span class="nt">"_meta"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">"querymt"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">"source"</span><span class="p">:</span><span class="w"> </span><span class="s2">"project"</span><span class="p">,</span><span class="w"> </span><span class="nt">"effect"</span><span class="p">:</span><span class="w"> </span><span class="s2">"prompt"</span><span class="p">,</span>
+<a id="__codelineno-5-4" name="__codelineno-5-4"></a><span class="w">                          </span><span class="nt">"input"</span><span class="p">:</span><span class="w"> </span><span class="s2">"required"</span><span class="p">,</span><span class="w"> </span><span class="nt">"accepts"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"prompt"</span><span class="p">,</span><span class="w"> </span><span class="s2">"queue"</span><span class="p">]</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="p">}</span>
+</code></pre></div></td></tr></table></div>
+<p><code>/compact</code> is <code>builtin</code>, <code>action</code>, <code>optional</code>, <code>["prompt", "queue"]</code>;
+<code>/worktree</code> is <code>builtin</code>, <code>action</code>, <code>required</code>, <code>["prompt"]</code>.</p>
+<h3 id="commands-and-steering">Commands and steering</h3>
+<p>While a turn is running, a client can steer it with extra input. A command is
+never steered: if the first text block names a command of the session's
+catalog (built-in or user-defined), the submission is rejected with an
+invalid-prompt error that names the command and says to queue it or submit it
+with <code>session/prompt</code>. Nothing of it reaches the running turn.</p>
+<p>Steered text that starts with <code>/</code> but names no command of the catalog, such as
+<code>/tmp/build.log is empty</code>, is accepted as steering and reaches the model
+unchanged. Earlier versions rejected all steered text that started with <code>/</code>
+with <code>slash_command_not_steerable</code>; that error no longer exists.</p>
+<h3 id="help-command"><code>/help [command]</code></h3>
+<p>Show available slash commands or detailed help for a specific command.</p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-6-1">1</a></span>
+<span class="normal"><a href="#__codelineno-6-2">2</a></span>
+<span class="normal"><a href="#__codelineno-6-3">3</a></span>
+<span class="normal"><a href="#__codelineno-6-4">4</a></span>
+<span class="normal"><a href="#__codelineno-6-5">5</a></span>
+<span class="normal"><a href="#__codelineno-6-6">6</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1"></a><span class="c1"># List all commands</span>
+<a id="__codelineno-6-2" name="__codelineno-6-2"></a>&gt;<span class="w"> </span>/help
+<a id="__codelineno-6-3" name="__codelineno-6-3"></a>
+<a id="__codelineno-6-4" name="__codelineno-6-4"></a><span class="c1"># Show help for specific command</span>
+<a id="__codelineno-6-5" name="__codelineno-6-5"></a>&gt;<span class="w"> </span>/help<span class="w"> </span>mcp
+<a id="__codelineno-6-6" name="__codelineno-6-6"></a>&gt;<span class="w"> </span>/help<span class="w"> </span>optimize
 </code></pre></div></td></tr></table></div>
 <p><strong>Output format:</strong>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-6-1"> 1</a></span>
-<span class="normal"><a href="#__codelineno-6-2"> 2</a></span>
-<span class="normal"><a href="#__codelineno-6-3"> 3</a></span>
-<span class="normal"><a href="#__codelineno-6-4"> 4</a></span>
-<span class="normal"><a href="#__codelineno-6-5"> 5</a></span>
-<span class="normal"><a href="#__codelineno-6-6"> 6</a></span>
-<span class="normal"><a href="#__codelineno-6-7"> 7</a></span>
-<span class="normal"><a href="#__codelineno-6-8"> 8</a></span>
-<span class="normal"><a href="#__codelineno-6-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-6-10">10</a></span>
-<span class="normal"><a href="#__codelineno-6-11">11</a></span>
-<span class="normal"><a href="#__codelineno-6-12">12</a></span>
-<span class="normal"><a href="#__codelineno-6-13">13</a></span>
-<span class="normal"><a href="#__codelineno-6-14">14</a></span>
-<span class="normal"><a href="#__codelineno-6-15">15</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1"></a>Available commands:
-<a id="__codelineno-6-2" name="__codelineno-6-2"></a>
-<a id="__codelineno-6-3" name="__codelineno-6-3"></a>Built-in:
-<a id="__codelineno-6-4" name="__codelineno-6-4"></a>  /help [command]    Show help information
-<a id="__codelineno-6-5" name="__codelineno-6-5"></a>  /mcp &lt;subcommand&gt;  Manage MCP servers
-<a id="__codelineno-6-6" name="__codelineno-6-6"></a>  /clear             Clear screen
-<a id="__codelineno-6-7" name="__codelineno-6-7"></a>  /exit              Exit application
-<a id="__codelineno-6-8" name="__codelineno-6-8"></a>
-<a id="__codelineno-6-9" name="__codelineno-6-9"></a>User (~/.qmt/commands/):
-<a id="__codelineno-6-10" name="__codelineno-6-10"></a>  /optimize &lt;file&gt;   Optimize code for performance
-<a id="__codelineno-6-11" name="__codelineno-6-11"></a>  /review [target]   Review code changes
-<a id="__codelineno-6-12" name="__codelineno-6-12"></a>
-<a id="__codelineno-6-13" name="__codelineno-6-13"></a>Project (.qmt/commands/):
-<a id="__codelineno-6-14" name="__codelineno-6-14"></a>  /test [options]    Run project tests
-<a id="__codelineno-6-15" name="__codelineno-6-15"></a>  /deploy [env]      Deploy to environment
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-7-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-7-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-7-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-7-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-7-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-7-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-7-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-7-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-7-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-7-10">10</a></span>
+<span class="normal"><a href="#__codelineno-7-11">11</a></span>
+<span class="normal"><a href="#__codelineno-7-12">12</a></span>
+<span class="normal"><a href="#__codelineno-7-13">13</a></span>
+<span class="normal"><a href="#__codelineno-7-14">14</a></span>
+<span class="normal"><a href="#__codelineno-7-15">15</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1"></a>Available commands:
+<a id="__codelineno-7-2" name="__codelineno-7-2"></a>
+<a id="__codelineno-7-3" name="__codelineno-7-3"></a>Built-in:
+<a id="__codelineno-7-4" name="__codelineno-7-4"></a>  /help [command]    Show help information
+<a id="__codelineno-7-5" name="__codelineno-7-5"></a>  /mcp &lt;subcommand&gt;  Manage MCP servers
+<a id="__codelineno-7-6" name="__codelineno-7-6"></a>  /clear             Clear screen
+<a id="__codelineno-7-7" name="__codelineno-7-7"></a>  /exit              Exit application
+<a id="__codelineno-7-8" name="__codelineno-7-8"></a>
+<a id="__codelineno-7-9" name="__codelineno-7-9"></a>User (~/.qmt/commands/):
+<a id="__codelineno-7-10" name="__codelineno-7-10"></a>  /optimize &lt;file&gt;   Optimize code for performance
+<a id="__codelineno-7-11" name="__codelineno-7-11"></a>  /review [target]   Review code changes
+<a id="__codelineno-7-12" name="__codelineno-7-12"></a>
+<a id="__codelineno-7-13" name="__codelineno-7-13"></a>Project (.qmt/commands/):
+<a id="__codelineno-7-14" name="__codelineno-7-14"></a>  /test [options]    Run project tests
+<a id="__codelineno-7-15" name="__codelineno-7-15"></a>  /deploy [env]      Deploy to environment
 </code></pre></div></td></tr></table></div></p>
 <h3 id="mcp-subcommand"><code>/mcp &lt;subcommand&gt;</code></h3>
 <p>Interact with the MCP (Model Context Protocol) server registry.</p>
 <h4 id="mcp-list-no-cache-limit-n"><code>/mcp list [--no-cache] [--limit N]</code></h4>
 <p>List available MCP servers:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-7-1">1</a></span>
-<span class="normal"><a href="#__codelineno-7-2">2</a></span>
-<span class="normal"><a href="#__codelineno-7-3">3</a></span>
-<span class="normal"><a href="#__codelineno-7-4">4</a></span>
-<span class="normal"><a href="#__codelineno-7-5">5</a></span>
-<span class="normal"><a href="#__codelineno-7-6">6</a></span>
-<span class="normal"><a href="#__codelineno-7-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1"></a>&gt;<span class="w"> </span>/mcp<span class="w"> </span>list
-<a id="__codelineno-7-2" name="__codelineno-7-2"></a>
-<a id="__codelineno-7-3" name="__codelineno-7-3"></a><span class="c1"># Skip cache, fetch fresh list</span>
-<a id="__codelineno-7-4" name="__codelineno-7-4"></a>&gt;<span class="w"> </span>/mcp<span class="w"> </span>list<span class="w"> </span>--no-cache
-<a id="__codelineno-7-5" name="__codelineno-7-5"></a>
-<a id="__codelineno-7-6" name="__codelineno-7-6"></a><span class="c1"># Limit results</span>
-<a id="__codelineno-7-7" name="__codelineno-7-7"></a>&gt;<span class="w"> </span>/mcp<span class="w"> </span>list<span class="w"> </span>--limit<span class="w"> </span><span class="m">10</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-8-1">1</a></span>
+<span class="normal"><a href="#__codelineno-8-2">2</a></span>
+<span class="normal"><a href="#__codelineno-8-3">3</a></span>
+<span class="normal"><a href="#__codelineno-8-4">4</a></span>
+<span class="normal"><a href="#__codelineno-8-5">5</a></span>
+<span class="normal"><a href="#__codelineno-8-6">6</a></span>
+<span class="normal"><a href="#__codelineno-8-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1"></a>&gt;<span class="w"> </span>/mcp<span class="w"> </span>list
+<a id="__codelineno-8-2" name="__codelineno-8-2"></a>
+<a id="__codelineno-8-3" name="__codelineno-8-3"></a><span class="c1"># Skip cache, fetch fresh list</span>
+<a id="__codelineno-8-4" name="__codelineno-8-4"></a>&gt;<span class="w"> </span>/mcp<span class="w"> </span>list<span class="w"> </span>--no-cache
+<a id="__codelineno-8-5" name="__codelineno-8-5"></a>
+<a id="__codelineno-8-6" name="__codelineno-8-6"></a><span class="c1"># Limit results</span>
+<a id="__codelineno-8-7" name="__codelineno-8-7"></a>&gt;<span class="w"> </span>/mcp<span class="w"> </span>list<span class="w"> </span>--limit<span class="w"> </span><span class="m">10</span>
 </code></pre></div></td></tr></table></div>
 <p><strong>Output:</strong>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-8-1"> 1</a></span>
-<span class="normal"><a href="#__codelineno-8-2"> 2</a></span>
-<span class="normal"><a href="#__codelineno-8-3"> 3</a></span>
-<span class="normal"><a href="#__codelineno-8-4"> 4</a></span>
-<span class="normal"><a href="#__codelineno-8-5"> 5</a></span>
-<span class="normal"><a href="#__codelineno-8-6"> 6</a></span>
-<span class="normal"><a href="#__codelineno-8-7"> 7</a></span>
-<span class="normal"><a href="#__codelineno-8-8"> 8</a></span>
-<span class="normal"><a href="#__codelineno-8-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-8-10">10</a></span>
-<span class="normal"><a href="#__codelineno-8-11">11</a></span>
-<span class="normal"><a href="#__codelineno-8-12">12</a></span>
-<span class="normal"><a href="#__codelineno-8-13">13</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1"></a>Available MCP servers:
-<a id="__codelineno-8-2" name="__codelineno-8-2"></a>
-<a id="__codelineno-8-3" name="__codelineno-8-3"></a>1. filesystem (v1.2.0)
-<a id="__codelineno-8-4" name="__codelineno-8-4"></a>   Local filesystem access
-<a id="__codelineno-8-5" name="__codelineno-8-5"></a>   Install: npx -y @modelcontextprotocol/server-filesystem
-<a id="__codelineno-8-6" name="__codelineno-8-6"></a>
-<a id="__codelineno-8-7" name="__codelineno-8-7"></a>2. github (v2.0.1)
-<a id="__codelineno-8-8" name="__codelineno-8-8"></a>   GitHub API integration
-<a id="__codelineno-8-9" name="__codelineno-8-9"></a>   Install: npx -y @modelcontextprotocol/server-github
-<a id="__codelineno-8-10" name="__codelineno-8-10"></a>
-<a id="__codelineno-8-11" name="__codelineno-8-11"></a>3. postgres (v1.0.0)
-<a id="__codelineno-8-12" name="__codelineno-8-12"></a>   PostgreSQL database access
-<a id="__codelineno-8-13" name="__codelineno-8-13"></a>   Install: npx -y @modelcontextprotocol/server-postgres
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-9-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-9-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-9-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-9-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-9-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-9-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-9-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-9-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-9-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-9-10">10</a></span>
+<span class="normal"><a href="#__codelineno-9-11">11</a></span>
+<span class="normal"><a href="#__codelineno-9-12">12</a></span>
+<span class="normal"><a href="#__codelineno-9-13">13</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1"></a>Available MCP servers:
+<a id="__codelineno-9-2" name="__codelineno-9-2"></a>
+<a id="__codelineno-9-3" name="__codelineno-9-3"></a>1. filesystem (v1.2.0)
+<a id="__codelineno-9-4" name="__codelineno-9-4"></a>   Local filesystem access
+<a id="__codelineno-9-5" name="__codelineno-9-5"></a>   Install: npx -y @modelcontextprotocol/server-filesystem
+<a id="__codelineno-9-6" name="__codelineno-9-6"></a>
+<a id="__codelineno-9-7" name="__codelineno-9-7"></a>2. github (v2.0.1)
+<a id="__codelineno-9-8" name="__codelineno-9-8"></a>   GitHub API integration
+<a id="__codelineno-9-9" name="__codelineno-9-9"></a>   Install: npx -y @modelcontextprotocol/server-github
+<a id="__codelineno-9-10" name="__codelineno-9-10"></a>
+<a id="__codelineno-9-11" name="__codelineno-9-11"></a>3. postgres (v1.0.0)
+<a id="__codelineno-9-12" name="__codelineno-9-12"></a>   PostgreSQL database access
+<a id="__codelineno-9-13" name="__codelineno-9-13"></a>   Install: npx -y @modelcontextprotocol/server-postgres
 </code></pre></div></td></tr></table></div></p>
 <h4 id="mcp-search-query"><code>/mcp search &lt;query&gt;</code></h4>
 <p>Search for MCP servers by keyword:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-9-1">1</a></span>
-<span class="normal"><a href="#__codelineno-9-2">2</a></span>
-<span class="normal"><a href="#__codelineno-9-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1"></a>&gt;<span class="w"> </span>/mcp<span class="w"> </span>search<span class="w"> </span>database
-<a id="__codelineno-9-2" name="__codelineno-9-2"></a>&gt;<span class="w"> </span>/mcp<span class="w"> </span>search<span class="w"> </span>file
-<a id="__codelineno-9-3" name="__codelineno-9-3"></a>&gt;<span class="w"> </span>/mcp<span class="w"> </span>search<span class="w"> </span>github
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-10-1">1</a></span>
+<span class="normal"><a href="#__codelineno-10-2">2</a></span>
+<span class="normal"><a href="#__codelineno-10-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1"></a>&gt;<span class="w"> </span>/mcp<span class="w"> </span>search<span class="w"> </span>database
+<a id="__codelineno-10-2" name="__codelineno-10-2"></a>&gt;<span class="w"> </span>/mcp<span class="w"> </span>search<span class="w"> </span>file
+<a id="__codelineno-10-3" name="__codelineno-10-3"></a>&gt;<span class="w"> </span>/mcp<span class="w"> </span>search<span class="w"> </span>github
 </code></pre></div></td></tr></table></div>
 <h4 id="mcp-info-server-id-version"><code>/mcp info &lt;server-id&gt; [version]</code></h4>
 <p>Show detailed information about an MCP server:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-10-1">1</a></span>
-<span class="normal"><a href="#__codelineno-10-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1"></a>&gt;<span class="w"> </span>/mcp<span class="w"> </span>info<span class="w"> </span>filesystem
-<a id="__codelineno-10-2" name="__codelineno-10-2"></a>&gt;<span class="w"> </span>/mcp<span class="w"> </span>info<span class="w"> </span>github<span class="w"> </span>v2.0.1
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-11-1">1</a></span>
+<span class="normal"><a href="#__codelineno-11-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-11-1" name="__codelineno-11-1"></a>&gt;<span class="w"> </span>/mcp<span class="w"> </span>info<span class="w"> </span>filesystem
+<a id="__codelineno-11-2" name="__codelineno-11-2"></a>&gt;<span class="w"> </span>/mcp<span class="w"> </span>info<span class="w"> </span>github<span class="w"> </span>v2.0.1
 </code></pre></div></td></tr></table></div>
 <p><strong>Output:</strong>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-11-1"> 1</a></span>
-<span class="normal"><a href="#__codelineno-11-2"> 2</a></span>
-<span class="normal"><a href="#__codelineno-11-3"> 3</a></span>
-<span class="normal"><a href="#__codelineno-11-4"> 4</a></span>
-<span class="normal"><a href="#__codelineno-11-5"> 5</a></span>
-<span class="normal"><a href="#__codelineno-11-6"> 6</a></span>
-<span class="normal"><a href="#__codelineno-11-7"> 7</a></span>
-<span class="normal"><a href="#__codelineno-11-8"> 8</a></span>
-<span class="normal"><a href="#__codelineno-11-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-11-10">10</a></span>
-<span class="normal"><a href="#__codelineno-11-11">11</a></span>
-<span class="normal"><a href="#__codelineno-11-12">12</a></span>
-<span class="normal"><a href="#__codelineno-11-13">13</a></span>
-<span class="normal"><a href="#__codelineno-11-14">14</a></span>
-<span class="normal"><a href="#__codelineno-11-15">15</a></span>
-<span class="normal"><a href="#__codelineno-11-16">16</a></span>
-<span class="normal"><a href="#__codelineno-11-17">17</a></span>
-<span class="normal"><a href="#__codelineno-11-18">18</a></span>
-<span class="normal"><a href="#__codelineno-11-19">19</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-11-1" name="__codelineno-11-1"></a>MCP Server: filesystem
-<a id="__codelineno-11-2" name="__codelineno-11-2"></a>
-<a id="__codelineno-11-3" name="__codelineno-11-3"></a>Version: 1.2.0
-<a id="__codelineno-11-4" name="__codelineno-11-4"></a>Description: Local filesystem access
-<a id="__codelineno-11-5" name="__codelineno-11-5"></a>Author: Anthropic
-<a id="__codelineno-11-6" name="__codelineno-11-6"></a>License: MIT
-<a id="__codelineno-11-7" name="__codelineno-11-7"></a>
-<a id="__codelineno-11-8" name="__codelineno-11-8"></a>Installation:
-<a id="__codelineno-11-9" name="__codelineno-11-9"></a>  npx -y @modelcontextprotocol/server-filesystem [root]
-<a id="__codelineno-11-10" name="__codelineno-11-10"></a>
-<a id="__codelineno-11-11" name="__codelineno-11-11"></a>Tools provided:
-<a id="__codelineno-11-12" name="__codelineno-11-12"></a>  - read_file: Read file contents
-<a id="__codelineno-11-13" name="__codelineno-11-13"></a>  - write_file: Write file contents
-<a id="__codelineno-11-14" name="__codelineno-11-14"></a>  - list_directory: List directory contents
-<a id="__codelineno-11-15" name="__codelineno-11-15"></a>  - create_directory: Create directory
-<a id="__codelineno-11-16" name="__codelineno-11-16"></a>  - move_file: Move/rename file
-<a id="__codelineno-11-17" name="__codelineno-11-17"></a>
-<a id="__codelineno-11-18" name="__codelineno-11-18"></a>Configuration:
-<a id="__codelineno-11-19" name="__codelineno-11-19"></a>  root: Root directory to expose (required)
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-12-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-12-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-12-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-12-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-12-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-12-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-12-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-12-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-12-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-12-10">10</a></span>
+<span class="normal"><a href="#__codelineno-12-11">11</a></span>
+<span class="normal"><a href="#__codelineno-12-12">12</a></span>
+<span class="normal"><a href="#__codelineno-12-13">13</a></span>
+<span class="normal"><a href="#__codelineno-12-14">14</a></span>
+<span class="normal"><a href="#__codelineno-12-15">15</a></span>
+<span class="normal"><a href="#__codelineno-12-16">16</a></span>
+<span class="normal"><a href="#__codelineno-12-17">17</a></span>
+<span class="normal"><a href="#__codelineno-12-18">18</a></span>
+<span class="normal"><a href="#__codelineno-12-19">19</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1"></a>MCP Server: filesystem
+<a id="__codelineno-12-2" name="__codelineno-12-2"></a>
+<a id="__codelineno-12-3" name="__codelineno-12-3"></a>Version: 1.2.0
+<a id="__codelineno-12-4" name="__codelineno-12-4"></a>Description: Local filesystem access
+<a id="__codelineno-12-5" name="__codelineno-12-5"></a>Author: Anthropic
+<a id="__codelineno-12-6" name="__codelineno-12-6"></a>License: MIT
+<a id="__codelineno-12-7" name="__codelineno-12-7"></a>
+<a id="__codelineno-12-8" name="__codelineno-12-8"></a>Installation:
+<a id="__codelineno-12-9" name="__codelineno-12-9"></a>  npx -y @modelcontextprotocol/server-filesystem [root]
+<a id="__codelineno-12-10" name="__codelineno-12-10"></a>
+<a id="__codelineno-12-11" name="__codelineno-12-11"></a>Tools provided:
+<a id="__codelineno-12-12" name="__codelineno-12-12"></a>  - read_file: Read file contents
+<a id="__codelineno-12-13" name="__codelineno-12-13"></a>  - write_file: Write file contents
+<a id="__codelineno-12-14" name="__codelineno-12-14"></a>  - list_directory: List directory contents
+<a id="__codelineno-12-15" name="__codelineno-12-15"></a>  - create_directory: Create directory
+<a id="__codelineno-12-16" name="__codelineno-12-16"></a>  - move_file: Move/rename file
+<a id="__codelineno-12-17" name="__codelineno-12-17"></a>
+<a id="__codelineno-12-18" name="__codelineno-12-18"></a>Configuration:
+<a id="__codelineno-12-19" name="__codelineno-12-19"></a>  root: Root directory to expose (required)
 </code></pre></div></td></tr></table></div></p>
 <h4 id="mcp-add-server-id-version"><code>/mcp add &lt;server-id&gt; [version]</code></h4>
 <p>Add an MCP server to your configuration:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-12-1">1</a></span>
-<span class="normal"><a href="#__codelineno-12-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1"></a>&gt;<span class="w"> </span>/mcp<span class="w"> </span>add<span class="w"> </span>filesystem
-<a id="__codelineno-12-2" name="__codelineno-12-2"></a>&gt;<span class="w"> </span>/mcp<span class="w"> </span>add<span class="w"> </span>github<span class="w"> </span>v2.0.1
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-13-1">1</a></span>
+<span class="normal"><a href="#__codelineno-13-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-13-1" name="__codelineno-13-1"></a>&gt;<span class="w"> </span>/mcp<span class="w"> </span>add<span class="w"> </span>filesystem
+<a id="__codelineno-13-2" name="__codelineno-13-2"></a>&gt;<span class="w"> </span>/mcp<span class="w"> </span>add<span class="w"> </span>github<span class="w"> </span>v2.0.1
 </code></pre></div></td></tr></table></div>
 <p><strong>Behavior:</strong>
 - Adds <code>[[mcp]]</code> entry to your config file
@@ -2012,11 +2067,11 @@ remote mesh node currently advertises only <code>/compact</code>.</p>
 - Validates configuration</p>
 <h3 id="clear"><code>/clear</code></h3>
 <p>Clear the terminal screen:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-13-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-13-1" name="__codelineno-13-1"></a>&gt;<span class="w"> </span>/clear
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-14-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-14-1" name="__codelineno-14-1"></a>&gt;<span class="w"> </span>/clear
 </code></pre></div></td></tr></table></div>
 <h3 id="exit"><code>/exit</code></h3>
 <p>Exit the application (alternative to Ctrl+D or typing "exit"):</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-14-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-14-1" name="__codelineno-14-1"></a>&gt;<span class="w"> </span>/exit
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-15-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-15-1" name="__codelineno-15-1"></a>&gt;<span class="w"> </span>/exit
 </code></pre></div></td></tr></table></div>
 <h2 id="custom-commands">Custom Commands</h2>
 <h3 id="creating-custom-commands">Creating Custom Commands</h3>
@@ -2029,15 +2084,15 @@ remote mesh node currently advertises only <code>/compact</code>.</p>
 <li>Not shared with team</li>
 <li>Gitignored by default</li>
 </ul>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-15-1">1</a></span>
-<span class="normal"><a href="#__codelineno-15-2">2</a></span>
-<span class="normal"><a href="#__codelineno-15-3">3</a></span>
-<span class="normal"><a href="#__codelineno-15-4">4</a></span>
-<span class="normal"><a href="#__codelineno-15-5">5</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-15-1" name="__codelineno-15-1"></a>~/.qmt/commands/
-<a id="__codelineno-15-2" name="__codelineno-15-2"></a>├──<span class="w"> </span>optimize.md
-<a id="__codelineno-15-3" name="__codelineno-15-3"></a>├──<span class="w"> </span>review.md
-<a id="__codelineno-15-4" name="__codelineno-15-4"></a>├──<span class="w"> </span>explain.md
-<a id="__codelineno-15-5" name="__codelineno-15-5"></a>└──<span class="w"> </span>commit.md
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-16-1">1</a></span>
+<span class="normal"><a href="#__codelineno-16-2">2</a></span>
+<span class="normal"><a href="#__codelineno-16-3">3</a></span>
+<span class="normal"><a href="#__codelineno-16-4">4</a></span>
+<span class="normal"><a href="#__codelineno-16-5">5</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-16-1" name="__codelineno-16-1"></a>~/.qmt/commands/
+<a id="__codelineno-16-2" name="__codelineno-16-2"></a>├──<span class="w"> </span>optimize.md
+<a id="__codelineno-16-3" name="__codelineno-16-3"></a>├──<span class="w"> </span>review.md
+<a id="__codelineno-16-4" name="__codelineno-16-4"></a>├──<span class="w"> </span>explain.md
+<a id="__codelineno-16-5" name="__codelineno-16-5"></a>└──<span class="w"> </span>commit.md
 </code></pre></div></td></tr></table></div>
 <h4 id="2-project-level-team-shared">2. Project-level (Team-shared)</h4>
 <p><strong>Location</strong>: <code>.qmt/commands/</code></p>
@@ -2047,24 +2102,24 @@ remote mesh node currently advertises only <code>/compact</code>.</p>
 <li>Team workflows</li>
 <li>Committed to repository</li>
 </ul>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-16-1">1</a></span>
-<span class="normal"><a href="#__codelineno-16-2">2</a></span>
-<span class="normal"><a href="#__codelineno-16-3">3</a></span>
-<span class="normal"><a href="#__codelineno-16-4">4</a></span>
-<span class="normal"><a href="#__codelineno-16-5">5</a></span>
-<span class="normal"><a href="#__codelineno-16-6">6</a></span>
-<span class="normal"><a href="#__codelineno-16-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-16-1" name="__codelineno-16-1"></a>project/
-<a id="__codelineno-16-2" name="__codelineno-16-2"></a>├──<span class="w"> </span>.qmt/
-<a id="__codelineno-16-3" name="__codelineno-16-3"></a>│<span class="w">   </span>└──<span class="w"> </span>commands/
-<a id="__codelineno-16-4" name="__codelineno-16-4"></a>│<span class="w">       </span>├──<span class="w"> </span>test.md
-<a id="__codelineno-16-5" name="__codelineno-16-5"></a>│<span class="w">       </span>├──<span class="w"> </span>deploy.md
-<a id="__codelineno-16-6" name="__codelineno-16-6"></a>│<span class="w">       </span>└──<span class="w"> </span>lint.md
-<a id="__codelineno-16-7" name="__codelineno-16-7"></a>└──<span class="w"> </span>src/
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-17-1">1</a></span>
+<span class="normal"><a href="#__codelineno-17-2">2</a></span>
+<span class="normal"><a href="#__codelineno-17-3">3</a></span>
+<span class="normal"><a href="#__codelineno-17-4">4</a></span>
+<span class="normal"><a href="#__codelineno-17-5">5</a></span>
+<span class="normal"><a href="#__codelineno-17-6">6</a></span>
+<span class="normal"><a href="#__codelineno-17-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-17-1" name="__codelineno-17-1"></a>project/
+<a id="__codelineno-17-2" name="__codelineno-17-2"></a>├──<span class="w"> </span>.qmt/
+<a id="__codelineno-17-3" name="__codelineno-17-3"></a>│<span class="w">   </span>└──<span class="w"> </span>commands/
+<a id="__codelineno-17-4" name="__codelineno-17-4"></a>│<span class="w">       </span>├──<span class="w"> </span>test.md
+<a id="__codelineno-17-5" name="__codelineno-17-5"></a>│<span class="w">       </span>├──<span class="w"> </span>deploy.md
+<a id="__codelineno-17-6" name="__codelineno-17-6"></a>│<span class="w">       </span>└──<span class="w"> </span>lint.md
+<a id="__codelineno-17-7" name="__codelineno-17-7"></a>└──<span class="w"> </span>src/
 </code></pre></div></td></tr></table></div>
 <p><strong>Add to version control:</strong>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-17-1">1</a></span>
-<span class="normal"><a href="#__codelineno-17-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-17-1" name="__codelineno-17-1"></a>git<span class="w"> </span>add<span class="w"> </span>.qmt/commands/
-<a id="__codelineno-17-2" name="__codelineno-17-2"></a>git<span class="w"> </span>commit<span class="w"> </span>-m<span class="w"> </span><span class="s2">"Add team slash commands"</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-18-1">1</a></span>
+<span class="normal"><a href="#__codelineno-18-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-18-1" name="__codelineno-18-1"></a>git<span class="w"> </span>add<span class="w"> </span>.qmt/commands/
+<a id="__codelineno-18-2" name="__codelineno-18-2"></a>git<span class="w"> </span>commit<span class="w"> </span>-m<span class="w"> </span><span class="s2">"Add team slash commands"</span>
 </code></pre></div></td></tr></table></div></p>
 <h3 id="command-naming">Command Naming</h3>
 <p>The filename determines the command name:</p>
@@ -2112,43 +2167,69 @@ remote mesh node currently advertises only <code>/compact</code>.</p>
 - <code>compact</code> and <code>worktree</code> are reserved for the native built-ins: a command
   file with either name is skipped with a warning</p>
 <h3 id="command-discovery">Command Discovery</h3>
-<p>Commands are discovered at startup:</p>
+<p>Commands are discovered when a session opens (new, load, resume or fork):</p>
 <ol>
 <li><strong>User commands</strong>: <code>~/.qmt/commands/*.md</code></li>
-<li><strong>Project commands</strong>: <code>.qmt/commands/*.md</code></li>
+<li><strong>Project commands</strong>: <code>&lt;project root&gt;/.qmt/commands/*.md</code></li>
 <li><strong>Merged</strong>: Project commands override user commands with same name</li>
 </ol>
+<p>A session's <strong>project root</strong> is the root of the Git checkout that contains its
+working directory, or the working directory itself when it is not in a Git
+repository. A session started in <code>crates/api</code> of a repository reads the
+repository's <code>.qmt/commands</code>; a folder outside Git does not search the folders
+above it. The catalog shown to the client and the actual <code>/command</code> expansion
+both use that one set, so two sessions in different folders each see and expand
+the commands of their own folder. A session without a working directory, or
+an agent with command discovery switched off, uses the agent-level commands
+(or none).</p>
 <p>For sessions running in an isolated Git worktree (see
-<a href=".././worktrees/">Git Worktree Workspaces</a>), project commands are
-re-discovered from the session's <strong>bound checkout</strong>: the catalog shown to
-the client and the actual <code>/command</code> expansion both use that checkout's
-files, so differently defined commands in different checkouts each expand
-their own version. Global and configured sources and the scripts policy
-follow the same configuration as a local session. Absolute paths inside
-command prompts are never rewritten.</p>
+<a href=".././worktrees/">Git Worktree Workspaces</a>), the project root is the session's
+<strong>bound checkout</strong>, so differently defined commands in different checkouts each
+expand their own version. Global and configured sources and the scripts policy
+follow the same configuration for every session. Absolute paths inside command
+prompts are never rewritten.</p>
+<h3 id="changing-commands-while-sessions-are-open">Changing Commands While Sessions Are Open</h3>
+<p>Adding, editing or removing a <code>.md</code> file in <code>~/.qmt/commands</code> or in an open
+session's <code>&lt;project root&gt;/.qmt/commands</code> takes effect without a restart or
+reopening the session: the session's next prompt expands from the new files,
+and the agent sends its clients a fresh <code>available_commands_update</code> with the
+complete command list (built-ins included), so the palette and composer update.
+A running turn keeps the commands it started with.</p>
+<p>Limits:</p>
+<ul>
+<li>Configured <code>slash_commands.paths</code> are read when a session opens, not watched.
+  A change there is listed the next time the session's commands are reloaded
+  or it is reopened.</li>
+<li>A <code>.qmt/commands</code> folder that the repository's <code>.gitignore</code> covers is not
+  watched (the workspace index skips ignored paths); it is read when the
+  session next opens, loads or resumes.</li>
+<li><code>~/.qmt/commands</code> is watched only if it exists when the agent starts; a
+  folder created later is read at the next agent start.</li>
+<li>Sessions hosted on another mesh node use that node's commands.</li>
+</ul>
 <h2 id="command-format">Command Format</h2>
 <h3 id="basic-structure">Basic Structure</h3>
 <p>Commands are markdown files with optional YAML frontmatter:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-18-1">1</a></span>
-<span class="normal"><a href="#__codelineno-18-2">2</a></span>
-<span class="normal"><a href="#__codelineno-18-3">3</a></span>
-<span class="normal"><a href="#__codelineno-18-4">4</a></span>
-<span class="normal"><a href="#__codelineno-18-5">5</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-18-1" name="__codelineno-18-1"></a>---
-<a id="__codelineno-18-2" name="__codelineno-18-2"></a><span class="gu">&lt;frontmatter&gt;</span>
-<a id="__codelineno-18-3" name="__codelineno-18-3"></a><span class="gu">---</span>
-<a id="__codelineno-18-4" name="__codelineno-18-4"></a>
-<a id="__codelineno-18-5" name="__codelineno-18-5"></a>&lt;prompt content&gt;
-</code></pre></div></td></tr></table></div>
-<h3 id="frontmatter-fields">Frontmatter Fields</h3>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-19-1">1</a></span>
 <span class="normal"><a href="#__codelineno-19-2">2</a></span>
 <span class="normal"><a href="#__codelineno-19-3">3</a></span>
 <span class="normal"><a href="#__codelineno-19-4">4</a></span>
-<span class="normal"><a href="#__codelineno-19-5">5</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-19-1" name="__codelineno-19-1"></a><span class="nn">---</span>
-<a id="__codelineno-19-2" name="__codelineno-19-2"></a><span class="nt">description</span><span class="p">:</span><span class="w"> </span><span class="s">"Brief</span><span class="nv"> </span><span class="s">description</span><span class="nv"> </span><span class="s">of</span><span class="nv"> </span><span class="s">what</span><span class="nv"> </span><span class="s">the</span><span class="nv"> </span><span class="s">command</span><span class="nv"> </span><span class="s">does"</span>
-<a id="__codelineno-19-3" name="__codelineno-19-3"></a><span class="nt">argument-hint</span><span class="p">:</span><span class="w"> </span><span class="s">"&lt;arg1&gt;</span><span class="nv"> </span><span class="s">[arg2]"</span>
-<a id="__codelineno-19-4" name="__codelineno-19-4"></a><span class="nt">tags</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">"coding"</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">"review"</span><span class="p p-Indicator">]</span>
-<a id="__codelineno-19-5" name="__codelineno-19-5"></a><span class="nn">---</span>
+<span class="normal"><a href="#__codelineno-19-5">5</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-19-1" name="__codelineno-19-1"></a>---
+<a id="__codelineno-19-2" name="__codelineno-19-2"></a><span class="gu">&lt;frontmatter&gt;</span>
+<a id="__codelineno-19-3" name="__codelineno-19-3"></a><span class="gu">---</span>
+<a id="__codelineno-19-4" name="__codelineno-19-4"></a>
+<a id="__codelineno-19-5" name="__codelineno-19-5"></a>&lt;prompt content&gt;
+</code></pre></div></td></tr></table></div>
+<h3 id="frontmatter-fields">Frontmatter Fields</h3>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-20-1">1</a></span>
+<span class="normal"><a href="#__codelineno-20-2">2</a></span>
+<span class="normal"><a href="#__codelineno-20-3">3</a></span>
+<span class="normal"><a href="#__codelineno-20-4">4</a></span>
+<span class="normal"><a href="#__codelineno-20-5">5</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-20-1" name="__codelineno-20-1"></a><span class="nn">---</span>
+<a id="__codelineno-20-2" name="__codelineno-20-2"></a><span class="nt">description</span><span class="p">:</span><span class="w"> </span><span class="s">"Brief</span><span class="nv"> </span><span class="s">description</span><span class="nv"> </span><span class="s">of</span><span class="nv"> </span><span class="s">what</span><span class="nv"> </span><span class="s">the</span><span class="nv"> </span><span class="s">command</span><span class="nv"> </span><span class="s">does"</span>
+<a id="__codelineno-20-3" name="__codelineno-20-3"></a><span class="nt">argument-hint</span><span class="p">:</span><span class="w"> </span><span class="s">"&lt;arg1&gt;</span><span class="nv"> </span><span class="s">[arg2]"</span>
+<a id="__codelineno-20-4" name="__codelineno-20-4"></a><span class="nt">tags</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">"coding"</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">"review"</span><span class="p p-Indicator">]</span>
+<a id="__codelineno-20-5" name="__codelineno-20-5"></a><span class="nn">---</span>
 </code></pre></div></td></tr></table></div>
 <table>
 <thead>
@@ -2173,6 +2254,12 @@ command prompts are never rewritten.</p>
 <td>Hint for arguments (e.g., <code>"&lt;file&gt; [options]"</code>)</td>
 </tr>
 <tr>
+<td><code>arguments</code></td>
+<td><code>none</code>, <code>optional</code>, <code>required</code></td>
+<td>No</td>
+<td>What the command asks of the user's input (default: see below)</td>
+</tr>
+<tr>
 <td><code>tags</code></td>
 <td>string[]</td>
 <td>No</td>
@@ -2195,7 +2282,7 @@ command prompts are never rewritten.</p>
 <p>Unknown fields are accepted but ignored by the system.</p>
 <h4 id="description"><code>description</code></h4>
 <p>Brief description shown in command list and help:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-20-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-20-1" name="__codelineno-20-1"></a><span class="nt">description</span><span class="p">:</span><span class="w"> </span><span class="s">"Analyze</span><span class="nv"> </span><span class="s">and</span><span class="nv"> </span><span class="s">optimize</span><span class="nv"> </span><span class="s">code</span><span class="nv"> </span><span class="s">for</span><span class="nv"> </span><span class="s">performance"</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-21-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-21-1" name="__codelineno-21-1"></a><span class="nt">description</span><span class="p">:</span><span class="w"> </span><span class="s">"Analyze</span><span class="nv"> </span><span class="s">and</span><span class="nv"> </span><span class="s">optimize</span><span class="nv"> </span><span class="s">code</span><span class="nv"> </span><span class="s">for</span><span class="nv"> </span><span class="s">performance"</span>
 </code></pre></div></td></tr></table></div>
 <p><strong>Usage:</strong>
 - Required field
@@ -2204,55 +2291,82 @@ command prompts are never rewritten.</p>
 - Should be concise (&lt; 80 characters)</p>
 <h4 id="argument-hint"><code>argument-hint</code></h4>
 <p>Hint for expected arguments:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-21-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-21-1" name="__codelineno-21-1"></a><span class="nt">argument-hint</span><span class="p">:</span><span class="w"> </span><span class="s">"&lt;file-path&gt;</span><span class="nv"> </span><span class="s">[--fast]"</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-22-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-22-1" name="__codelineno-22-1"></a><span class="nt">argument-hint</span><span class="p">:</span><span class="w"> </span><span class="s">"&lt;file-path&gt;</span><span class="nv"> </span><span class="s">[--fast]"</span>
 </code></pre></div></td></tr></table></div>
 <p><strong>Format:</strong>
 - <code>&lt;required&gt;</code> - Required argument
 - <code>[optional]</code> - Optional argument
 - <code>...</code> - Variadic arguments</p>
 <p><strong>Examples:</strong>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-22-1">1</a></span>
-<span class="normal"><a href="#__codelineno-22-2">2</a></span>
-<span class="normal"><a href="#__codelineno-22-3">3</a></span>
-<span class="normal"><a href="#__codelineno-22-4">4</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-22-1" name="__codelineno-22-1"></a><span class="nt">argument-hint</span><span class="p">:</span><span class="w"> </span><span class="s">"&lt;file&gt;"</span><span class="w">                    </span><span class="c1"># Single required file</span>
-<a id="__codelineno-22-2" name="__codelineno-22-2"></a><span class="nt">argument-hint</span><span class="p">:</span><span class="w"> </span><span class="s">"[target]"</span><span class="w">                  </span><span class="c1"># Optional target</span>
-<a id="__codelineno-22-3" name="__codelineno-22-3"></a><span class="nt">argument-hint</span><span class="p">:</span><span class="w"> </span><span class="s">"&lt;file&gt;</span><span class="nv"> </span><span class="s">[options...]"</span><span class="w">       </span><span class="c1"># File with optional options</span>
-<a id="__codelineno-22-4" name="__codelineno-22-4"></a><span class="nt">argument-hint</span><span class="p">:</span><span class="w"> </span><span class="s">"&lt;source&gt;</span><span class="nv"> </span><span class="s">&lt;destination&gt;"</span><span class="w">    </span><span class="c1"># Two required args</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-23-1">1</a></span>
+<span class="normal"><a href="#__codelineno-23-2">2</a></span>
+<span class="normal"><a href="#__codelineno-23-3">3</a></span>
+<span class="normal"><a href="#__codelineno-23-4">4</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-23-1" name="__codelineno-23-1"></a><span class="nt">argument-hint</span><span class="p">:</span><span class="w"> </span><span class="s">"&lt;file&gt;"</span><span class="w">                    </span><span class="c1"># Single required file</span>
+<a id="__codelineno-23-2" name="__codelineno-23-2"></a><span class="nt">argument-hint</span><span class="p">:</span><span class="w"> </span><span class="s">"[target]"</span><span class="w">                  </span><span class="c1"># Optional target</span>
+<a id="__codelineno-23-3" name="__codelineno-23-3"></a><span class="nt">argument-hint</span><span class="p">:</span><span class="w"> </span><span class="s">"&lt;file&gt;</span><span class="nv"> </span><span class="s">[options...]"</span><span class="w">       </span><span class="c1"># File with optional options</span>
+<a id="__codelineno-23-4" name="__codelineno-23-4"></a><span class="nt">argument-hint</span><span class="p">:</span><span class="w"> </span><span class="s">"&lt;source&gt;</span><span class="nv"> </span><span class="s">&lt;destination&gt;"</span><span class="w">    </span><span class="c1"># Two required args</span>
 </code></pre></div></td></tr></table></div></p>
+<h4 id="arguments"><code>arguments</code></h4>
+<p>How much input the command needs. Clients read it from the command
+descriptor (<code>input</code>) to decide whether to ask for input before sending:</p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-24-1">1</a></span>
+<span class="normal"><a href="#__codelineno-24-2">2</a></span>
+<span class="normal"><a href="#__codelineno-24-3">3</a></span>
+<span class="normal"><a href="#__codelineno-24-4">4</a></span>
+<span class="normal"><a href="#__codelineno-24-5">5</a></span>
+<span class="normal"><a href="#__codelineno-24-6">6</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-24-1" name="__codelineno-24-1"></a><span class="nn">---</span>
+<a id="__codelineno-24-2" name="__codelineno-24-2"></a><span class="nt">description</span><span class="p">:</span><span class="w"> </span><span class="s">"Explain</span><span class="nv"> </span><span class="s">a</span><span class="nv"> </span><span class="s">topic"</span>
+<a id="__codelineno-24-3" name="__codelineno-24-3"></a><span class="nt">argument-hint</span><span class="p">:</span><span class="w"> </span><span class="s">"[topic]"</span>
+<a id="__codelineno-24-4" name="__codelineno-24-4"></a><span class="nt">arguments</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">optional</span>
+<a id="__codelineno-24-5" name="__codelineno-24-5"></a><span class="nn">---</span>
+<a id="__codelineno-24-6" name="__codelineno-24-6"></a><span class="l l-Scalar l-Scalar-Plain">Explain $ARGUMENTS</span>
+</code></pre></div></td></tr></table></div>
+<ul>
+<li><code>none</code>: the command takes no input; no ACP <code>input</code> is advertised even when
+  the template contains <code>$ARGUMENTS</code>.</li>
+<li><code>optional</code>: the command works with or without input.</li>
+<li><code>required</code>: the command is meant to be sent with input.</li>
+</ul>
+<p>Without the key the need is <code>required</code> when the file has an <code>argument-hint</code> or
+the template contains <code>$ARGUMENTS</code>, and <code>none</code> otherwise. The need is advice
+for clients: a command sent without arguments is still expanded, with empty
+arguments.</p>
+<p>A value other than the three above is an error: the command is not loaded and
+discovery reports a diagnostic that names the file.</p>
 <h4 id="tags"><code>tags</code></h4>
 <p>Tags for filtering and organization:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-23-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-23-1" name="__codelineno-23-1"></a><span class="nt">tags</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">"coding"</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">"optimization"</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">"performance"</span><span class="p p-Indicator">]</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-25-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-25-1" name="__codelineno-25-1"></a><span class="nt">tags</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">"coding"</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">"optimization"</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">"performance"</span><span class="p p-Indicator">]</span>
 </code></pre></div></td></tr></table></div>
 <p><strong>Usage:</strong>
 - Used for categorization and display
 - Optional field</p>
 <h3 id="prompt-content">Prompt Content</h3>
 <p>The main content of the command is the prompt template:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-24-1"> 1</a></span>
-<span class="normal"><a href="#__codelineno-24-2"> 2</a></span>
-<span class="normal"><a href="#__codelineno-24-3"> 3</a></span>
-<span class="normal"><a href="#__codelineno-24-4"> 4</a></span>
-<span class="normal"><a href="#__codelineno-24-5"> 5</a></span>
-<span class="normal"><a href="#__codelineno-24-6"> 6</a></span>
-<span class="normal"><a href="#__codelineno-24-7"> 7</a></span>
-<span class="normal"><a href="#__codelineno-24-8"> 8</a></span>
-<span class="normal"><a href="#__codelineno-24-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-24-10">10</a></span>
-<span class="normal"><a href="#__codelineno-24-11">11</a></span>
-<span class="normal"><a href="#__codelineno-24-12">12</a></span>
-<span class="normal"><a href="#__codelineno-24-13">13</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-24-1" name="__codelineno-24-1"></a>---
-<a id="__codelineno-24-2" name="__codelineno-24-2"></a>description: "Optimize code"
-<a id="__codelineno-24-3" name="__codelineno-24-3"></a><span class="gu">argument-hint: "&lt;file&gt;"</span>
-<a id="__codelineno-24-4" name="__codelineno-24-4"></a><span class="gu">---</span>
-<a id="__codelineno-24-5" name="__codelineno-24-5"></a>
-<a id="__codelineno-24-6" name="__codelineno-24-6"></a>Please analyze and optimize the code in $ARGUMENTS.
-<a id="__codelineno-24-7" name="__codelineno-24-7"></a>
-<a id="__codelineno-24-8" name="__codelineno-24-8"></a>Focus on:
-<a id="__codelineno-24-9" name="__codelineno-24-9"></a><span class="k">-</span><span class="w"> </span>Performance improvements
-<a id="__codelineno-24-10" name="__codelineno-24-10"></a><span class="k">-</span><span class="w"> </span>Memory efficiency
-<a id="__codelineno-24-11" name="__codelineno-24-11"></a><span class="k">-</span><span class="w"> </span>Readability
-<a id="__codelineno-24-12" name="__codelineno-24-12"></a>
-<a id="__codelineno-24-13" name="__codelineno-24-13"></a>Provide specific suggestions with code examples.
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-26-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-26-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-26-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-26-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-26-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-26-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-26-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-26-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-26-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-26-10">10</a></span>
+<span class="normal"><a href="#__codelineno-26-11">11</a></span>
+<span class="normal"><a href="#__codelineno-26-12">12</a></span>
+<span class="normal"><a href="#__codelineno-26-13">13</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-26-1" name="__codelineno-26-1"></a>---
+<a id="__codelineno-26-2" name="__codelineno-26-2"></a>description: "Optimize code"
+<a id="__codelineno-26-3" name="__codelineno-26-3"></a><span class="gu">argument-hint: "&lt;file&gt;"</span>
+<a id="__codelineno-26-4" name="__codelineno-26-4"></a><span class="gu">---</span>
+<a id="__codelineno-26-5" name="__codelineno-26-5"></a>
+<a id="__codelineno-26-6" name="__codelineno-26-6"></a>Please analyze and optimize the code in $ARGUMENTS.
+<a id="__codelineno-26-7" name="__codelineno-26-7"></a>
+<a id="__codelineno-26-8" name="__codelineno-26-8"></a>Focus on:
+<a id="__codelineno-26-9" name="__codelineno-26-9"></a><span class="k">-</span><span class="w"> </span>Performance improvements
+<a id="__codelineno-26-10" name="__codelineno-26-10"></a><span class="k">-</span><span class="w"> </span>Memory efficiency
+<a id="__codelineno-26-11" name="__codelineno-26-11"></a><span class="k">-</span><span class="w"> </span>Readability
+<a id="__codelineno-26-12" name="__codelineno-26-12"></a>
+<a id="__codelineno-26-13" name="__codelineno-26-13"></a>Provide specific suggestions with code examples.
 </code></pre></div></td></tr></table></div>
 <h4 id="argument-substitution">Argument Substitution</h4>
 <p>Use <code>$ARGUMENTS</code> in prompts to insert the text typed after the command name:</p>
@@ -2272,84 +2386,6 @@ command prompts are never rewritten.</p>
 </table>
 <p><strong>Example:</strong></p>
 <p>Command: <code>/compare file1.rs file2.rs</code></p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-25-1"> 1</a></span>
-<span class="normal"><a href="#__codelineno-25-2"> 2</a></span>
-<span class="normal"><a href="#__codelineno-25-3"> 3</a></span>
-<span class="normal"><a href="#__codelineno-25-4"> 4</a></span>
-<span class="normal"><a href="#__codelineno-25-5"> 5</a></span>
-<span class="normal"><a href="#__codelineno-25-6"> 6</a></span>
-<span class="normal"><a href="#__codelineno-25-7"> 7</a></span>
-<span class="normal"><a href="#__codelineno-25-8"> 8</a></span>
-<span class="normal"><a href="#__codelineno-25-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-25-10">10</a></span>
-<span class="normal"><a href="#__codelineno-25-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-25-1" name="__codelineno-25-1"></a>---
-<a id="__codelineno-25-2" name="__codelineno-25-2"></a>description: "Compare two files"
-<a id="__codelineno-25-3" name="__codelineno-25-3"></a><span class="gu">argument-hint: "&lt;file1&gt; &lt;file2&gt;"</span>
-<a id="__codelineno-25-4" name="__codelineno-25-4"></a><span class="gu">---</span>
-<a id="__codelineno-25-5" name="__codelineno-25-5"></a>
-<a id="__codelineno-25-6" name="__codelineno-25-6"></a>Compare the following files and highlight differences: $ARGUMENTS
-<a id="__codelineno-25-7" name="__codelineno-25-7"></a>
-<a id="__codelineno-25-8" name="__codelineno-25-8"></a>Focus on:
-<a id="__codelineno-25-9" name="__codelineno-25-9"></a><span class="k">-</span><span class="w"> </span>Functional differences
-<a id="__codelineno-25-10" name="__codelineno-25-10"></a><span class="k">-</span><span class="w"> </span>Performance implications
-<a id="__codelineno-25-11" name="__codelineno-25-11"></a><span class="k">-</span><span class="w"> </span>Code quality
-</code></pre></div></td></tr></table></div>
-<p>The expansion wraps the command template with context so the model understands it was invoked as a slash command, including the description and instructions.</p>
-<h4 id="multi-line-prompts">Multi-line Prompts</h4>
-<p>Commands can have complex, multi-line prompts:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-26-1"> 1</a></span>
-<span class="normal"><a href="#__codelineno-26-2"> 2</a></span>
-<span class="normal"><a href="#__codelineno-26-3"> 3</a></span>
-<span class="normal"><a href="#__codelineno-26-4"> 4</a></span>
-<span class="normal"><a href="#__codelineno-26-5"> 5</a></span>
-<span class="normal"><a href="#__codelineno-26-6"> 6</a></span>
-<span class="normal"><a href="#__codelineno-26-7"> 7</a></span>
-<span class="normal"><a href="#__codelineno-26-8"> 8</a></span>
-<span class="normal"><a href="#__codelineno-26-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-26-10">10</a></span>
-<span class="normal"><a href="#__codelineno-26-11">11</a></span>
-<span class="normal"><a href="#__codelineno-26-12">12</a></span>
-<span class="normal"><a href="#__codelineno-26-13">13</a></span>
-<span class="normal"><a href="#__codelineno-26-14">14</a></span>
-<span class="normal"><a href="#__codelineno-26-15">15</a></span>
-<span class="normal"><a href="#__codelineno-26-16">16</a></span>
-<span class="normal"><a href="#__codelineno-26-17">17</a></span>
-<span class="normal"><a href="#__codelineno-26-18">18</a></span>
-<span class="normal"><a href="#__codelineno-26-19">19</a></span>
-<span class="normal"><a href="#__codelineno-26-20">20</a></span>
-<span class="normal"><a href="#__codelineno-26-21">21</a></span>
-<span class="normal"><a href="#__codelineno-26-22">22</a></span>
-<span class="normal"><a href="#__codelineno-26-23">23</a></span>
-<span class="normal"><a href="#__codelineno-26-24">24</a></span>
-<span class="normal"><a href="#__codelineno-26-25">25</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-26-1" name="__codelineno-26-1"></a>---
-<a id="__codelineno-26-2" name="__codelineno-26-2"></a>description: "Generate comprehensive tests"
-<a id="__codelineno-26-3" name="__codelineno-26-3"></a><span class="gu">argument-hint: "&lt;source-file&gt;"</span>
-<a id="__codelineno-26-4" name="__codelineno-26-4"></a><span class="gu">---</span>
-<a id="__codelineno-26-5" name="__codelineno-26-5"></a>
-<a id="__codelineno-26-6" name="__codelineno-26-6"></a>You are a testing expert. Analyze the code in $ARGUMENTS and generate comprehensive tests.
-<a id="__codelineno-26-7" name="__codelineno-26-7"></a>
-<a id="__codelineno-26-8" name="__codelineno-26-8"></a><span class="gu">## Requirements</span>
-<a id="__codelineno-26-9" name="__codelineno-26-9"></a>
-<a id="__codelineno-26-10" name="__codelineno-26-10"></a><span class="k">1.</span> <span class="gs">**Unit tests**</span>: Test individual functions
-<a id="__codelineno-26-11" name="__codelineno-26-11"></a><span class="k">2.</span> <span class="gs">**Integration tests**</span>: Test component interactions
-<a id="__codelineno-26-12" name="__codelineno-26-12"></a><span class="k">3.</span> <span class="gs">**Edge cases**</span>: Test boundary conditions
-<a id="__codelineno-26-13" name="__codelineno-26-13"></a><span class="k">4.</span> <span class="gs">**Error handling**</span>: Test error scenarios
-<a id="__codelineno-26-14" name="__codelineno-26-14"></a>
-<a id="__codelineno-26-15" name="__codelineno-26-15"></a><span class="gu">## Output Format</span>
-<a id="__codelineno-26-16" name="__codelineno-26-16"></a>
-<a id="__codelineno-26-17" name="__codelineno-26-17"></a><span class="k">-</span><span class="w"> </span>Use the project's testing framework
-<a id="__codelineno-26-18" name="__codelineno-26-18"></a><span class="k">-</span><span class="w"> </span>Include setup and teardown
-<a id="__codelineno-26-19" name="__codelineno-26-19"></a><span class="k">-</span><span class="w"> </span>Add descriptive test names
-<a id="__codelineno-26-20" name="__codelineno-26-20"></a><span class="k">-</span><span class="w"> </span>Include comments explaining test strategy
-<a id="__codelineno-26-21" name="__codelineno-26-21"></a>
-<a id="__codelineno-26-22" name="__codelineno-26-22"></a><span class="gu">## Additional Context</span>
-<a id="__codelineno-26-23" name="__codelineno-26-23"></a>
-<a id="__codelineno-26-24" name="__codelineno-26-24"></a>Current directory: $PWD
-<a id="__codelineno-26-25" name="__codelineno-26-25"></a>Project type: Rust (Cargo)
-</code></pre></div></td></tr></table></div>
-<h2 id="advanced-features">Advanced Features</h2>
-<h3 id="conditional-logic-via-llm">Conditional Logic (via LLM)</h3>
-<p>Commands can instruct the LLM to handle conditions:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-27-1"> 1</a></span>
 <span class="normal"><a href="#__codelineno-27-2"> 2</a></span>
 <span class="normal"><a href="#__codelineno-27-3"> 3</a></span>
@@ -2360,42 +2396,21 @@ command prompts are never rewritten.</p>
 <span class="normal"><a href="#__codelineno-27-8"> 8</a></span>
 <span class="normal"><a href="#__codelineno-27-9"> 9</a></span>
 <span class="normal"><a href="#__codelineno-27-10">10</a></span>
-<span class="normal"><a href="#__codelineno-27-11">11</a></span>
-<span class="normal"><a href="#__codelineno-27-12">12</a></span>
-<span class="normal"><a href="#__codelineno-27-13">13</a></span>
-<span class="normal"><a href="#__codelineno-27-14">14</a></span>
-<span class="normal"><a href="#__codelineno-27-15">15</a></span>
-<span class="normal"><a href="#__codelineno-27-16">16</a></span>
-<span class="normal"><a href="#__codelineno-27-17">17</a></span>
-<span class="normal"><a href="#__codelineno-27-18">18</a></span>
-<span class="normal"><a href="#__codelineno-27-19">19</a></span>
-<span class="normal"><a href="#__codelineno-27-20">20</a></span>
-<span class="normal"><a href="#__codelineno-27-21">21</a></span>
-<span class="normal"><a href="#__codelineno-27-22">22</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-27-1" name="__codelineno-27-1"></a>---
-<a id="__codelineno-27-2" name="__codelineno-27-2"></a><span class="gu">description: "Smart commit"</span>
-<a id="__codelineno-27-3" name="__codelineno-27-3"></a><span class="gu">---</span>
-<a id="__codelineno-27-4" name="__codelineno-27-4"></a>
-<a id="__codelineno-27-5" name="__codelineno-27-5"></a>Analyze the current git changes and create an appropriate commit.
-<a id="__codelineno-27-6" name="__codelineno-27-6"></a>
-<a id="__codelineno-27-7" name="__codelineno-27-7"></a><span class="gu">## Steps</span>
-<a id="__codelineno-27-8" name="__codelineno-27-8"></a>
-<a id="__codelineno-27-9" name="__codelineno-27-9"></a><span class="k">1.</span> Run <span class="sb">`git status`</span> to see changes
-<a id="__codelineno-27-10" name="__codelineno-27-10"></a><span class="k">2.</span> Run <span class="sb">`git diff`</span> to review changes
-<a id="__codelineno-27-11" name="__codelineno-27-11"></a><span class="k">3.</span> Determine commit type:
-<a id="__codelineno-27-12" name="__codelineno-27-12"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>feat: New feature
-<a id="__codelineno-27-13" name="__codelineno-27-13"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>fix: Bug fix
-<a id="__codelineno-27-14" name="__codelineno-27-14"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>docs: Documentation
-<a id="__codelineno-27-15" name="__codelineno-27-15"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>style: Formatting
-<a id="__codelineno-27-16" name="__codelineno-27-16"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>refactor: Code refactoring
-<a id="__codelineno-27-17" name="__codelineno-27-17"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>test: Adding tests
-<a id="__codelineno-27-18" name="__codelineno-27-18"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>chore: Maintenance
-<a id="__codelineno-27-19" name="__codelineno-27-19"></a><span class="k">4.</span> Create descriptive commit message
-<a id="__codelineno-27-20" name="__codelineno-27-20"></a><span class="k">5.</span> Stage and commit changes
-<a id="__codelineno-27-21" name="__codelineno-27-21"></a>
-<a id="__codelineno-27-22" name="__codelineno-27-22"></a>If no changes are found, inform the user.
+<span class="normal"><a href="#__codelineno-27-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-27-1" name="__codelineno-27-1"></a>---
+<a id="__codelineno-27-2" name="__codelineno-27-2"></a>description: "Compare two files"
+<a id="__codelineno-27-3" name="__codelineno-27-3"></a><span class="gu">argument-hint: "&lt;file1&gt; &lt;file2&gt;"</span>
+<a id="__codelineno-27-4" name="__codelineno-27-4"></a><span class="gu">---</span>
+<a id="__codelineno-27-5" name="__codelineno-27-5"></a>
+<a id="__codelineno-27-6" name="__codelineno-27-6"></a>Compare the following files and highlight differences: $ARGUMENTS
+<a id="__codelineno-27-7" name="__codelineno-27-7"></a>
+<a id="__codelineno-27-8" name="__codelineno-27-8"></a>Focus on:
+<a id="__codelineno-27-9" name="__codelineno-27-9"></a><span class="k">-</span><span class="w"> </span>Functional differences
+<a id="__codelineno-27-10" name="__codelineno-27-10"></a><span class="k">-</span><span class="w"> </span>Performance implications
+<a id="__codelineno-27-11" name="__codelineno-27-11"></a><span class="k">-</span><span class="w"> </span>Code quality
 </code></pre></div></td></tr></table></div>
-<h3 id="command-composition">Command Composition</h3>
-<p>Commands can reference other commands:</p>
+<p>The expansion wraps the command template with context so the model understands it was invoked as a slash command, including the description and instructions.</p>
+<h4 id="multi-line-prompts">Multi-line Prompts</h4>
+<p>Commands can have complex, multi-line prompts:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-28-1"> 1</a></span>
 <span class="normal"><a href="#__codelineno-28-2"> 2</a></span>
 <span class="normal"><a href="#__codelineno-28-3"> 3</a></span>
@@ -2406,20 +2421,49 @@ command prompts are never rewritten.</p>
 <span class="normal"><a href="#__codelineno-28-8"> 8</a></span>
 <span class="normal"><a href="#__codelineno-28-9"> 9</a></span>
 <span class="normal"><a href="#__codelineno-28-10">10</a></span>
-<span class="normal"><a href="#__codelineno-28-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-28-1" name="__codelineno-28-1"></a>---
-<a id="__codelineno-28-2" name="__codelineno-28-2"></a><span class="gu">description: "Full development workflow"</span>
-<a id="__codelineno-28-3" name="__codelineno-28-3"></a><span class="gu">---</span>
-<a id="__codelineno-28-4" name="__codelineno-28-4"></a>
-<a id="__codelineno-28-5" name="__codelineno-28-5"></a>Run the following workflow:
-<a id="__codelineno-28-6" name="__codelineno-28-6"></a>
-<a id="__codelineno-28-7" name="__codelineno-28-7"></a><span class="k">1.</span> First, review the code: Use /review or read the files
-<a id="__codelineno-28-8" name="__codelineno-28-8"></a><span class="k">2.</span> Then, run tests: Use /test or run <span class="sb">`cargo test`</span>
-<a id="__codelineno-28-9" name="__codelineno-28-9"></a><span class="k">3.</span> Finally, optimize: Use /optimize if needed
-<a id="__codelineno-28-10" name="__codelineno-28-10"></a>
-<a id="__codelineno-28-11" name="__codelineno-28-11"></a>Provide a summary of each step.
+<span class="normal"><a href="#__codelineno-28-11">11</a></span>
+<span class="normal"><a href="#__codelineno-28-12">12</a></span>
+<span class="normal"><a href="#__codelineno-28-13">13</a></span>
+<span class="normal"><a href="#__codelineno-28-14">14</a></span>
+<span class="normal"><a href="#__codelineno-28-15">15</a></span>
+<span class="normal"><a href="#__codelineno-28-16">16</a></span>
+<span class="normal"><a href="#__codelineno-28-17">17</a></span>
+<span class="normal"><a href="#__codelineno-28-18">18</a></span>
+<span class="normal"><a href="#__codelineno-28-19">19</a></span>
+<span class="normal"><a href="#__codelineno-28-20">20</a></span>
+<span class="normal"><a href="#__codelineno-28-21">21</a></span>
+<span class="normal"><a href="#__codelineno-28-22">22</a></span>
+<span class="normal"><a href="#__codelineno-28-23">23</a></span>
+<span class="normal"><a href="#__codelineno-28-24">24</a></span>
+<span class="normal"><a href="#__codelineno-28-25">25</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-28-1" name="__codelineno-28-1"></a>---
+<a id="__codelineno-28-2" name="__codelineno-28-2"></a>description: "Generate comprehensive tests"
+<a id="__codelineno-28-3" name="__codelineno-28-3"></a><span class="gu">argument-hint: "&lt;source-file&gt;"</span>
+<a id="__codelineno-28-4" name="__codelineno-28-4"></a><span class="gu">---</span>
+<a id="__codelineno-28-5" name="__codelineno-28-5"></a>
+<a id="__codelineno-28-6" name="__codelineno-28-6"></a>You are a testing expert. Analyze the code in $ARGUMENTS and generate comprehensive tests.
+<a id="__codelineno-28-7" name="__codelineno-28-7"></a>
+<a id="__codelineno-28-8" name="__codelineno-28-8"></a><span class="gu">## Requirements</span>
+<a id="__codelineno-28-9" name="__codelineno-28-9"></a>
+<a id="__codelineno-28-10" name="__codelineno-28-10"></a><span class="k">1.</span> <span class="gs">**Unit tests**</span>: Test individual functions
+<a id="__codelineno-28-11" name="__codelineno-28-11"></a><span class="k">2.</span> <span class="gs">**Integration tests**</span>: Test component interactions
+<a id="__codelineno-28-12" name="__codelineno-28-12"></a><span class="k">3.</span> <span class="gs">**Edge cases**</span>: Test boundary conditions
+<a id="__codelineno-28-13" name="__codelineno-28-13"></a><span class="k">4.</span> <span class="gs">**Error handling**</span>: Test error scenarios
+<a id="__codelineno-28-14" name="__codelineno-28-14"></a>
+<a id="__codelineno-28-15" name="__codelineno-28-15"></a><span class="gu">## Output Format</span>
+<a id="__codelineno-28-16" name="__codelineno-28-16"></a>
+<a id="__codelineno-28-17" name="__codelineno-28-17"></a><span class="k">-</span><span class="w"> </span>Use the project's testing framework
+<a id="__codelineno-28-18" name="__codelineno-28-18"></a><span class="k">-</span><span class="w"> </span>Include setup and teardown
+<a id="__codelineno-28-19" name="__codelineno-28-19"></a><span class="k">-</span><span class="w"> </span>Add descriptive test names
+<a id="__codelineno-28-20" name="__codelineno-28-20"></a><span class="k">-</span><span class="w"> </span>Include comments explaining test strategy
+<a id="__codelineno-28-21" name="__codelineno-28-21"></a>
+<a id="__codelineno-28-22" name="__codelineno-28-22"></a><span class="gu">## Additional Context</span>
+<a id="__codelineno-28-23" name="__codelineno-28-23"></a>
+<a id="__codelineno-28-24" name="__codelineno-28-24"></a>Current directory: $PWD
+<a id="__codelineno-28-25" name="__codelineno-28-25"></a>Project type: Rust (Cargo)
 </code></pre></div></td></tr></table></div>
-<h3 id="tool-specific-commands">Tool-Specific Commands</h3>
-<p>Create commands that focus on specific tools:</p>
+<h2 id="advanced-features">Advanced Features</h2>
+<h3 id="conditional-logic-via-llm">Conditional Logic (via LLM)</h3>
+<p>Commands can instruct the LLM to handle conditions:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-29-1"> 1</a></span>
 <span class="normal"><a href="#__codelineno-29-2"> 2</a></span>
 <span class="normal"><a href="#__codelineno-29-3"> 3</a></span>
@@ -2433,24 +2477,39 @@ command prompts are never rewritten.</p>
 <span class="normal"><a href="#__codelineno-29-11">11</a></span>
 <span class="normal"><a href="#__codelineno-29-12">12</a></span>
 <span class="normal"><a href="#__codelineno-29-13">13</a></span>
-<span class="normal"><a href="#__codelineno-29-14">14</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-29-1" name="__codelineno-29-1"></a>---
-<a id="__codelineno-29-2" name="__codelineno-29-2"></a>description: "Search and replace across project"
-<a id="__codelineno-29-3" name="__codelineno-29-3"></a><span class="gu">argument-hint: "&lt;search&gt; &lt;replace&gt;"</span>
-<a id="__codelineno-29-4" name="__codelineno-29-4"></a><span class="gu">---</span>
-<a id="__codelineno-29-5" name="__codelineno-29-5"></a>
-<a id="__codelineno-29-6" name="__codelineno-29-6"></a>Search and replace across the project: $ARGUMENTS.
-<a id="__codelineno-29-7" name="__codelineno-29-7"></a>
-<a id="__codelineno-29-8" name="__codelineno-29-8"></a><span class="gu">## Steps</span>
-<a id="__codelineno-29-9" name="__codelineno-29-9"></a>
-<a id="__codelineno-29-10" name="__codelineno-29-10"></a><span class="k">1.</span> Use search_text to find all occurrences
-<a id="__codelineno-29-11" name="__codelineno-29-11"></a><span class="k">2.</span> List affected files
-<a id="__codelineno-29-12" name="__codelineno-29-12"></a><span class="k">3.</span> Ask for confirmation
-<a id="__codelineno-29-13" name="__codelineno-29-13"></a><span class="k">4.</span> Use edit or multiedit to make replacements
-<a id="__codelineno-29-14" name="__codelineno-29-14"></a><span class="k">5.</span> Show summary of changes
+<span class="normal"><a href="#__codelineno-29-14">14</a></span>
+<span class="normal"><a href="#__codelineno-29-15">15</a></span>
+<span class="normal"><a href="#__codelineno-29-16">16</a></span>
+<span class="normal"><a href="#__codelineno-29-17">17</a></span>
+<span class="normal"><a href="#__codelineno-29-18">18</a></span>
+<span class="normal"><a href="#__codelineno-29-19">19</a></span>
+<span class="normal"><a href="#__codelineno-29-20">20</a></span>
+<span class="normal"><a href="#__codelineno-29-21">21</a></span>
+<span class="normal"><a href="#__codelineno-29-22">22</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-29-1" name="__codelineno-29-1"></a>---
+<a id="__codelineno-29-2" name="__codelineno-29-2"></a><span class="gu">description: "Smart commit"</span>
+<a id="__codelineno-29-3" name="__codelineno-29-3"></a><span class="gu">---</span>
+<a id="__codelineno-29-4" name="__codelineno-29-4"></a>
+<a id="__codelineno-29-5" name="__codelineno-29-5"></a>Analyze the current git changes and create an appropriate commit.
+<a id="__codelineno-29-6" name="__codelineno-29-6"></a>
+<a id="__codelineno-29-7" name="__codelineno-29-7"></a><span class="gu">## Steps</span>
+<a id="__codelineno-29-8" name="__codelineno-29-8"></a>
+<a id="__codelineno-29-9" name="__codelineno-29-9"></a><span class="k">1.</span> Run <span class="sb">`git status`</span> to see changes
+<a id="__codelineno-29-10" name="__codelineno-29-10"></a><span class="k">2.</span> Run <span class="sb">`git diff`</span> to review changes
+<a id="__codelineno-29-11" name="__codelineno-29-11"></a><span class="k">3.</span> Determine commit type:
+<a id="__codelineno-29-12" name="__codelineno-29-12"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>feat: New feature
+<a id="__codelineno-29-13" name="__codelineno-29-13"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>fix: Bug fix
+<a id="__codelineno-29-14" name="__codelineno-29-14"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>docs: Documentation
+<a id="__codelineno-29-15" name="__codelineno-29-15"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>style: Formatting
+<a id="__codelineno-29-16" name="__codelineno-29-16"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>refactor: Code refactoring
+<a id="__codelineno-29-17" name="__codelineno-29-17"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>test: Adding tests
+<a id="__codelineno-29-18" name="__codelineno-29-18"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>chore: Maintenance
+<a id="__codelineno-29-19" name="__codelineno-29-19"></a><span class="k">4.</span> Create descriptive commit message
+<a id="__codelineno-29-20" name="__codelineno-29-20"></a><span class="k">5.</span> Stage and commit changes
+<a id="__codelineno-29-21" name="__codelineno-29-21"></a>
+<a id="__codelineno-29-22" name="__codelineno-29-22"></a>If no changes are found, inform the user.
 </code></pre></div></td></tr></table></div>
-<h2 id="examples">Examples</h2>
-<h3 id="example-1-code-optimization">Example 1: Code Optimization</h3>
-<p><strong>File</strong>: <code>~/.qmt/commands/optimize.md</code></p>
+<h3 id="command-composition">Command Composition</h3>
+<p>Commands can reference other commands:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-30-1"> 1</a></span>
 <span class="normal"><a href="#__codelineno-30-2"> 2</a></span>
 <span class="normal"><a href="#__codelineno-30-3"> 3</a></span>
@@ -2461,70 +2520,20 @@ command prompts are never rewritten.</p>
 <span class="normal"><a href="#__codelineno-30-8"> 8</a></span>
 <span class="normal"><a href="#__codelineno-30-9"> 9</a></span>
 <span class="normal"><a href="#__codelineno-30-10">10</a></span>
-<span class="normal"><a href="#__codelineno-30-11">11</a></span>
-<span class="normal"><a href="#__codelineno-30-12">12</a></span>
-<span class="normal"><a href="#__codelineno-30-13">13</a></span>
-<span class="normal"><a href="#__codelineno-30-14">14</a></span>
-<span class="normal"><a href="#__codelineno-30-15">15</a></span>
-<span class="normal"><a href="#__codelineno-30-16">16</a></span>
-<span class="normal"><a href="#__codelineno-30-17">17</a></span>
-<span class="normal"><a href="#__codelineno-30-18">18</a></span>
-<span class="normal"><a href="#__codelineno-30-19">19</a></span>
-<span class="normal"><a href="#__codelineno-30-20">20</a></span>
-<span class="normal"><a href="#__codelineno-30-21">21</a></span>
-<span class="normal"><a href="#__codelineno-30-22">22</a></span>
-<span class="normal"><a href="#__codelineno-30-23">23</a></span>
-<span class="normal"><a href="#__codelineno-30-24">24</a></span>
-<span class="normal"><a href="#__codelineno-30-25">25</a></span>
-<span class="normal"><a href="#__codelineno-30-26">26</a></span>
-<span class="normal"><a href="#__codelineno-30-27">27</a></span>
-<span class="normal"><a href="#__codelineno-30-28">28</a></span>
-<span class="normal"><a href="#__codelineno-30-29">29</a></span>
-<span class="normal"><a href="#__codelineno-30-30">30</a></span>
-<span class="normal"><a href="#__codelineno-30-31">31</a></span>
-<span class="normal"><a href="#__codelineno-30-32">32</a></span>
-<span class="normal"><a href="#__codelineno-30-33">33</a></span>
-<span class="normal"><a href="#__codelineno-30-34">34</a></span>
-<span class="normal"><a href="#__codelineno-30-35">35</a></span>
-<span class="normal"><a href="#__codelineno-30-36">36</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-30-1" name="__codelineno-30-1"></a>---
-<a id="__codelineno-30-2" name="__codelineno-30-2"></a>description: "Analyze and optimize code for performance"
-<a id="__codelineno-30-3" name="__codelineno-30-3"></a><span class="gu">argument-hint: "&lt;file-path&gt;"</span>
-<a id="__codelineno-30-4" name="__codelineno-30-4"></a><span class="gu">---</span>
-<a id="__codelineno-30-5" name="__codelineno-30-5"></a>
-<a id="__codelineno-30-6" name="__codelineno-30-6"></a>Please analyze and optimize the code in $ARGUMENTS for:
-<a id="__codelineno-30-7" name="__codelineno-30-7"></a>
-<a id="__codelineno-30-8" name="__codelineno-30-8"></a><span class="gu">## Analysis Areas</span>
-<a id="__codelineno-30-9" name="__codelineno-30-9"></a>
-<a id="__codelineno-30-10" name="__codelineno-30-10"></a><span class="k">1.</span> <span class="gs">**Performance**</span>
-<a id="__codelineno-30-11" name="__codelineno-30-11"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Algorithmic complexity (Big O)
-<a id="__codelineno-30-12" name="__codelineno-30-12"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Unnecessary allocations
-<a id="__codelineno-30-13" name="__codelineno-30-13"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Cache efficiency
-<a id="__codelineno-30-14" name="__codelineno-30-14"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Parallelization opportunities
-<a id="__codelineno-30-15" name="__codelineno-30-15"></a>
-<a id="__codelineno-30-16" name="__codelineno-30-16"></a><span class="k">2.</span> <span class="gs">**Memory**</span>
-<a id="__codelineno-30-17" name="__codelineno-30-17"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Stack vs heap usage
-<a id="__codelineno-30-18" name="__codelineno-30-18"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Memory leaks
-<a id="__codelineno-30-19" name="__codelineno-30-19"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Unnecessary copies
-<a id="__codelineno-30-20" name="__codelineno-30-20"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Borrow checker optimizations
-<a id="__codelineno-30-21" name="__codelineno-30-21"></a>
-<a id="__codelineno-30-22" name="__codelineno-30-22"></a><span class="k">3.</span> <span class="gs">**Readability**</span>
-<a id="__codelineno-30-23" name="__codelineno-30-23"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Clear variable names
-<a id="__codelineno-30-24" name="__codelineno-30-24"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Appropriate comments
-<a id="__codelineno-30-25" name="__codelineno-30-25"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Function decomposition
-<a id="__codelineno-30-26" name="__codelineno-30-26"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Idiomatic patterns
-<a id="__codelineno-30-27" name="__codelineno-30-27"></a>
-<a id="__codelineno-30-28" name="__codelineno-30-28"></a><span class="gu">## Output Format</span>
-<a id="__codelineno-30-29" name="__codelineno-30-29"></a>
-<a id="__codelineno-30-30" name="__codelineno-30-30"></a>For each issue found:
-<a id="__codelineno-30-31" name="__codelineno-30-31"></a><span class="k">-</span><span class="w"> </span><span class="gs">**Issue**</span>: Description
-<a id="__codelineno-30-32" name="__codelineno-30-32"></a><span class="k">-</span><span class="w"> </span><span class="gs">**Impact**</span>: Performance/memory impact
-<a id="__codelineno-30-33" name="__codelineno-30-33"></a><span class="k">-</span><span class="w"> </span><span class="gs">**Solution**</span>: Specific code change
-<a id="__codelineno-30-34" name="__codelineno-30-34"></a><span class="k">-</span><span class="w"> </span><span class="gs">**Example**</span>: Before/after code
-<a id="__codelineno-30-35" name="__codelineno-30-35"></a>
-<a id="__codelineno-30-36" name="__codelineno-30-36"></a>Prioritize issues by impact.
+<span class="normal"><a href="#__codelineno-30-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-30-1" name="__codelineno-30-1"></a>---
+<a id="__codelineno-30-2" name="__codelineno-30-2"></a><span class="gu">description: "Full development workflow"</span>
+<a id="__codelineno-30-3" name="__codelineno-30-3"></a><span class="gu">---</span>
+<a id="__codelineno-30-4" name="__codelineno-30-4"></a>
+<a id="__codelineno-30-5" name="__codelineno-30-5"></a>Run the following workflow:
+<a id="__codelineno-30-6" name="__codelineno-30-6"></a>
+<a id="__codelineno-30-7" name="__codelineno-30-7"></a><span class="k">1.</span> First, review the code: Use /review or read the files
+<a id="__codelineno-30-8" name="__codelineno-30-8"></a><span class="k">2.</span> Then, run tests: Use /test or run <span class="sb">`cargo test`</span>
+<a id="__codelineno-30-9" name="__codelineno-30-9"></a><span class="k">3.</span> Finally, optimize: Use /optimize if needed
+<a id="__codelineno-30-10" name="__codelineno-30-10"></a>
+<a id="__codelineno-30-11" name="__codelineno-30-11"></a>Provide a summary of each step.
 </code></pre></div></td></tr></table></div>
-<h3 id="example-2-code-review">Example 2: Code Review</h3>
-<p><strong>File</strong>: <code>.qmt/commands/review.md</code></p>
+<h3 id="tool-specific-commands">Tool-Specific Commands</h3>
+<p>Create commands that focus on specific tools:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-31-1"> 1</a></span>
 <span class="normal"><a href="#__codelineno-31-2"> 2</a></span>
 <span class="normal"><a href="#__codelineno-31-3"> 3</a></span>
@@ -2538,99 +2547,24 @@ command prompts are never rewritten.</p>
 <span class="normal"><a href="#__codelineno-31-11">11</a></span>
 <span class="normal"><a href="#__codelineno-31-12">12</a></span>
 <span class="normal"><a href="#__codelineno-31-13">13</a></span>
-<span class="normal"><a href="#__codelineno-31-14">14</a></span>
-<span class="normal"><a href="#__codelineno-31-15">15</a></span>
-<span class="normal"><a href="#__codelineno-31-16">16</a></span>
-<span class="normal"><a href="#__codelineno-31-17">17</a></span>
-<span class="normal"><a href="#__codelineno-31-18">18</a></span>
-<span class="normal"><a href="#__codelineno-31-19">19</a></span>
-<span class="normal"><a href="#__codelineno-31-20">20</a></span>
-<span class="normal"><a href="#__codelineno-31-21">21</a></span>
-<span class="normal"><a href="#__codelineno-31-22">22</a></span>
-<span class="normal"><a href="#__codelineno-31-23">23</a></span>
-<span class="normal"><a href="#__codelineno-31-24">24</a></span>
-<span class="normal"><a href="#__codelineno-31-25">25</a></span>
-<span class="normal"><a href="#__codelineno-31-26">26</a></span>
-<span class="normal"><a href="#__codelineno-31-27">27</a></span>
-<span class="normal"><a href="#__codelineno-31-28">28</a></span>
-<span class="normal"><a href="#__codelineno-31-29">29</a></span>
-<span class="normal"><a href="#__codelineno-31-30">30</a></span>
-<span class="normal"><a href="#__codelineno-31-31">31</a></span>
-<span class="normal"><a href="#__codelineno-31-32">32</a></span>
-<span class="normal"><a href="#__codelineno-31-33">33</a></span>
-<span class="normal"><a href="#__codelineno-31-34">34</a></span>
-<span class="normal"><a href="#__codelineno-31-35">35</a></span>
-<span class="normal"><a href="#__codelineno-31-36">36</a></span>
-<span class="normal"><a href="#__codelineno-31-37">37</a></span>
-<span class="normal"><a href="#__codelineno-31-38">38</a></span>
-<span class="normal"><a href="#__codelineno-31-39">39</a></span>
-<span class="normal"><a href="#__codelineno-31-40">40</a></span>
-<span class="normal"><a href="#__codelineno-31-41">41</a></span>
-<span class="normal"><a href="#__codelineno-31-42">42</a></span>
-<span class="normal"><a href="#__codelineno-31-43">43</a></span>
-<span class="normal"><a href="#__codelineno-31-44">44</a></span>
-<span class="normal"><a href="#__codelineno-31-45">45</a></span>
-<span class="normal"><a href="#__codelineno-31-46">46</a></span>
-<span class="normal"><a href="#__codelineno-31-47">47</a></span>
-<span class="normal"><a href="#__codelineno-31-48">48</a></span>
-<span class="normal"><a href="#__codelineno-31-49">49</a></span>
-<span class="normal"><a href="#__codelineno-31-50">50</a></span>
-<span class="normal"><a href="#__codelineno-31-51">51</a></span>
-<span class="normal"><a href="#__codelineno-31-52">52</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-31-1" name="__codelineno-31-1"></a>---
-<a id="__codelineno-31-2" name="__codelineno-31-2"></a>description: "Review code changes (git diff or specific files)"
-<a id="__codelineno-31-3" name="__codelineno-31-3"></a><span class="gu">argument-hint: "[target]"</span>
+<span class="normal"><a href="#__codelineno-31-14">14</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-31-1" name="__codelineno-31-1"></a>---
+<a id="__codelineno-31-2" name="__codelineno-31-2"></a>description: "Search and replace across project"
+<a id="__codelineno-31-3" name="__codelineno-31-3"></a><span class="gu">argument-hint: "&lt;search&gt; &lt;replace&gt;"</span>
 <a id="__codelineno-31-4" name="__codelineno-31-4"></a><span class="gu">---</span>
 <a id="__codelineno-31-5" name="__codelineno-31-5"></a>
-<a id="__codelineno-31-6" name="__codelineno-31-6"></a>Review the code changes: $ARGUMENTS
+<a id="__codelineno-31-6" name="__codelineno-31-6"></a>Search and replace across the project: $ARGUMENTS.
 <a id="__codelineno-31-7" name="__codelineno-31-7"></a>
-<a id="__codelineno-31-8" name="__codelineno-31-8"></a><span class="gu">## Review Checklist</span>
+<a id="__codelineno-31-8" name="__codelineno-31-8"></a><span class="gu">## Steps</span>
 <a id="__codelineno-31-9" name="__codelineno-31-9"></a>
-<a id="__codelineno-31-10" name="__codelineno-31-10"></a><span class="gu">### Correctness</span>
-<a id="__codelineno-31-11" name="__codelineno-31-11"></a><span class="k">- [ ]</span> Logic errors
-<a id="__codelineno-31-12" name="__codelineno-31-12"></a><span class="k">- [ ]</span> Edge cases handled
-<a id="__codelineno-31-13" name="__codelineno-31-13"></a><span class="k">- [ ]</span> Error handling complete
-<a id="__codelineno-31-14" name="__codelineno-31-14"></a><span class="k">- [ ]</span> No race conditions
-<a id="__codelineno-31-15" name="__codelineno-31-15"></a>
-<a id="__codelineno-31-16" name="__codelineno-31-16"></a><span class="gu">### Security</span>
-<a id="__codelineno-31-17" name="__codelineno-31-17"></a><span class="k">- [ ]</span> Input validation
-<a id="__codelineno-31-18" name="__codelineno-31-18"></a><span class="k">- [ ]</span> No SQL injection
-<a id="__codelineno-31-19" name="__codelineno-31-19"></a><span class="k">- [ ]</span> No XSS vulnerabilities
-<a id="__codelineno-31-20" name="__codelineno-31-20"></a><span class="k">- [ ]</span> Secrets not exposed
-<a id="__codelineno-31-21" name="__codelineno-31-21"></a>
-<a id="__codelineno-31-22" name="__codelineno-31-22"></a><span class="gu">### Performance</span>
-<a id="__codelineno-31-23" name="__codelineno-31-23"></a><span class="k">- [ ]</span> No N+1 queries
-<a id="__codelineno-31-24" name="__codelineno-31-24"></a><span class="k">- [ ]</span> Efficient algorithms
-<a id="__codelineno-31-25" name="__codelineno-31-25"></a><span class="k">- [ ]</span> Proper caching
-<a id="__codelineno-31-26" name="__codelineno-31-26"></a><span class="k">- [ ]</span> No memory leaks
-<a id="__codelineno-31-27" name="__codelineno-31-27"></a>
-<a id="__codelineno-31-28" name="__codelineno-31-28"></a><span class="gu">### Maintainability</span>
-<a id="__codelineno-31-29" name="__codelineno-31-29"></a><span class="k">- [ ]</span> Clear naming
-<a id="__codelineno-31-30" name="__codelineno-31-30"></a><span class="k">- [ ]</span> Appropriate comments
-<a id="__codelineno-31-31" name="__codelineno-31-31"></a><span class="k">- [ ]</span> DRY principle
-<a id="__codelineno-31-32" name="__codelineno-31-32"></a><span class="k">- [ ]</span> SOLID principles
-<a id="__codelineno-31-33" name="__codelineno-31-33"></a>
-<a id="__codelineno-31-34" name="__codelineno-31-34"></a><span class="gu">### Testing</span>
-<a id="__codelineno-31-35" name="__codelineno-31-35"></a><span class="k">- [ ]</span> Tests included
-<a id="__codelineno-31-36" name="__codelineno-31-36"></a><span class="k">- [ ]</span> Edge cases tested
-<a id="__codelineno-31-37" name="__codelineno-31-37"></a><span class="k">- [ ]</span> Integration tests
-<a id="__codelineno-31-38" name="__codelineno-31-38"></a><span class="k">- [ ]</span> Documentation updated
-<a id="__codelineno-31-39" name="__codelineno-31-39"></a>
-<a id="__codelineno-31-40" name="__codelineno-31-40"></a><span class="gu">## Output Format</span>
-<a id="__codelineno-31-41" name="__codelineno-31-41"></a>
-<a id="__codelineno-31-42" name="__codelineno-31-42"></a>Group findings by severity:
-<a id="__codelineno-31-43" name="__codelineno-31-43"></a><span class="k">1.</span> <span class="gs">**Critical**</span>: Must fix before merge
-<a id="__codelineno-31-44" name="__codelineno-31-44"></a><span class="k">2.</span> <span class="gs">**Important**</span>: Should fix
-<a id="__codelineno-31-45" name="__codelineno-31-45"></a><span class="k">3.</span> <span class="gs">**Minor**</span>: Consider fixing
-<a id="__codelineno-31-46" name="__codelineno-31-46"></a><span class="k">4.</span> <span class="gs">**Suggestions**</span>: Optional improvements
-<a id="__codelineno-31-47" name="__codelineno-31-47"></a>
-<a id="__codelineno-31-48" name="__codelineno-31-48"></a>For each finding:
-<a id="__codelineno-31-49" name="__codelineno-31-49"></a><span class="k">-</span><span class="w"> </span>File and line number
-<a id="__codelineno-31-50" name="__codelineno-31-50"></a><span class="k">-</span><span class="w"> </span>Issue description
-<a id="__codelineno-31-51" name="__codelineno-31-51"></a><span class="k">-</span><span class="w"> </span>Suggested fix
-<a id="__codelineno-31-52" name="__codelineno-31-52"></a><span class="k">-</span><span class="w"> </span>Example code (if applicable)
+<a id="__codelineno-31-10" name="__codelineno-31-10"></a><span class="k">1.</span> Use search_text to find all occurrences
+<a id="__codelineno-31-11" name="__codelineno-31-11"></a><span class="k">2.</span> List affected files
+<a id="__codelineno-31-12" name="__codelineno-31-12"></a><span class="k">3.</span> Ask for confirmation
+<a id="__codelineno-31-13" name="__codelineno-31-13"></a><span class="k">4.</span> Use edit or multiedit to make replacements
+<a id="__codelineno-31-14" name="__codelineno-31-14"></a><span class="k">5.</span> Show summary of changes
 </code></pre></div></td></tr></table></div>
-<h3 id="example-3-test-generation">Example 3: Test Generation</h3>
-<p><strong>File</strong>: <code>~/.qmt/commands/test.md</code></p>
+<h2 id="examples">Examples</h2>
+<h3 id="example-1-code-optimization">Example 1: Code Optimization</h3>
+<p><strong>File</strong>: <code>~/.qmt/commands/optimize.md</code></p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-32-1"> 1</a></span>
 <span class="normal"><a href="#__codelineno-32-2"> 2</a></span>
 <span class="normal"><a href="#__codelineno-32-3"> 3</a></span>
@@ -2667,44 +2601,44 @@ command prompts are never rewritten.</p>
 <span class="normal"><a href="#__codelineno-32-34">34</a></span>
 <span class="normal"><a href="#__codelineno-32-35">35</a></span>
 <span class="normal"><a href="#__codelineno-32-36">36</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-32-1" name="__codelineno-32-1"></a>---
-<a id="__codelineno-32-2" name="__codelineno-32-2"></a>description: "Generate comprehensive tests for code"
-<a id="__codelineno-32-3" name="__codelineno-32-3"></a><span class="gu">argument-hint: "&lt;source-file&gt;"</span>
+<a id="__codelineno-32-2" name="__codelineno-32-2"></a>description: "Analyze and optimize code for performance"
+<a id="__codelineno-32-3" name="__codelineno-32-3"></a><span class="gu">argument-hint: "&lt;file-path&gt;"</span>
 <a id="__codelineno-32-4" name="__codelineno-32-4"></a><span class="gu">---</span>
 <a id="__codelineno-32-5" name="__codelineno-32-5"></a>
-<a id="__codelineno-32-6" name="__codelineno-32-6"></a>Generate comprehensive tests for the code in $ARGUMENTS.
+<a id="__codelineno-32-6" name="__codelineno-32-6"></a>Please analyze and optimize the code in $ARGUMENTS for:
 <a id="__codelineno-32-7" name="__codelineno-32-7"></a>
-<a id="__codelineno-32-8" name="__codelineno-32-8"></a><span class="gu">## Test Strategy</span>
+<a id="__codelineno-32-8" name="__codelineno-32-8"></a><span class="gu">## Analysis Areas</span>
 <a id="__codelineno-32-9" name="__codelineno-32-9"></a>
-<a id="__codelineno-32-10" name="__codelineno-32-10"></a><span class="k">1.</span> <span class="gs">**Unit Tests**</span>
-<a id="__codelineno-32-11" name="__codelineno-32-11"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Test each public function
-<a id="__codelineno-32-12" name="__codelineno-32-12"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Test return values
-<a id="__codelineno-32-13" name="__codelineno-32-13"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Test error conditions
-<a id="__codelineno-32-14" name="__codelineno-32-14"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Test edge cases
+<a id="__codelineno-32-10" name="__codelineno-32-10"></a><span class="k">1.</span> <span class="gs">**Performance**</span>
+<a id="__codelineno-32-11" name="__codelineno-32-11"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Algorithmic complexity (Big O)
+<a id="__codelineno-32-12" name="__codelineno-32-12"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Unnecessary allocations
+<a id="__codelineno-32-13" name="__codelineno-32-13"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Cache efficiency
+<a id="__codelineno-32-14" name="__codelineno-32-14"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Parallelization opportunities
 <a id="__codelineno-32-15" name="__codelineno-32-15"></a>
-<a id="__codelineno-32-16" name="__codelineno-32-16"></a><span class="k">2.</span> <span class="gs">**Integration Tests**</span>
-<a id="__codelineno-32-17" name="__codelineno-32-17"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Test component interactions
-<a id="__codelineno-32-18" name="__codelineno-32-18"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Test with real dependencies
-<a id="__codelineno-32-19" name="__codelineno-32-19"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Test end-to-end flows
-<a id="__codelineno-32-20" name="__codelineno-32-20"></a>
-<a id="__codelineno-32-21" name="__codelineno-32-21"></a><span class="k">3.</span> <span class="gs">**Property-Based Tests**</span>
-<a id="__codelineno-32-22" name="__codelineno-32-22"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Invariant testing
-<a id="__codelineno-32-23" name="__codelineno-32-23"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Fuzzing where appropriate
-<a id="__codelineno-32-24" name="__codelineno-32-24"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Random input generation
-<a id="__codelineno-32-25" name="__codelineno-32-25"></a>
-<a id="__codelineno-32-26" name="__codelineno-32-26"></a><span class="gu">## Requirements</span>
+<a id="__codelineno-32-16" name="__codelineno-32-16"></a><span class="k">2.</span> <span class="gs">**Memory**</span>
+<a id="__codelineno-32-17" name="__codelineno-32-17"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Stack vs heap usage
+<a id="__codelineno-32-18" name="__codelineno-32-18"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Memory leaks
+<a id="__codelineno-32-19" name="__codelineno-32-19"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Unnecessary copies
+<a id="__codelineno-32-20" name="__codelineno-32-20"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Borrow checker optimizations
+<a id="__codelineno-32-21" name="__codelineno-32-21"></a>
+<a id="__codelineno-32-22" name="__codelineno-32-22"></a><span class="k">3.</span> <span class="gs">**Readability**</span>
+<a id="__codelineno-32-23" name="__codelineno-32-23"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Clear variable names
+<a id="__codelineno-32-24" name="__codelineno-32-24"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Appropriate comments
+<a id="__codelineno-32-25" name="__codelineno-32-25"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Function decomposition
+<a id="__codelineno-32-26" name="__codelineno-32-26"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Idiomatic patterns
 <a id="__codelineno-32-27" name="__codelineno-32-27"></a>
-<a id="__codelineno-32-28" name="__codelineno-32-28"></a><span class="k">-</span><span class="w"> </span>Use the project's testing framework (cargo test for Rust)
-<a id="__codelineno-32-29" name="__codelineno-32-29"></a><span class="k">-</span><span class="w"> </span>Include descriptive test names
-<a id="__codelineno-32-30" name="__codelineno-32-30"></a><span class="k">-</span><span class="w"> </span>Add setup/teardown as needed
-<a id="__codelineno-32-31" name="__codelineno-32-31"></a><span class="k">-</span><span class="w"> </span>Include comments explaining test strategy
-<a id="__codelineno-32-32" name="__codelineno-32-32"></a><span class="k">-</span><span class="w"> </span>Aim for high coverage of critical paths
-<a id="__codelineno-32-33" name="__codelineno-32-33"></a>
-<a id="__codelineno-32-34" name="__codelineno-32-34"></a><span class="gu">## Output</span>
+<a id="__codelineno-32-28" name="__codelineno-32-28"></a><span class="gu">## Output Format</span>
+<a id="__codelineno-32-29" name="__codelineno-32-29"></a>
+<a id="__codelineno-32-30" name="__codelineno-32-30"></a>For each issue found:
+<a id="__codelineno-32-31" name="__codelineno-32-31"></a><span class="k">-</span><span class="w"> </span><span class="gs">**Issue**</span>: Description
+<a id="__codelineno-32-32" name="__codelineno-32-32"></a><span class="k">-</span><span class="w"> </span><span class="gs">**Impact**</span>: Performance/memory impact
+<a id="__codelineno-32-33" name="__codelineno-32-33"></a><span class="k">-</span><span class="w"> </span><span class="gs">**Solution**</span>: Specific code change
+<a id="__codelineno-32-34" name="__codelineno-32-34"></a><span class="k">-</span><span class="w"> </span><span class="gs">**Example**</span>: Before/after code
 <a id="__codelineno-32-35" name="__codelineno-32-35"></a>
-<a id="__codelineno-32-36" name="__codelineno-32-36"></a>Generate complete, runnable test code.
+<a id="__codelineno-32-36" name="__codelineno-32-36"></a>Prioritize issues by impact.
 </code></pre></div></td></tr></table></div>
-<h3 id="example-4-documentation-generation">Example 4: Documentation Generation</h3>
-<p><strong>File</strong>: <code>.qmt/commands/docs.md</code></p>
+<h3 id="example-2-code-review">Example 2: Code Review</h3>
+<p><strong>File</strong>: <code>.qmt/commands/review.md</code></p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-33-1"> 1</a></span>
 <span class="normal"><a href="#__codelineno-33-2"> 2</a></span>
 <span class="normal"><a href="#__codelineno-33-3"> 3</a></span>
@@ -2741,46 +2675,76 @@ command prompts are never rewritten.</p>
 <span class="normal"><a href="#__codelineno-33-34">34</a></span>
 <span class="normal"><a href="#__codelineno-33-35">35</a></span>
 <span class="normal"><a href="#__codelineno-33-36">36</a></span>
-<span class="normal"><a href="#__codelineno-33-37">37</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-33-1" name="__codelineno-33-1"></a>---
-<a id="__codelineno-33-2" name="__codelineno-33-2"></a>description: "Generate documentation for code"
-<a id="__codelineno-33-3" name="__codelineno-33-3"></a><span class="gu">argument-hint: "&lt;file-or-module&gt;"</span>
+<span class="normal"><a href="#__codelineno-33-37">37</a></span>
+<span class="normal"><a href="#__codelineno-33-38">38</a></span>
+<span class="normal"><a href="#__codelineno-33-39">39</a></span>
+<span class="normal"><a href="#__codelineno-33-40">40</a></span>
+<span class="normal"><a href="#__codelineno-33-41">41</a></span>
+<span class="normal"><a href="#__codelineno-33-42">42</a></span>
+<span class="normal"><a href="#__codelineno-33-43">43</a></span>
+<span class="normal"><a href="#__codelineno-33-44">44</a></span>
+<span class="normal"><a href="#__codelineno-33-45">45</a></span>
+<span class="normal"><a href="#__codelineno-33-46">46</a></span>
+<span class="normal"><a href="#__codelineno-33-47">47</a></span>
+<span class="normal"><a href="#__codelineno-33-48">48</a></span>
+<span class="normal"><a href="#__codelineno-33-49">49</a></span>
+<span class="normal"><a href="#__codelineno-33-50">50</a></span>
+<span class="normal"><a href="#__codelineno-33-51">51</a></span>
+<span class="normal"><a href="#__codelineno-33-52">52</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-33-1" name="__codelineno-33-1"></a>---
+<a id="__codelineno-33-2" name="__codelineno-33-2"></a>description: "Review code changes (git diff or specific files)"
+<a id="__codelineno-33-3" name="__codelineno-33-3"></a><span class="gu">argument-hint: "[target]"</span>
 <a id="__codelineno-33-4" name="__codelineno-33-4"></a><span class="gu">---</span>
 <a id="__codelineno-33-5" name="__codelineno-33-5"></a>
-<a id="__codelineno-33-6" name="__codelineno-33-6"></a>Generate comprehensive documentation for $ARGUMENTS.
+<a id="__codelineno-33-6" name="__codelineno-33-6"></a>Review the code changes: $ARGUMENTS
 <a id="__codelineno-33-7" name="__codelineno-33-7"></a>
-<a id="__codelineno-33-8" name="__codelineno-33-8"></a><span class="gu">## Documentation Types</span>
+<a id="__codelineno-33-8" name="__codelineno-33-8"></a><span class="gu">## Review Checklist</span>
 <a id="__codelineno-33-9" name="__codelineno-33-9"></a>
-<a id="__codelineno-33-10" name="__codelineno-33-10"></a><span class="k">1.</span> <span class="gs">**Module-level docs**</span>
-<a id="__codelineno-33-11" name="__codelineno-33-11"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Purpose and overview
-<a id="__codelineno-33-12" name="__codelineno-33-12"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Usage examples
-<a id="__codelineno-33-13" name="__codelineno-33-13"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Feature description
-<a id="__codelineno-33-14" name="__codelineno-33-14"></a>
-<a id="__codelineno-33-15" name="__codelineno-33-15"></a><span class="k">2.</span> <span class="gs">**Function docs**</span>
-<a id="__codelineno-33-16" name="__codelineno-33-16"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Description
-<a id="__codelineno-33-17" name="__codelineno-33-17"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Parameters
-<a id="__codelineno-33-18" name="__codelineno-33-18"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Return values
-<a id="__codelineno-33-19" name="__codelineno-33-19"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Errors
-<a id="__codelineno-33-20" name="__codelineno-33-20"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Examples
-<a id="__codelineno-33-21" name="__codelineno-33-21"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Safety notes (if unsafe)
-<a id="__codelineno-33-22" name="__codelineno-33-22"></a>
-<a id="__codelineno-33-23" name="__codelineno-33-23"></a><span class="k">3.</span> <span class="gs">**Type docs**</span>
-<a id="__codelineno-33-24" name="__codelineno-33-24"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Description
-<a id="__codelineno-33-25" name="__codelineno-33-25"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Fields/members
-<a id="__codelineno-33-26" name="__codelineno-33-26"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Usage examples
-<a id="__codelineno-33-27" name="__codelineno-33-27"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Invariants
-<a id="__codelineno-33-28" name="__codelineno-33-28"></a>
-<a id="__codelineno-33-29" name="__codelineno-33-29"></a><span class="gu">## Style Guide</span>
-<a id="__codelineno-33-30" name="__codelineno-33-30"></a>
-<a id="__codelineno-33-31" name="__codelineno-33-31"></a><span class="k">-</span><span class="w"> </span>Use rustdoc format
-<a id="__codelineno-33-32" name="__codelineno-33-32"></a><span class="k">-</span><span class="w"> </span>Include code examples
-<a id="__codelineno-33-33" name="__codelineno-33-33"></a><span class="k">-</span><span class="w"> </span>Add links to related items
-<a id="__codelineno-33-34" name="__codelineno-33-34"></a><span class="k">-</span><span class="w"> </span>Keep descriptions concise
-<a id="__codelineno-33-35" name="__codelineno-33-35"></a><span class="k">-</span><span class="w"> </span>Include safety sections for unsafe code
-<a id="__codelineno-33-36" name="__codelineno-33-36"></a>
-<a id="__codelineno-33-37" name="__codelineno-33-37"></a>Generate complete documentation comments.
+<a id="__codelineno-33-10" name="__codelineno-33-10"></a><span class="gu">### Correctness</span>
+<a id="__codelineno-33-11" name="__codelineno-33-11"></a><span class="k">- [ ]</span> Logic errors
+<a id="__codelineno-33-12" name="__codelineno-33-12"></a><span class="k">- [ ]</span> Edge cases handled
+<a id="__codelineno-33-13" name="__codelineno-33-13"></a><span class="k">- [ ]</span> Error handling complete
+<a id="__codelineno-33-14" name="__codelineno-33-14"></a><span class="k">- [ ]</span> No race conditions
+<a id="__codelineno-33-15" name="__codelineno-33-15"></a>
+<a id="__codelineno-33-16" name="__codelineno-33-16"></a><span class="gu">### Security</span>
+<a id="__codelineno-33-17" name="__codelineno-33-17"></a><span class="k">- [ ]</span> Input validation
+<a id="__codelineno-33-18" name="__codelineno-33-18"></a><span class="k">- [ ]</span> No SQL injection
+<a id="__codelineno-33-19" name="__codelineno-33-19"></a><span class="k">- [ ]</span> No XSS vulnerabilities
+<a id="__codelineno-33-20" name="__codelineno-33-20"></a><span class="k">- [ ]</span> Secrets not exposed
+<a id="__codelineno-33-21" name="__codelineno-33-21"></a>
+<a id="__codelineno-33-22" name="__codelineno-33-22"></a><span class="gu">### Performance</span>
+<a id="__codelineno-33-23" name="__codelineno-33-23"></a><span class="k">- [ ]</span> No N+1 queries
+<a id="__codelineno-33-24" name="__codelineno-33-24"></a><span class="k">- [ ]</span> Efficient algorithms
+<a id="__codelineno-33-25" name="__codelineno-33-25"></a><span class="k">- [ ]</span> Proper caching
+<a id="__codelineno-33-26" name="__codelineno-33-26"></a><span class="k">- [ ]</span> No memory leaks
+<a id="__codelineno-33-27" name="__codelineno-33-27"></a>
+<a id="__codelineno-33-28" name="__codelineno-33-28"></a><span class="gu">### Maintainability</span>
+<a id="__codelineno-33-29" name="__codelineno-33-29"></a><span class="k">- [ ]</span> Clear naming
+<a id="__codelineno-33-30" name="__codelineno-33-30"></a><span class="k">- [ ]</span> Appropriate comments
+<a id="__codelineno-33-31" name="__codelineno-33-31"></a><span class="k">- [ ]</span> DRY principle
+<a id="__codelineno-33-32" name="__codelineno-33-32"></a><span class="k">- [ ]</span> SOLID principles
+<a id="__codelineno-33-33" name="__codelineno-33-33"></a>
+<a id="__codelineno-33-34" name="__codelineno-33-34"></a><span class="gu">### Testing</span>
+<a id="__codelineno-33-35" name="__codelineno-33-35"></a><span class="k">- [ ]</span> Tests included
+<a id="__codelineno-33-36" name="__codelineno-33-36"></a><span class="k">- [ ]</span> Edge cases tested
+<a id="__codelineno-33-37" name="__codelineno-33-37"></a><span class="k">- [ ]</span> Integration tests
+<a id="__codelineno-33-38" name="__codelineno-33-38"></a><span class="k">- [ ]</span> Documentation updated
+<a id="__codelineno-33-39" name="__codelineno-33-39"></a>
+<a id="__codelineno-33-40" name="__codelineno-33-40"></a><span class="gu">## Output Format</span>
+<a id="__codelineno-33-41" name="__codelineno-33-41"></a>
+<a id="__codelineno-33-42" name="__codelineno-33-42"></a>Group findings by severity:
+<a id="__codelineno-33-43" name="__codelineno-33-43"></a><span class="k">1.</span> <span class="gs">**Critical**</span>: Must fix before merge
+<a id="__codelineno-33-44" name="__codelineno-33-44"></a><span class="k">2.</span> <span class="gs">**Important**</span>: Should fix
+<a id="__codelineno-33-45" name="__codelineno-33-45"></a><span class="k">3.</span> <span class="gs">**Minor**</span>: Consider fixing
+<a id="__codelineno-33-46" name="__codelineno-33-46"></a><span class="k">4.</span> <span class="gs">**Suggestions**</span>: Optional improvements
+<a id="__codelineno-33-47" name="__codelineno-33-47"></a>
+<a id="__codelineno-33-48" name="__codelineno-33-48"></a>For each finding:
+<a id="__codelineno-33-49" name="__codelineno-33-49"></a><span class="k">-</span><span class="w"> </span>File and line number
+<a id="__codelineno-33-50" name="__codelineno-33-50"></a><span class="k">-</span><span class="w"> </span>Issue description
+<a id="__codelineno-33-51" name="__codelineno-33-51"></a><span class="k">-</span><span class="w"> </span>Suggested fix
+<a id="__codelineno-33-52" name="__codelineno-33-52"></a><span class="k">-</span><span class="w"> </span>Example code (if applicable)
 </code></pre></div></td></tr></table></div>
-<h3 id="example-5-git-commit">Example 5: Git Commit</h3>
-<p><strong>File</strong>: <code>~/.qmt/commands/commit.md</code></p>
+<h3 id="example-3-test-generation">Example 3: Test Generation</h3>
+<p><strong>File</strong>: <code>~/.qmt/commands/test.md</code></p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-34-1"> 1</a></span>
 <span class="normal"><a href="#__codelineno-34-2"> 2</a></span>
 <span class="normal"><a href="#__codelineno-34-3"> 3</a></span>
@@ -2816,53 +2780,45 @@ command prompts are never rewritten.</p>
 <span class="normal"><a href="#__codelineno-34-33">33</a></span>
 <span class="normal"><a href="#__codelineno-34-34">34</a></span>
 <span class="normal"><a href="#__codelineno-34-35">35</a></span>
-<span class="normal"><a href="#__codelineno-34-36">36</a></span>
-<span class="normal"><a href="#__codelineno-34-37">37</a></span>
-<span class="normal"><a href="#__codelineno-34-38">38</a></span>
-<span class="normal"><a href="#__codelineno-34-39">39</a></span>
-<span class="normal"><a href="#__codelineno-34-40">40</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-34-1" name="__codelineno-34-1"></a>---
-<a id="__codelineno-34-2" name="__codelineno-34-2"></a><span class="gu">description: "Create semantic commit message and commit"</span>
-<a id="__codelineno-34-3" name="__codelineno-34-3"></a><span class="gu">---</span>
-<a id="__codelineno-34-4" name="__codelineno-34-4"></a>
-<a id="__codelineno-34-5" name="__codelineno-34-5"></a>Create a semantic commit for the current changes.
-<a id="__codelineno-34-6" name="__codelineno-34-6"></a>
-<a id="__codelineno-34-7" name="__codelineno-34-7"></a><span class="gu">## Steps</span>
-<a id="__codelineno-34-8" name="__codelineno-34-8"></a>
-<a id="__codelineno-34-9" name="__codelineno-34-9"></a><span class="k">1.</span> Run <span class="sb">`git status`</span> to see changes
-<a id="__codelineno-34-10" name="__codelineno-34-10"></a><span class="k">2.</span> Run <span class="sb">`git diff --cached`</span> for staged changes
-<a id="__codelineno-34-11" name="__codelineno-34-11"></a><span class="k">3.</span> If no staged changes, run <span class="sb">`git diff`</span> and suggest staging
-<a id="__codelineno-34-12" name="__codelineno-34-12"></a><span class="k">4.</span> Analyze changes and determine commit type:
-<a id="__codelineno-34-13" name="__codelineno-34-13"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span><span class="gs">**feat**</span>: New feature
-<a id="__codelineno-34-14" name="__codelineno-34-14"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span><span class="gs">**fix**</span>: Bug fix
-<a id="__codelineno-34-15" name="__codelineno-34-15"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span><span class="gs">**docs**</span>: Documentation only
-<a id="__codelineno-34-16" name="__codelineno-34-16"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span><span class="gs">**style**</span>: Formatting, missing semicolons, etc.
-<a id="__codelineno-34-17" name="__codelineno-34-17"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span><span class="gs">**refactor**</span>: Code change that neither fixes a bug nor adds a feature
-<a id="__codelineno-34-18" name="__codelineno-34-18"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span><span class="gs">**test**</span>: Adding missing tests
-<a id="__codelineno-34-19" name="__codelineno-34-19"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span><span class="gs">**chore**</span>: Updating build tasks, configs, etc.
-<a id="__codelineno-34-20" name="__codelineno-34-20"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span><span class="gs">**perf**</span>: Performance improvement
-<a id="__codelineno-34-21" name="__codelineno-34-21"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span><span class="gs">**ci**</span>: CI/CD changes
-<a id="__codelineno-34-22" name="__codelineno-34-22"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span><span class="gs">**build**</span>: Build system changes
-<a id="__codelineno-34-23" name="__codelineno-34-23"></a>
-<a id="__codelineno-34-24" name="__codelineno-34-24"></a><span class="k">5.</span> Generate commit message following Conventional Commits:
+<span class="normal"><a href="#__codelineno-34-36">36</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-34-1" name="__codelineno-34-1"></a>---
+<a id="__codelineno-34-2" name="__codelineno-34-2"></a>description: "Generate comprehensive tests for code"
+<a id="__codelineno-34-3" name="__codelineno-34-3"></a><span class="gu">argument-hint: "&lt;source-file&gt;"</span>
+<a id="__codelineno-34-4" name="__codelineno-34-4"></a><span class="gu">---</span>
+<a id="__codelineno-34-5" name="__codelineno-34-5"></a>
+<a id="__codelineno-34-6" name="__codelineno-34-6"></a>Generate comprehensive tests for the code in $ARGUMENTS.
+<a id="__codelineno-34-7" name="__codelineno-34-7"></a>
+<a id="__codelineno-34-8" name="__codelineno-34-8"></a><span class="gu">## Test Strategy</span>
+<a id="__codelineno-34-9" name="__codelineno-34-9"></a>
+<a id="__codelineno-34-10" name="__codelineno-34-10"></a><span class="k">1.</span> <span class="gs">**Unit Tests**</span>
+<a id="__codelineno-34-11" name="__codelineno-34-11"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Test each public function
+<a id="__codelineno-34-12" name="__codelineno-34-12"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Test return values
+<a id="__codelineno-34-13" name="__codelineno-34-13"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Test error conditions
+<a id="__codelineno-34-14" name="__codelineno-34-14"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Test edge cases
+<a id="__codelineno-34-15" name="__codelineno-34-15"></a>
+<a id="__codelineno-34-16" name="__codelineno-34-16"></a><span class="k">2.</span> <span class="gs">**Integration Tests**</span>
+<a id="__codelineno-34-17" name="__codelineno-34-17"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Test component interactions
+<a id="__codelineno-34-18" name="__codelineno-34-18"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Test with real dependencies
+<a id="__codelineno-34-19" name="__codelineno-34-19"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Test end-to-end flows
+<a id="__codelineno-34-20" name="__codelineno-34-20"></a>
+<a id="__codelineno-34-21" name="__codelineno-34-21"></a><span class="k">3.</span> <span class="gs">**Property-Based Tests**</span>
+<a id="__codelineno-34-22" name="__codelineno-34-22"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Invariant testing
+<a id="__codelineno-34-23" name="__codelineno-34-23"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Fuzzing where appropriate
+<a id="__codelineno-34-24" name="__codelineno-34-24"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Random input generation
 <a id="__codelineno-34-25" name="__codelineno-34-25"></a>
-<a id="__codelineno-34-26" name="__codelineno-34-26"></a>       &lt;type&gt;[optional scope]: &lt;description&gt;
+<a id="__codelineno-34-26" name="__codelineno-34-26"></a><span class="gu">## Requirements</span>
 <a id="__codelineno-34-27" name="__codelineno-34-27"></a>
-<a id="__codelineno-34-28" name="__codelineno-34-28"></a>       [optional body]
-<a id="__codelineno-34-29" name="__codelineno-34-29"></a>
-<a id="__codelineno-34-30" name="__codelineno-34-30"></a>       [optional footer(s)]
-<a id="__codelineno-34-31" name="__codelineno-34-31"></a>
-<a id="__codelineno-34-32" name="__codelineno-34-32"></a><span class="k">6.</span> Ask for confirmation before committing
-<a id="__codelineno-34-33" name="__codelineno-34-33"></a><span class="k">7.</span> Create the commit
-<a id="__codelineno-34-34" name="__codelineno-34-34"></a>
-<a id="__codelineno-34-35" name="__codelineno-34-35"></a><span class="gu">## Rules</span>
-<a id="__codelineno-34-36" name="__codelineno-34-36"></a>
-<a id="__codelineno-34-37" name="__codelineno-34-37"></a><span class="k">-</span><span class="w"> </span>Subject line &lt; 72 characters
-<a id="__codelineno-34-38" name="__codelineno-34-38"></a><span class="k">-</span><span class="w"> </span>Use imperative mood ("Add feature" not "Added feature")
-<a id="__codelineno-34-39" name="__codelineno-34-39"></a><span class="k">-</span><span class="w"> </span>Body explains what and why, not how
-<a id="__codelineno-34-40" name="__codelineno-34-40"></a><span class="k">-</span><span class="w"> </span>Reference issues if applicable
+<a id="__codelineno-34-28" name="__codelineno-34-28"></a><span class="k">-</span><span class="w"> </span>Use the project's testing framework (cargo test for Rust)
+<a id="__codelineno-34-29" name="__codelineno-34-29"></a><span class="k">-</span><span class="w"> </span>Include descriptive test names
+<a id="__codelineno-34-30" name="__codelineno-34-30"></a><span class="k">-</span><span class="w"> </span>Add setup/teardown as needed
+<a id="__codelineno-34-31" name="__codelineno-34-31"></a><span class="k">-</span><span class="w"> </span>Include comments explaining test strategy
+<a id="__codelineno-34-32" name="__codelineno-34-32"></a><span class="k">-</span><span class="w"> </span>Aim for high coverage of critical paths
+<a id="__codelineno-34-33" name="__codelineno-34-33"></a>
+<a id="__codelineno-34-34" name="__codelineno-34-34"></a><span class="gu">## Output</span>
+<a id="__codelineno-34-35" name="__codelineno-34-35"></a>
+<a id="__codelineno-34-36" name="__codelineno-34-36"></a>Generate complete, runnable test code.
 </code></pre></div></td></tr></table></div>
-<h3 id="example-6-project-specific-deployment">Example 6: Project-Specific Deployment</h3>
-<p><strong>File</strong>: <code>.qmt/commands/deploy.md</code></p>
+<h3 id="example-4-documentation-generation">Example 4: Documentation Generation</h3>
+<p><strong>File</strong>: <code>.qmt/commands/docs.md</code></p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-35-1"> 1</a></span>
 <span class="normal"><a href="#__codelineno-35-2"> 2</a></span>
 <span class="normal"><a href="#__codelineno-35-3"> 3</a></span>
@@ -2899,57 +2855,215 @@ command prompts are never rewritten.</p>
 <span class="normal"><a href="#__codelineno-35-34">34</a></span>
 <span class="normal"><a href="#__codelineno-35-35">35</a></span>
 <span class="normal"><a href="#__codelineno-35-36">36</a></span>
-<span class="normal"><a href="#__codelineno-35-37">37</a></span>
-<span class="normal"><a href="#__codelineno-35-38">38</a></span>
-<span class="normal"><a href="#__codelineno-35-39">39</a></span>
-<span class="normal"><a href="#__codelineno-35-40">40</a></span>
-<span class="normal"><a href="#__codelineno-35-41">41</a></span>
-<span class="normal"><a href="#__codelineno-35-42">42</a></span>
-<span class="normal"><a href="#__codelineno-35-43">43</a></span>
-<span class="normal"><a href="#__codelineno-35-44">44</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-35-1" name="__codelineno-35-1"></a>---
-<a id="__codelineno-35-2" name="__codelineno-35-2"></a>description: "Deploy to specified environment"
-<a id="__codelineno-35-3" name="__codelineno-35-3"></a><span class="gu">argument-hint: "[staging|production]"</span>
+<span class="normal"><a href="#__codelineno-35-37">37</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-35-1" name="__codelineno-35-1"></a>---
+<a id="__codelineno-35-2" name="__codelineno-35-2"></a>description: "Generate documentation for code"
+<a id="__codelineno-35-3" name="__codelineno-35-3"></a><span class="gu">argument-hint: "&lt;file-or-module&gt;"</span>
 <a id="__codelineno-35-4" name="__codelineno-35-4"></a><span class="gu">---</span>
 <a id="__codelineno-35-5" name="__codelineno-35-5"></a>
-<a id="__codelineno-35-6" name="__codelineno-35-6"></a>Deploy to ${1:-staging} environment.
+<a id="__codelineno-35-6" name="__codelineno-35-6"></a>Generate comprehensive documentation for $ARGUMENTS.
 <a id="__codelineno-35-7" name="__codelineno-35-7"></a>
-<a id="__codelineno-35-8" name="__codelineno-35-8"></a><span class="gu">## Pre-deployment Checks</span>
+<a id="__codelineno-35-8" name="__codelineno-35-8"></a><span class="gu">## Documentation Types</span>
 <a id="__codelineno-35-9" name="__codelineno-35-9"></a>
-<a id="__codelineno-35-10" name="__codelineno-35-10"></a><span class="k">1.</span> Run tests: <span class="sb">`cargo test`</span>
-<a id="__codelineno-35-11" name="__codelineno-35-11"></a><span class="k">2.</span> Check formatting: <span class="sb">`cargo fmt --check`</span>
-<a id="__codelineno-35-12" name="__codelineno-35-12"></a><span class="k">3.</span> Run linter: <span class="sb">`cargo clippy`</span>
-<a id="__codelineno-35-13" name="__codelineno-35-13"></a><span class="k">4.</span> Build release: <span class="sb">`cargo build --release`</span>
+<a id="__codelineno-35-10" name="__codelineno-35-10"></a><span class="k">1.</span> <span class="gs">**Module-level docs**</span>
+<a id="__codelineno-35-11" name="__codelineno-35-11"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Purpose and overview
+<a id="__codelineno-35-12" name="__codelineno-35-12"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Usage examples
+<a id="__codelineno-35-13" name="__codelineno-35-13"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Feature description
 <a id="__codelineno-35-14" name="__codelineno-35-14"></a>
-<a id="__codelineno-35-15" name="__codelineno-35-15"></a><span class="gu">## Deployment Steps</span>
-<a id="__codelineno-35-16" name="__codelineno-35-16"></a>
-<a id="__codelineno-35-17" name="__codelineno-35-17"></a><span class="gu">### Staging</span>
-<a id="__codelineno-35-18" name="__codelineno-35-18"></a>
-<a id="__codelineno-35-19" name="__codelineno-35-19"></a><span class="k">1.</span> Build Docker image
-<a id="__codelineno-35-20" name="__codelineno-35-20"></a><span class="k">2.</span> Push to registry
-<a id="__codelineno-35-21" name="__codelineno-35-21"></a><span class="k">3.</span> Update staging deployment
-<a id="__codelineno-35-22" name="__codelineno-35-22"></a><span class="k">4.</span> Run smoke tests
-<a id="__codelineno-35-23" name="__codelineno-35-23"></a><span class="k">5.</span> Notify team
-<a id="__codelineno-35-24" name="__codelineno-35-24"></a>
-<a id="__codelineno-35-25" name="__codelineno-35-25"></a><span class="gu">### Production</span>
-<a id="__codelineno-35-26" name="__codelineno-35-26"></a>
-<a id="__codelineno-35-27" name="__codelineno-35-27"></a><span class="k">1.</span> <span class="gs">**Confirm**</span>: Ask for explicit confirmation
-<a id="__codelineno-35-28" name="__codelineno-35-28"></a><span class="k">2.</span> Create release tag
-<a id="__codelineno-35-29" name="__codelineno-35-29"></a><span class="k">3.</span> Build Docker image
-<a id="__codelineno-35-30" name="__codelineno-35-30"></a><span class="k">4.</span> Push to registry
-<a id="__codelineno-35-31" name="__codelineno-35-31"></a><span class="k">5.</span> Update production deployment
-<a id="__codelineno-35-32" name="__codelineno-35-32"></a><span class="k">6.</span> Run smoke tests
-<a id="__codelineno-35-33" name="__codelineno-35-33"></a><span class="k">7.</span> Monitor for errors
-<a id="__codelineno-35-34" name="__codelineno-35-34"></a><span class="k">8.</span> Notify team
-<a id="__codelineno-35-35" name="__codelineno-35-35"></a>
-<a id="__codelineno-35-36" name="__codelineno-35-36"></a><span class="gu">## Rollback Plan</span>
-<a id="__codelineno-35-37" name="__codelineno-35-37"></a>
-<a id="__codelineno-35-38" name="__codelineno-35-38"></a>If issues detected:
-<a id="__codelineno-35-39" name="__codelineno-35-39"></a><span class="k">1.</span> Identify problem
-<a id="__codelineno-35-40" name="__codelineno-35-40"></a><span class="k">2.</span> Rollback to previous version
-<a id="__codelineno-35-41" name="__codelineno-35-41"></a><span class="k">3.</span> Notify team
-<a id="__codelineno-35-42" name="__codelineno-35-42"></a><span class="k">4.</span> Create incident report
-<a id="__codelineno-35-43" name="__codelineno-35-43"></a>
-<a id="__codelineno-35-44" name="__codelineno-35-44"></a>Proceed with deployment to ${1:-staging}? Ask for confirmation.
+<a id="__codelineno-35-15" name="__codelineno-35-15"></a><span class="k">2.</span> <span class="gs">**Function docs**</span>
+<a id="__codelineno-35-16" name="__codelineno-35-16"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Description
+<a id="__codelineno-35-17" name="__codelineno-35-17"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Parameters
+<a id="__codelineno-35-18" name="__codelineno-35-18"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Return values
+<a id="__codelineno-35-19" name="__codelineno-35-19"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Errors
+<a id="__codelineno-35-20" name="__codelineno-35-20"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Examples
+<a id="__codelineno-35-21" name="__codelineno-35-21"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Safety notes (if unsafe)
+<a id="__codelineno-35-22" name="__codelineno-35-22"></a>
+<a id="__codelineno-35-23" name="__codelineno-35-23"></a><span class="k">3.</span> <span class="gs">**Type docs**</span>
+<a id="__codelineno-35-24" name="__codelineno-35-24"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Description
+<a id="__codelineno-35-25" name="__codelineno-35-25"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Fields/members
+<a id="__codelineno-35-26" name="__codelineno-35-26"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Usage examples
+<a id="__codelineno-35-27" name="__codelineno-35-27"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span>Invariants
+<a id="__codelineno-35-28" name="__codelineno-35-28"></a>
+<a id="__codelineno-35-29" name="__codelineno-35-29"></a><span class="gu">## Style Guide</span>
+<a id="__codelineno-35-30" name="__codelineno-35-30"></a>
+<a id="__codelineno-35-31" name="__codelineno-35-31"></a><span class="k">-</span><span class="w"> </span>Use rustdoc format
+<a id="__codelineno-35-32" name="__codelineno-35-32"></a><span class="k">-</span><span class="w"> </span>Include code examples
+<a id="__codelineno-35-33" name="__codelineno-35-33"></a><span class="k">-</span><span class="w"> </span>Add links to related items
+<a id="__codelineno-35-34" name="__codelineno-35-34"></a><span class="k">-</span><span class="w"> </span>Keep descriptions concise
+<a id="__codelineno-35-35" name="__codelineno-35-35"></a><span class="k">-</span><span class="w"> </span>Include safety sections for unsafe code
+<a id="__codelineno-35-36" name="__codelineno-35-36"></a>
+<a id="__codelineno-35-37" name="__codelineno-35-37"></a>Generate complete documentation comments.
+</code></pre></div></td></tr></table></div>
+<h3 id="example-5-git-commit">Example 5: Git Commit</h3>
+<p><strong>File</strong>: <code>~/.qmt/commands/commit.md</code></p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-36-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-36-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-36-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-36-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-36-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-36-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-36-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-36-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-36-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-36-10">10</a></span>
+<span class="normal"><a href="#__codelineno-36-11">11</a></span>
+<span class="normal"><a href="#__codelineno-36-12">12</a></span>
+<span class="normal"><a href="#__codelineno-36-13">13</a></span>
+<span class="normal"><a href="#__codelineno-36-14">14</a></span>
+<span class="normal"><a href="#__codelineno-36-15">15</a></span>
+<span class="normal"><a href="#__codelineno-36-16">16</a></span>
+<span class="normal"><a href="#__codelineno-36-17">17</a></span>
+<span class="normal"><a href="#__codelineno-36-18">18</a></span>
+<span class="normal"><a href="#__codelineno-36-19">19</a></span>
+<span class="normal"><a href="#__codelineno-36-20">20</a></span>
+<span class="normal"><a href="#__codelineno-36-21">21</a></span>
+<span class="normal"><a href="#__codelineno-36-22">22</a></span>
+<span class="normal"><a href="#__codelineno-36-23">23</a></span>
+<span class="normal"><a href="#__codelineno-36-24">24</a></span>
+<span class="normal"><a href="#__codelineno-36-25">25</a></span>
+<span class="normal"><a href="#__codelineno-36-26">26</a></span>
+<span class="normal"><a href="#__codelineno-36-27">27</a></span>
+<span class="normal"><a href="#__codelineno-36-28">28</a></span>
+<span class="normal"><a href="#__codelineno-36-29">29</a></span>
+<span class="normal"><a href="#__codelineno-36-30">30</a></span>
+<span class="normal"><a href="#__codelineno-36-31">31</a></span>
+<span class="normal"><a href="#__codelineno-36-32">32</a></span>
+<span class="normal"><a href="#__codelineno-36-33">33</a></span>
+<span class="normal"><a href="#__codelineno-36-34">34</a></span>
+<span class="normal"><a href="#__codelineno-36-35">35</a></span>
+<span class="normal"><a href="#__codelineno-36-36">36</a></span>
+<span class="normal"><a href="#__codelineno-36-37">37</a></span>
+<span class="normal"><a href="#__codelineno-36-38">38</a></span>
+<span class="normal"><a href="#__codelineno-36-39">39</a></span>
+<span class="normal"><a href="#__codelineno-36-40">40</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-36-1" name="__codelineno-36-1"></a>---
+<a id="__codelineno-36-2" name="__codelineno-36-2"></a><span class="gu">description: "Create semantic commit message and commit"</span>
+<a id="__codelineno-36-3" name="__codelineno-36-3"></a><span class="gu">---</span>
+<a id="__codelineno-36-4" name="__codelineno-36-4"></a>
+<a id="__codelineno-36-5" name="__codelineno-36-5"></a>Create a semantic commit for the current changes.
+<a id="__codelineno-36-6" name="__codelineno-36-6"></a>
+<a id="__codelineno-36-7" name="__codelineno-36-7"></a><span class="gu">## Steps</span>
+<a id="__codelineno-36-8" name="__codelineno-36-8"></a>
+<a id="__codelineno-36-9" name="__codelineno-36-9"></a><span class="k">1.</span> Run <span class="sb">`git status`</span> to see changes
+<a id="__codelineno-36-10" name="__codelineno-36-10"></a><span class="k">2.</span> Run <span class="sb">`git diff --cached`</span> for staged changes
+<a id="__codelineno-36-11" name="__codelineno-36-11"></a><span class="k">3.</span> If no staged changes, run <span class="sb">`git diff`</span> and suggest staging
+<a id="__codelineno-36-12" name="__codelineno-36-12"></a><span class="k">4.</span> Analyze changes and determine commit type:
+<a id="__codelineno-36-13" name="__codelineno-36-13"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span><span class="gs">**feat**</span>: New feature
+<a id="__codelineno-36-14" name="__codelineno-36-14"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span><span class="gs">**fix**</span>: Bug fix
+<a id="__codelineno-36-15" name="__codelineno-36-15"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span><span class="gs">**docs**</span>: Documentation only
+<a id="__codelineno-36-16" name="__codelineno-36-16"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span><span class="gs">**style**</span>: Formatting, missing semicolons, etc.
+<a id="__codelineno-36-17" name="__codelineno-36-17"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span><span class="gs">**refactor**</span>: Code change that neither fixes a bug nor adds a feature
+<a id="__codelineno-36-18" name="__codelineno-36-18"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span><span class="gs">**test**</span>: Adding missing tests
+<a id="__codelineno-36-19" name="__codelineno-36-19"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span><span class="gs">**chore**</span>: Updating build tasks, configs, etc.
+<a id="__codelineno-36-20" name="__codelineno-36-20"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span><span class="gs">**perf**</span>: Performance improvement
+<a id="__codelineno-36-21" name="__codelineno-36-21"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span><span class="gs">**ci**</span>: CI/CD changes
+<a id="__codelineno-36-22" name="__codelineno-36-22"></a><span class="w">   </span><span class="k">-</span><span class="w"> </span><span class="gs">**build**</span>: Build system changes
+<a id="__codelineno-36-23" name="__codelineno-36-23"></a>
+<a id="__codelineno-36-24" name="__codelineno-36-24"></a><span class="k">5.</span> Generate commit message following Conventional Commits:
+<a id="__codelineno-36-25" name="__codelineno-36-25"></a>
+<a id="__codelineno-36-26" name="__codelineno-36-26"></a>       &lt;type&gt;[optional scope]: &lt;description&gt;
+<a id="__codelineno-36-27" name="__codelineno-36-27"></a>
+<a id="__codelineno-36-28" name="__codelineno-36-28"></a>       [optional body]
+<a id="__codelineno-36-29" name="__codelineno-36-29"></a>
+<a id="__codelineno-36-30" name="__codelineno-36-30"></a>       [optional footer(s)]
+<a id="__codelineno-36-31" name="__codelineno-36-31"></a>
+<a id="__codelineno-36-32" name="__codelineno-36-32"></a><span class="k">6.</span> Ask for confirmation before committing
+<a id="__codelineno-36-33" name="__codelineno-36-33"></a><span class="k">7.</span> Create the commit
+<a id="__codelineno-36-34" name="__codelineno-36-34"></a>
+<a id="__codelineno-36-35" name="__codelineno-36-35"></a><span class="gu">## Rules</span>
+<a id="__codelineno-36-36" name="__codelineno-36-36"></a>
+<a id="__codelineno-36-37" name="__codelineno-36-37"></a><span class="k">-</span><span class="w"> </span>Subject line &lt; 72 characters
+<a id="__codelineno-36-38" name="__codelineno-36-38"></a><span class="k">-</span><span class="w"> </span>Use imperative mood ("Add feature" not "Added feature")
+<a id="__codelineno-36-39" name="__codelineno-36-39"></a><span class="k">-</span><span class="w"> </span>Body explains what and why, not how
+<a id="__codelineno-36-40" name="__codelineno-36-40"></a><span class="k">-</span><span class="w"> </span>Reference issues if applicable
+</code></pre></div></td></tr></table></div>
+<h3 id="example-6-project-specific-deployment">Example 6: Project-Specific Deployment</h3>
+<p><strong>File</strong>: <code>.qmt/commands/deploy.md</code></p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-37-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-37-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-37-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-37-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-37-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-37-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-37-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-37-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-37-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-37-10">10</a></span>
+<span class="normal"><a href="#__codelineno-37-11">11</a></span>
+<span class="normal"><a href="#__codelineno-37-12">12</a></span>
+<span class="normal"><a href="#__codelineno-37-13">13</a></span>
+<span class="normal"><a href="#__codelineno-37-14">14</a></span>
+<span class="normal"><a href="#__codelineno-37-15">15</a></span>
+<span class="normal"><a href="#__codelineno-37-16">16</a></span>
+<span class="normal"><a href="#__codelineno-37-17">17</a></span>
+<span class="normal"><a href="#__codelineno-37-18">18</a></span>
+<span class="normal"><a href="#__codelineno-37-19">19</a></span>
+<span class="normal"><a href="#__codelineno-37-20">20</a></span>
+<span class="normal"><a href="#__codelineno-37-21">21</a></span>
+<span class="normal"><a href="#__codelineno-37-22">22</a></span>
+<span class="normal"><a href="#__codelineno-37-23">23</a></span>
+<span class="normal"><a href="#__codelineno-37-24">24</a></span>
+<span class="normal"><a href="#__codelineno-37-25">25</a></span>
+<span class="normal"><a href="#__codelineno-37-26">26</a></span>
+<span class="normal"><a href="#__codelineno-37-27">27</a></span>
+<span class="normal"><a href="#__codelineno-37-28">28</a></span>
+<span class="normal"><a href="#__codelineno-37-29">29</a></span>
+<span class="normal"><a href="#__codelineno-37-30">30</a></span>
+<span class="normal"><a href="#__codelineno-37-31">31</a></span>
+<span class="normal"><a href="#__codelineno-37-32">32</a></span>
+<span class="normal"><a href="#__codelineno-37-33">33</a></span>
+<span class="normal"><a href="#__codelineno-37-34">34</a></span>
+<span class="normal"><a href="#__codelineno-37-35">35</a></span>
+<span class="normal"><a href="#__codelineno-37-36">36</a></span>
+<span class="normal"><a href="#__codelineno-37-37">37</a></span>
+<span class="normal"><a href="#__codelineno-37-38">38</a></span>
+<span class="normal"><a href="#__codelineno-37-39">39</a></span>
+<span class="normal"><a href="#__codelineno-37-40">40</a></span>
+<span class="normal"><a href="#__codelineno-37-41">41</a></span>
+<span class="normal"><a href="#__codelineno-37-42">42</a></span>
+<span class="normal"><a href="#__codelineno-37-43">43</a></span>
+<span class="normal"><a href="#__codelineno-37-44">44</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-37-1" name="__codelineno-37-1"></a>---
+<a id="__codelineno-37-2" name="__codelineno-37-2"></a>description: "Deploy to specified environment"
+<a id="__codelineno-37-3" name="__codelineno-37-3"></a><span class="gu">argument-hint: "[staging|production]"</span>
+<a id="__codelineno-37-4" name="__codelineno-37-4"></a><span class="gu">---</span>
+<a id="__codelineno-37-5" name="__codelineno-37-5"></a>
+<a id="__codelineno-37-6" name="__codelineno-37-6"></a>Deploy to ${1:-staging} environment.
+<a id="__codelineno-37-7" name="__codelineno-37-7"></a>
+<a id="__codelineno-37-8" name="__codelineno-37-8"></a><span class="gu">## Pre-deployment Checks</span>
+<a id="__codelineno-37-9" name="__codelineno-37-9"></a>
+<a id="__codelineno-37-10" name="__codelineno-37-10"></a><span class="k">1.</span> Run tests: <span class="sb">`cargo test`</span>
+<a id="__codelineno-37-11" name="__codelineno-37-11"></a><span class="k">2.</span> Check formatting: <span class="sb">`cargo fmt --check`</span>
+<a id="__codelineno-37-12" name="__codelineno-37-12"></a><span class="k">3.</span> Run linter: <span class="sb">`cargo clippy`</span>
+<a id="__codelineno-37-13" name="__codelineno-37-13"></a><span class="k">4.</span> Build release: <span class="sb">`cargo build --release`</span>
+<a id="__codelineno-37-14" name="__codelineno-37-14"></a>
+<a id="__codelineno-37-15" name="__codelineno-37-15"></a><span class="gu">## Deployment Steps</span>
+<a id="__codelineno-37-16" name="__codelineno-37-16"></a>
+<a id="__codelineno-37-17" name="__codelineno-37-17"></a><span class="gu">### Staging</span>
+<a id="__codelineno-37-18" name="__codelineno-37-18"></a>
+<a id="__codelineno-37-19" name="__codelineno-37-19"></a><span class="k">1.</span> Build Docker image
+<a id="__codelineno-37-20" name="__codelineno-37-20"></a><span class="k">2.</span> Push to registry
+<a id="__codelineno-37-21" name="__codelineno-37-21"></a><span class="k">3.</span> Update staging deployment
+<a id="__codelineno-37-22" name="__codelineno-37-22"></a><span class="k">4.</span> Run smoke tests
+<a id="__codelineno-37-23" name="__codelineno-37-23"></a><span class="k">5.</span> Notify team
+<a id="__codelineno-37-24" name="__codelineno-37-24"></a>
+<a id="__codelineno-37-25" name="__codelineno-37-25"></a><span class="gu">### Production</span>
+<a id="__codelineno-37-26" name="__codelineno-37-26"></a>
+<a id="__codelineno-37-27" name="__codelineno-37-27"></a><span class="k">1.</span> <span class="gs">**Confirm**</span>: Ask for explicit confirmation
+<a id="__codelineno-37-28" name="__codelineno-37-28"></a><span class="k">2.</span> Create release tag
+<a id="__codelineno-37-29" name="__codelineno-37-29"></a><span class="k">3.</span> Build Docker image
+<a id="__codelineno-37-30" name="__codelineno-37-30"></a><span class="k">4.</span> Push to registry
+<a id="__codelineno-37-31" name="__codelineno-37-31"></a><span class="k">5.</span> Update production deployment
+<a id="__codelineno-37-32" name="__codelineno-37-32"></a><span class="k">6.</span> Run smoke tests
+<a id="__codelineno-37-33" name="__codelineno-37-33"></a><span class="k">7.</span> Monitor for errors
+<a id="__codelineno-37-34" name="__codelineno-37-34"></a><span class="k">8.</span> Notify team
+<a id="__codelineno-37-35" name="__codelineno-37-35"></a>
+<a id="__codelineno-37-36" name="__codelineno-37-36"></a><span class="gu">## Rollback Plan</span>
+<a id="__codelineno-37-37" name="__codelineno-37-37"></a>
+<a id="__codelineno-37-38" name="__codelineno-37-38"></a>If issues detected:
+<a id="__codelineno-37-39" name="__codelineno-37-39"></a><span class="k">1.</span> Identify problem
+<a id="__codelineno-37-40" name="__codelineno-37-40"></a><span class="k">2.</span> Rollback to previous version
+<a id="__codelineno-37-41" name="__codelineno-37-41"></a><span class="k">3.</span> Notify team
+<a id="__codelineno-37-42" name="__codelineno-37-42"></a><span class="k">4.</span> Create incident report
+<a id="__codelineno-37-43" name="__codelineno-37-43"></a>
+<a id="__codelineno-37-44" name="__codelineno-37-44"></a>Proceed with deployment to ${1:-staging}? Ask for confirmation.
 </code></pre></div></td></tr></table></div>
 <h2 id="best-practices">Best Practices</h2>
 <h3 id="command-design">Command Design</h3>
@@ -2997,7 +3111,9 @@ command prompts are never rewritten.</p>
 1. Check file exists in <code>~/.qmt/commands/</code> or <code>.qmt/commands/</code>
 2. Verify filename ends with <code>.md</code>
 3. Check filename has no spaces
-4. Restart application to reload commands</p>
+4. If the file lives in a <code>.gitignore</code>d <code>.qmt/commands</code>, a configured path, or a
+   global folder that did not exist when the agent started, reopen the session
+   (or restart the agent for the global folder)</p>
 <h3 id="tab-completion-not-working">Tab Completion Not Working</h3>
 <p><strong>Symptoms:</strong> Tab doesn't complete commands</p>
 <p><strong>Solutions:</strong>
@@ -3158,7 +3274,7 @@ command prompts are never rewritten.</p>
       <script id="__config" type="application/json">{"annotate":null,"base":"../..","features":["navigation.tabs","navigation.sections","navigation.tracking","toc.integrate","navigation.top","search.suggest","search.highlight","content.tabs.link","content.code.annotation","content.code.copy"],"redirect":null,"search":"../../assets/javascripts/workers/search.719e0d91.min.js","tags":null,"translations":{"clipboard.copied":"Copied to clipboard","clipboard.copy":"Copy to clipboard","clipboard.error":"Could not copy to clipboard","search.result.more.one":"1 more on this page","search.result.more.other":"# more on this page","search.result.none":"No matching documents","search.result.one":"1 matching document","search.result.other":"# matching documents","search.result.placeholder":"Type to start searching","search.result.term.missing":"Missing","select.version":"Select version"},"version":{"default":"stable","provider":"mike"}}</script>
     
     
-      <script src="../../assets/javascripts/bundle.9e76c64c.min.js"></script>
+      <script src="../../assets/javascripts/bundle.ef37db6d.min.js"></script>
       
       
     
