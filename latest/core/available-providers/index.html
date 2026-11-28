@@ -2956,6 +2956,26 @@
 <td>KV cache value quantization: <code>"f16"</code>, <code>"q8_0"</code>, <code>"q4_0"</code></td>
 </tr>
 <tr>
+<td><code>swa_full</code></td>
+<td>bool</td>
+<td>Keep a full-size KV cache for sliding-window attention layers (default: <code>false</code>, as in <code>llama-cli</code>). <code>true</code> allows reusing older cached prompt prefixes but can run the GPU out of memory on long contexts (<code>Decode Error -3</code>)</td>
+</tr>
+<tr>
+<td><code>fit</code></td>
+<td>bool</td>
+<td>Fit the model to free device memory at load time, like <code>llama-cli --fit</code> (default: <code>false</code>). Chooses <code>n_gpu_layers</code>, the tensor split and CPU-resident experts, and, when <code>n_ctx</code> is unset, the largest context that fits. Skipped when <code>n_gpu_layers</code>, a device placement option or <code>speculative</code> is set</td>
+</tr>
+<tr>
+<td><code>fit_min_ctx</code></td>
+<td>integer</td>
+<td>Smallest context <code>fit</code> may choose when <code>n_ctx</code> is unset (default: <code>4096</code>)</td>
+</tr>
+<tr>
+<td><code>fit_margin_mib</code></td>
+<td>integer</td>
+<td>Memory in MiB <code>fit</code> leaves free on each device (default: <code>1024</code>). <code>fit</code> sizes the context of text requests; a request with images creates a larger one (<code>n_ubatch</code> = <code>n_batch</code>), so raise the margin when sending large images</td>
+</tr>
+<tr>
 <td><code>max_tokens</code></td>
 <td>integer</td>
 <td>Maximum tokens to generate (default: 256). A per-request <code>max_tokens</code> override takes precedence</td>
