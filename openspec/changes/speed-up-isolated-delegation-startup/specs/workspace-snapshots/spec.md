@@ -20,11 +20,15 @@ The snapshot store of a managed workspace checkout SHALL read objects from its s
 - **THEN** the undo restores the baseline contents, because the workspace's retained baseline keeps them in the source repository
 
 ### Requirement: Managed workspace snapshots store all other content themselves
-Every object a snapshot of a managed workspace records that is not reachable from the workspace's retained baseline SHALL be written to the snapshot store itself, including content the workspace has staged or committed in the source repository.
+Every object a snapshot of a managed workspace records that is not reachable from the workspace's retained baseline SHALL be written to the snapshot store itself, including content the workspace has staged or committed in the source repository. A snapshot SHALL NOT reuse a previously recorded object id unless that object is in the snapshot store itself or reachable from the retained baseline.
 
 #### Scenario: Content edited in the workspace is stored in the snapshot store
 - **WHEN** a delegate edits a file and a snapshot is taken
 - **THEN** the edited contents are written to the snapshot store itself
+
+#### Scenario: Cached file whose object only the source holds is stored again
+- **WHEN** a file's stat data matches the snapshot store's cache, its object is no longer in the snapshot store, and only the source holds it, outside the retained baseline
+- **THEN** the snapshot writes that file's blob to the snapshot store itself
 
 #### Scenario: Content committed in the workspace survives source pruning
 - **WHEN** a delegate commits a new file in its workspace, a snapshot is taken, and the workspace branch is later deleted and the source's unreachable objects are pruned

@@ -3,7 +3,7 @@
 ## ADDED Requirements
 
 ### Requirement: Baseline capture reads only changed content
-Baseline capture SHALL NOT read the content of a tracked file whose stat data matches its entry in the source's real index, as Git compares stat data. It SHALL take that entry's content identity instead. It SHALL read modified tracked files and non-ignored untracked files.
+Baseline capture SHALL NOT read the content of a tracked file whose stat data matches its entry in the source's real index, as Git compares stat data. It SHALL take that entry's content identity instead. It SHALL read modified tracked files and non-ignored untracked files. It SHALL find non-ignored untracked files regardless of the repository's `status.showUntrackedFiles` setting.
 
 #### Scenario: Clean checkout reads no file content
 - **WHEN** an isolated delegate is requested from a checkout whose working files all match the index and HEAD, and the index was written in a later timestamp tick than any of them was modified
@@ -20,8 +20,13 @@ Baseline capture SHALL NOT read the content of a tracked file whose stat data ma
 - **THEN** the baseline holds the edited working contents, not the staged contents
 - **AND** the real index is byte-for-byte unchanged
 
+#### Scenario: Untracked files are captured when status hides them
+- **WHEN** the repository sets `status.showUntrackedFiles=no` and a new non-ignored file exists
+- **THEN** the capture reads that file
+- **AND** the baseline includes it
+
 ### Requirement: Index entries that can hide working content are read
-Baseline capture SHALL read a tracked file whose real-index entry is racily clean (modified no earlier than the index was written) or carries an assume-unchanged, skip-worktree or fsmonitor-valid flag, even when its stat data matches the entry.
+Baseline capture SHALL read a tracked file whose real-index entry is racily clean (modified no earlier than the index was written) or carries an assume-unchanged, skip-worktree, fsmonitor-valid or intent-to-add flag, even when its stat data matches the entry. It SHALL also read a tracked file whose recorded kind (regular file or symbolic link) differs from the file on disk.
 
 #### Scenario: Racily clean entry is read
 - **WHEN** a tracked file's index entry is racily clean and the file was rewritten with the same size and modification time
@@ -32,6 +37,16 @@ Baseline capture SHALL read a tracked file whose real-index entry is racily clea
 - **WHEN** a tracked file marked assume-unchanged in the real index was edited before an isolated delegate is requested
 - **THEN** the capture reads that file
 - **AND** the baseline holds its edited contents
+
+#### Scenario: Intent-to-add file is read
+- **WHEN** a file was added with intent-to-add and has content before an isolated delegate is requested
+- **THEN** the capture reads that file
+- **AND** the baseline holds its contents
+
+#### Scenario: File replaced by a symlink is read
+- **WHEN** a tracked regular file was replaced by a symbolic link
+- **THEN** the capture reads the link
+- **AND** the baseline records a symbolic link with its target
 
 ### Requirement: Baselines hold raw working contents
 The baseline SHALL hold the raw working bytes and on-disk modes of the checkout, and SHALL equal one built by reading every candidate file. Baseline capture SHALL read a tracked file whose effective attributes or configuration convert its content between the index and the working tree.
@@ -50,7 +65,11 @@ Baseline capture SHALL NOT write an object to the source repository that the rep
 
 #### Scenario: Repeated delegation from the same dirty state
 - **WHEN** two isolated delegates are requested one after the other from a checkout whose working state did not change in between
-- **THEN** the second capture writes no new object
+- **THEN** the second capture writes no new blob or tree
+
+#### Scenario: Repeated delegation with a large dirty file writes nothing
+- **WHEN** two isolated delegates are requested one after the other from a checkout with a dirty file of at least the large-file threshold, and nothing changed in between
+- **THEN** the second capture writes no new blob or tree
 
 #### Scenario: New untracked file is written once
 - **WHEN** an isolated delegate is requested after a new non-ignored file was created
@@ -58,15 +77,15 @@ Baseline capture SHALL NOT write an object to the source repository that the rep
 - **AND** the baseline includes the file
 
 ### Requirement: Capture validation reads file contents once per attempt
-Each capture attempt SHALL read the content of each file at most once, except that a captured file modified within the racy window of the attempt's start SHALL be read once more to verify the captured content. A verified file whose content no longer matches SHALL be treated as a change detected during capture, which is retried or fails as already required.
+Each capture attempt SHALL read the content of each file at most once, except that a captured file modified within the racy window of the attempt's start SHALL be read once more to verify the captured content, and a file of at least the large-file threshold that the repository does not yet hold SHALL be read once more to write it. A verified file whose content no longer matches SHALL be treated as a change detected during capture, which is retried or fails as already required.
 
 #### Scenario: Same-size rewrite after the read is detected
-- **WHEN** a captured file is rewritten with the same size after the capture read it, and its stat data after the rewrite equals its stat data before the capture
+- **WHEN** a captured file modified within the racy window is rewritten with the same size after the capture read it, and its stat data after the rewrite equals its stat data before the capture
 - **THEN** the attempt is discarded and a new validated capture is made, or the delegation fails before the child launches
 
 #### Scenario: Quiet checkout needs one attempt
 - **WHEN** nothing changes the checkout while the capture runs
-- **THEN** the baseline is produced by one attempt that read each changed file once, apart from files verified because they were modified within the racy window
+- **THEN** the baseline is produced by one attempt that read each changed file once, apart from files verified because they were modified within the racy window and large files written for the first time
 
 ### Requirement: Capture validation compares stat fingerprints
 Validation SHALL compare HEAD, the index entries, and the size, modification time and mode of every captured path and every non-ignored untracked path, plus change time and inode where the platform provides them and the repository's stat settings use them, taken before and after the capture. Any difference SHALL be treated as a change detected during capture, which is retried or fails as already required.

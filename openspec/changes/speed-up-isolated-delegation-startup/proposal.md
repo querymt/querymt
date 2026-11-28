@@ -23,13 +23,14 @@ The code explains most of it. `capture_working_state_validated` runs three full 
   Each span records the counts that explain its duration, as `snapshot.git.track` already does.
 - **Baseline capture reads only what changed.** The capture compares each tracked file's stat data with its real-index entry itself, instead of running a status pass. A file whose stat data matches, and that is not racily clean, reuses the entry's object id and is not read. These are always read:
   - modified tracked files;
-  - entries flagged assume-unchanged, skip-worktree or fsmonitor-valid;
+  - entries flagged assume-unchanged, skip-worktree, fsmonitor-valid or intent-to-add;
+  - entries whose kind changed (regular file vs symbolic link);
   - files whose attributes or config convert content (line endings, `ident`, working-tree encoding);
-  - non-ignored untracked files.
+  - non-ignored untracked files, regardless of `status.showUntrackedFiles`.
 
-  A blob is hashed before it is written, and an object that already exists is not written again. The baseline still holds raw working bytes and on-disk modes, as today.
-- **Capture validation stops re-capturing.** The before/after source manifest becomes HEAD, the index entries and the stat fingerprint of every captured and untracked path. Each attempt makes one capture instead of three. Files modified within the racy window are re-hashed once to catch same-size rewrites in the same timestamp tick. Validation still detects concurrent changes to HEAD, the index, or any captured or untracked path, and still retries or fails as today.
-- **The first snapshot of a managed workspace does not rewrite its baseline.** The snapshot store of a managed checkout can read objects from its source repository. A snapshot skips writing an object only when it is reachable from the workspace's retained baseline. Everything else, including content the delegate stages or commits in its linked worktree, is written to the store itself. Files of 16 MiB or more are still copied into the store so they restore by streaming.
+  A blob is hashed before it is written, and an object that already exists is not written again. Large files (16 MiB or more) are hashed by streaming first and only written when the repository does not hold them. The baseline still holds raw working bytes and on-disk modes, as today.
+- **Capture validation stops re-capturing.** The before/after source manifest becomes HEAD, the index entries and the stat fingerprint of every captured and untracked path. Each attempt makes one capture instead of three. Files modified within the racy window are re-hashed once to catch same-size rewrites in the same timestamp tick. Large files the repository does not yet hold are read a second time to write them. Validation still detects concurrent changes to HEAD, the index, or any captured or untracked path, and still retries or fails as today.
+- **The first snapshot of a managed workspace does not rewrite its baseline.** The snapshot store of a managed checkout can read objects from its source repository. A snapshot skips writing an object only when it is reachable from the workspace's retained baseline. Everything else, including content the delegate stages or commits in its linked worktree, is written to the store itself. Files of 16 MiB or more are still copied into the store so they restore by streaming. A snapshot never reuses a cached object id unless the object is in the store itself or in the baseline. The store is linked when a managed session is created, loaded or resumed.
 - **Worktree locks and gates stop blocking the async runtime.** Lock-file directory creation and opening, gate canonicalisation and repository resolution move off the Tokio worker threads.
 
 No configuration keys, tool arguments, ACP shapes or stored formats change. Baselines, results and undo behave as before.
@@ -51,7 +52,7 @@ None.
 
 ### Modified Capabilities
 
-- `isolated-delegation`: adds requirements that baseline capture reads only changed content (but always reads racy, flagged and converted entries), keeps raw working contents, writes no object the repository holds, and validates with stat fingerprints and a racy re-hash instead of re-capturing; and that each startup phase of an isolated delegation is traceable and records its counts.
+- `isolated-delegation`: adds requirements that baseline capture reads only changed content (but always reads racy, flagged, kind-changed and converted entries), keeps raw working contents, writes no object the repository holds, and validates with stat fingerprints and a racy re-hash instead of re-capturing; and that each startup phase of an isolated delegation is traceable and records its counts.
 - `workspace-snapshots`: adds requirements that snapshots of a managed workspace reuse the baseline content its source repository retains, store all other content (including committed workspace content and large files) themselves, and that other snapshot stores stay self-contained.
 
 ## Impact
@@ -60,7 +61,10 @@ None.
   - `querymt-agent-services`:
     - `worktree/capture.rs`, `worktree/repo_ops.rs`, `worktree/service.rs`, `worktree/allocate.rs`, `worktree/lock.rs`, `worktree/gate.rs`;
     - `snapshot/snapshot_backend.rs` and `snapshot/git` (linked object store, `ObjectSink`).
-  - `querymt-agent-runtime`: `delegation/core.rs` spans, and the `link_object_source` call where managed session runtimes are created (`agent/session_materializer.rs` and the isolated creation paths).
+  - `querymt-agent-runtime`:
+    - `delegation/core.rs`: spans, and the parent gate construction moved off the async workers;
+    - the `link_object_source` call where managed session runtimes are created (`agent/session_materializer.rs` load and resume paths, and the isolated creation paths).
+  - `.config/nextest.toml`: a serial test group for the gap test (test configuration only).
   - `querymt-agent`: facade tests only.
 - **Features:** no feature-gated code changes. The `remote` admission path in `execute_delegation_unboxed` only gets a span.
 - **Public Rust API (additive, non-breaking):**
