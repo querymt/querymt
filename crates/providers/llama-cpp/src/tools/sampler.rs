@@ -515,6 +515,20 @@ pub(crate) fn build_standard_sampler(model: &LlamaModel, params: &SamplingParams
     LlamaSampler::chain_simple(samplers)
 }
 
+/// The end-of-sequence token id handed to llguidance.
+///
+/// A model without an EOS token reports `LLAMA_TOKEN_NULL` (-1), which must
+/// not be cast to `u32` (it would become `u32::MAX`, outside the vocabulary).
+/// Fall back to the first end-of-generation token, if the model has one.
+#[cfg(feature = "llguidance")]
+fn resolve_eos(eos: i32, n_vocab: i32, mut eog: impl Iterator<Item = i32>) -> Option<u32> {
+    if (0..n_vocab).contains(&eos) {
+        Some(eos as u32)
+    } else {
+        eog.next().map(|id| id as u32)
+    }
+}
+
 #[cfg(feature = "llguidance")]
 pub(crate) fn build_structured_sampler(
     model: &Arc<LlamaModel>,
@@ -527,7 +541,16 @@ pub(crate) fn build_structured_sampler(
 
     let n_vocab = model.n_vocab() as u32;
     let vocab = model.vocab();
-    let eos = vocab.eos().0 as u32;
+    let eos = resolve_eos(
+        vocab.eos().0,
+        model.n_vocab(),
+        (0..model.n_vocab()).filter(|id| vocab.is_eog(llama_cpp_2::token::LlamaToken(*id))),
+    )
+    .ok_or_else(|| {
+        LLMError::ProviderError(
+            "Structured output needs an end-of-sequence token, but the model defines none".into(),
+        )
+    })?;
     let mut eog_tokens = vec![eos];
     let mut words = Vec::with_capacity(n_vocab as usize);
     for id in 0..n_vocab as i32 {
@@ -582,6 +605,28 @@ pub(crate) fn build_fallback_sampler(seed: u32) -> LlamaSampler {
         LlamaSampler::temp(0.8),
         LlamaSampler::dist(seed),
     ])
+}
+
+#[cfg(all(test, feature = "llguidance"))]
+mod eos_tests {
+    use super::resolve_eos;
+
+    #[test]
+    fn defined_eos_is_used() {
+        assert_eq!(resolve_eos(7, 100, [3, 7].into_iter()), Some(7));
+    }
+
+    #[test]
+    fn missing_eos_falls_back_to_first_end_of_generation_token() {
+        // LLAMA_TOKEN_NULL must not become u32::MAX.
+        assert_eq!(resolve_eos(-1, 100, [3, 7].into_iter()), Some(3));
+        assert_eq!(resolve_eos(100, 100, [5].into_iter()), Some(5));
+    }
+
+    #[test]
+    fn no_eos_and_no_end_of_generation_token_is_none() {
+        assert_eq!(resolve_eos(-1, 100, std::iter::empty()), None);
+    }
 }
 
 #[cfg(all(test, feature = "common"))]

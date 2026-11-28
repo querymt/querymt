@@ -2,10 +2,7 @@ use crate::backend::llama_backend;
 use crate::chat_format::ParsedDelta;
 use crate::common_chat::ChatTemplateResult;
 use crate::config::LlamaCppConfig;
-use crate::context::{
-    DEFAULT_N_BATCH_CAP, apply_context_params, estimate_context_memory, resolve_n_batch,
-    resolve_n_ubatch,
-};
+use crate::context::{ContextSettings, DEFAULT_N_BATCH_CAP, estimate_context_memory};
 use crate::lora::{Models, new_target_context};
 use crate::messages;
 use crate::multimodal::MediaInputs;
@@ -186,8 +183,7 @@ pub(crate) fn force_text(
             index += 1;
             sampler.accept_token(*token);
         }
-        ctx.decode(batch)
-            .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+        ctx.decode(batch).map_err(crate::context::decode_error)?;
     }
     log::debug!(
         "thinking_budget spent; forced end of reasoning ({} tokens)",
@@ -272,14 +268,15 @@ pub(crate) fn generate(
         ));
     }
 
+    let settings = ContextSettings::from_config(cfg);
     let mut ctx_params = LlamaContextParams::default();
     let effective_n_ctx;
     let effective_n_batch;
     if let Some(n_ctx) = cfg.n_ctx {
         let n_ctx = NonZeroU32::new(n_ctx)
             .ok_or_else(|| LLMError::InvalidRequest("n_ctx must be greater than zero".into()))?;
-        let n_batch = resolve_n_batch(cfg, n_ctx.get());
-        let n_ubatch = resolve_n_ubatch(cfg, n_batch, mm_ctx.is_some());
+        let n_batch = settings.n_batch(n_ctx.get());
+        let n_ubatch = settings.n_ubatch(n_batch, mm_ctx.is_some());
         ctx_params = ctx_params.with_n_ctx(Some(n_ctx));
         ctx_params = ctx_params.with_n_batch(n_batch);
         ctx_params = ctx_params.with_n_ubatch(n_ubatch);
@@ -295,7 +292,7 @@ pub(crate) fn generate(
     if let Some(n_threads_batch) = cfg.n_threads_batch {
         ctx_params = ctx_params.with_n_threads_batch(n_threads_batch);
     }
-    ctx_params = apply_context_params(cfg, ctx_params)?;
+    ctx_params = settings.apply(ctx_params)?;
 
     let sampling_params = SamplingParams::from_config(cfg, temperature);
     let backend_sampling = cfg.backend_sampling.unwrap_or(false);
@@ -319,7 +316,7 @@ pub(crate) fn generate(
     )?;
 
     let n_ctx_total = ctx.n_ctx() as i32;
-    let n_batch = resolve_n_batch(cfg, n_ctx_total as u32);
+    let n_batch = settings.n_batch(n_ctx_total as u32);
 
     // UNIFIED TOKENIZATION AND EVALUATION
     let (n_past, input_tokens) = if let Some(mm_ctx) = mm_ctx.filter(|_| !bitmaps.is_empty()) {
@@ -341,7 +338,7 @@ pub(crate) fn generate(
         // Validate that each media chunk fits within n_ubatch.
         // Vision models (Qwen-VL, LLaVA, etc.) use non-causal attention for
         // image decoding, requiring all image tokens in a single ubatch.
-        let n_ubatch = resolve_n_ubatch(cfg, effective_n_batch, true) as usize;
+        let n_ubatch = settings.n_ubatch(effective_n_batch, true) as usize;
         for i in 0..chunks.len() {
             if let Some(chunk) = chunks.get(i)
                 && chunk.chunk_type() != MtmdInputChunkType::Text
@@ -503,7 +500,7 @@ pub(crate) fn generate(
         output_tokens += 1;
 
         ctx.decode(&mut batch)
-            .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+            .map_err(crate::context::decode_error)?;
     }
 
     Ok(GeneratedText {
@@ -602,14 +599,15 @@ pub(crate) fn generate_streaming_with_thinking(
         ));
     }
 
+    let settings = ContextSettings::from_config(cfg);
     let mut ctx_params = LlamaContextParams::default();
     let effective_n_ctx;
     let effective_n_batch;
     if let Some(n_ctx) = cfg.n_ctx {
         let n_ctx = NonZeroU32::new(n_ctx)
             .ok_or_else(|| LLMError::InvalidRequest("n_ctx must be greater than zero".into()))?;
-        let n_batch = resolve_n_batch(cfg, n_ctx.get());
-        let n_ubatch = resolve_n_ubatch(cfg, n_batch, mm_ctx.is_some());
+        let n_batch = settings.n_batch(n_ctx.get());
+        let n_ubatch = settings.n_ubatch(n_batch, mm_ctx.is_some());
         ctx_params = ctx_params.with_n_ctx(Some(n_ctx));
         ctx_params = ctx_params.with_n_batch(n_batch);
         ctx_params = ctx_params.with_n_ubatch(n_ubatch);
@@ -625,7 +623,7 @@ pub(crate) fn generate_streaming_with_thinking(
     if let Some(n_threads_batch) = cfg.n_threads_batch {
         ctx_params = ctx_params.with_n_threads_batch(n_threads_batch);
     }
-    ctx_params = apply_context_params(cfg, ctx_params)?;
+    ctx_params = settings.apply(ctx_params)?;
 
     let mut ctx =
         new_target_context(models, &backend, ctx_params, None, &cfg.lora).map_err(|err| {
@@ -646,7 +644,7 @@ pub(crate) fn generate_streaming_with_thinking(
         })?;
 
     let n_ctx_total = ctx.n_ctx() as i32;
-    let n_batch = resolve_n_batch(cfg, n_ctx_total as u32) as usize;
+    let n_batch = settings.n_batch(n_ctx_total as u32) as usize;
     let mut batch = LlamaBatch::new(n_batch, 1);
 
     // TOKENIZATION AND EVALUATION — dual path: multimodal vs text-only
@@ -673,7 +671,7 @@ pub(crate) fn generate_streaming_with_thinking(
         // Validate that each media chunk fits within n_ubatch.
         // Vision models (Qwen-VL, LLaVA, etc.) use non-causal attention for
         // image decoding, requiring all image tokens in a single ubatch.
-        let n_ubatch = resolve_n_ubatch(cfg, effective_n_batch, true) as usize;
+        let n_ubatch = settings.n_ubatch(effective_n_batch, true) as usize;
         for i in 0..chunks.len() {
             if let Some(chunk) = chunks.get(i)
                 && chunk.chunk_type() != MtmdInputChunkType::Text
@@ -853,7 +851,7 @@ pub(crate) fn generate_streaming_with_thinking(
         reasoning.observe(&chunk);
 
         ctx.decode(&mut batch)
-            .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+            .map_err(crate::context::decode_error)?;
 
         if let Some(forced) = thinking_budget.as_mut().and_then(|b| b.observe(&chunk))
             && let Some(added) = force_text(

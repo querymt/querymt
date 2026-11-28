@@ -264,7 +264,7 @@ pub(crate) fn generate_streaming_with_tools(
         state
             .ctx
             .decode(&mut batch)
-            .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+            .map_err(crate::context::decode_error)?;
 
         if let Some(forced) = thinking_budget.as_mut().and_then(|b| b.observe(&chunk))
             && let Some(added) = crate::generation::force_text(

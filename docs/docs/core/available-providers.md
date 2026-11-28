@@ -456,6 +456,10 @@ Wraps [llama.cpp](https://github.com/ggerganov/llama.cpp). Supports GGUF models,
 | `flash_attention` | string | `"auto"` \| `"enabled"` \| `"disabled"` |
 | `kv_cache_type_k` | string | KV cache key quantization: `"f16"`, `"q8_0"`, `"q4_0"` |
 | `kv_cache_type_v` | string | KV cache value quantization: `"f16"`, `"q8_0"`, `"q4_0"` |
+| `swa_full` | bool | Keep a full-size KV cache for sliding-window attention layers (default: `false`, as in `llama-cli`). `true` allows reusing older cached prompt prefixes but can run the GPU out of memory on long contexts (`Decode Error -3`) |
+| `fit` | bool | Fit the model to free device memory at load time, like `llama-cli --fit` (default: `false`). Chooses `n_gpu_layers`, the tensor split and CPU-resident experts, and, when `n_ctx` is unset, the largest context that fits. Skipped when `n_gpu_layers`, a device placement option or `speculative` is set |
+| `fit_min_ctx` | integer | Smallest context `fit` may choose when `n_ctx` is unset (default: `4096`) |
+| `fit_margin_mib` | integer | Memory in MiB `fit` leaves free on each device (default: `1024`). `fit` sizes the context of text requests; a request with images creates a larger one (`n_ubatch` = `n_batch`), so raise the margin when sending large images |
 | `max_tokens` | integer | Maximum tokens to generate (default: 256). A per-request `max_tokens` override takes precedence |
 | `temperature` | float | Sampling temperature. `0` = greedy |
 | `enable_thinking` | bool | Render the chat template with reasoning enabled (default: `true`) |

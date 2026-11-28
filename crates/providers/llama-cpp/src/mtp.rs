@@ -1,6 +1,6 @@
 use crate::backend::llama_backend;
 use crate::config::LlamaCppConfig;
-use crate::context::{apply_context_params, resolve_n_batch, resolve_n_ubatch};
+use crate::context::ContextSettings;
 use crate::lora::{Models, new_target_context};
 use crate::response::GenerationTermination;
 use crate::tools::sampler::{ConstrainedSampler, SamplingParams, build_standard_sampler};
@@ -118,8 +118,11 @@ pub(crate) fn run_mtp(
     }
     let n_ctx = NonZeroU32::new(n_ctx_raw)
         .ok_or_else(|| LLMError::InvalidRequest("n_ctx must be greater than zero".into()))?;
-    let n_batch = resolve_n_batch(cfg, n_ctx.get()).max(spec_params.n_max as u32 + 1);
-    let n_ubatch = resolve_n_ubatch(cfg, n_batch, false);
+    let settings = ContextSettings::from_config(cfg);
+    let n_batch = settings
+        .n_batch(n_ctx.get())
+        .max(spec_params.n_max as u32 + 1);
+    let n_ubatch = settings.n_ubatch(n_batch, false);
 
     let mut target_params = LlamaContextParams::default()
         .with_n_ctx(Some(n_ctx))
@@ -132,7 +135,7 @@ pub(crate) fn run_mtp(
     if let Some(n) = cfg.n_threads_batch {
         target_params = target_params.with_n_threads_batch(n);
     }
-    target_params = apply_context_params(cfg, target_params)?;
+    target_params = settings.apply(target_params)?;
 
     // The draft context intentionally does not inherit target KV quantization,
     // flash-attention, or recurrent snapshots.
@@ -141,6 +144,7 @@ pub(crate) fn run_mtp(
         .with_n_batch(n_batch)
         .with_n_ubatch(n_ubatch)
         .with_n_rs_seq(0)
+        .with_swa_full(false)
         .with_context_type(LlamaContextType::Mtp)
         .with_no_perf(false);
     if let Some(n) = cfg.n_threads {
