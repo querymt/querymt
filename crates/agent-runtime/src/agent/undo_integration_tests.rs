@@ -2237,6 +2237,53 @@ async fn redo_to_a_pruned_snapshot_keeps_its_frame() -> Result<()> {
     Ok(())
 }
 
+// ==================== snapshot store of an unmanaged checkout ====================
+
+#[tokio::test]
+async fn unmanaged_checkout_keeps_a_self_contained_store() -> Result<()> {
+    use crate::send_agent::SendAgent;
+    use crate::test_utils::{MockChatResponse, MockLlmProvider, SharedLlmProvider};
+
+    let mut mock = MockLlmProvider::new();
+    mock.expect_chat_with_tools()
+        .returning(|_, _| Ok(MockChatResponse::text_only("done").into()));
+    mock.expect_chat()
+        .returning(|_| Ok(MockChatResponse::text_only("done").into()));
+    let fixture = UndoTestFixture::with_provider(SharedLlmProvider::new(mock, Vec::new())).await?;
+    // A plain git repository that is not a managed workspace.
+    let init = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(fixture.worktree.path())
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .status()?;
+    assert!(init.success());
+    fixture.write_file("tracked.txt", "content")?;
+
+    let created = SendAgent::new_session(
+        &fixture.handle,
+        crate::acp::protocol::NewSessionRequest::new(fixture.worktree.path().to_path_buf()),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("new_session failed: {e:?}"))?;
+    fixture
+        .prompt_to_completion(&created.session_id.to_string(), "hello")
+        .await?;
+
+    let stores: Vec<_> = std::fs::read_dir(fixture.snapshot_base.path())?
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    assert_eq!(stores.len(), 1, "the turn took a snapshot: {stores:?}");
+    assert!(stores[0].join("HEAD").exists());
+    assert!(
+        !stores[0].join("objects/info/alternates").exists(),
+        "an unmanaged checkout reads no other repository's objects"
+    );
+    assert!(!stores[0].join("qmt-baseline").exists());
+    Ok(())
+}
+
 // ==================== self-contained turn records ====================
 
 /// Binds the mock LLM config to `session`, so a real prompt can run.

@@ -131,4 +131,25 @@ pub trait SnapshotBackend: Send + Sync {
     /// # Returns
     /// Statistics about snapshots removed and remaining
     async fn gc(&self, worktree: &Path, config: &GcConfig) -> SnapshotResult<GcResult>;
+
+    /// Let the snapshot store of `worktree` read the baseline objects of its
+    /// source repository, so a snapshot need not copy them.
+    ///
+    /// `objects_dir` is the source repository's object directory and
+    /// `baseline_commit` the retained baseline commit of the managed workspace.
+    /// Only objects reachable from that commit are trusted. The default does
+    /// nothing: the store stays self-contained.
+    ///
+    /// # Errors
+    /// Fails when the store cannot be opened or written, or `baseline_commit`
+    /// is not an object id. A source with another object format is not an
+    /// error: the store is left unlinked.
+    async fn link_object_source(
+        &self,
+        _worktree: &Path,
+        _objects_dir: &Path,
+        _baseline_commit: &str,
+    ) -> SnapshotResult<()> {
+        Ok(())
+    }
 }

@@ -319,6 +319,35 @@ impl SessionMaterializer {
         self.config.workspace_service()
     }
 
+    /// Let the snapshot store of a managed workspace read the baseline
+    /// objects of its source repository, so the first snapshot does not copy
+    /// them. Skipped when the record has no baseline; unbound sessions never
+    /// call it. Best effort: a store that cannot be linked stays
+    /// self-contained, which only costs disk and time.
+    async fn link_workspace_store(&self, binding: &WorkspaceBinding) {
+        let Some(backend) = self.config.snapshot_backend.as_ref() else {
+            return;
+        };
+        let Some(baseline) = binding.record.baseline.as_ref() else {
+            return;
+        };
+        let objects_dir = binding.record.repository.common_dir.join("objects");
+        if let Err(err) = backend
+            .link_object_source(
+                &binding.effective_cwd,
+                &objects_dir,
+                &baseline.baseline_commit,
+            )
+            .await
+        {
+            tracing::warn!(
+                workspace = %binding.record.id,
+                error = %err,
+                "failed to link the workspace snapshot store to its source objects"
+            );
+        }
+    }
+
     /// Resolve the workspace binding for a NEW session before any session,
     /// MCP, index, hook, or actor startup.
     ///
@@ -775,6 +804,11 @@ impl SessionMaterializer {
                 )
                 .await?;
 
+            // Before the actor can take its first pre-turn snapshot.
+            if let Some(binding) = &workspace {
+                self.link_workspace_store(binding).await;
+            }
+
             // Materialize session actor (heavy: MCP startup, actor spawn)
             let materialization = self
                 .materialize_session_actor(
@@ -1030,6 +1064,11 @@ impl SessionMaterializer {
             )
             .await?;
 
+        // Before the actor can take its first pre-turn snapshot.
+        if let Some(binding) = &workspace {
+            self.link_workspace_store(binding).await;
+        }
+
         // Materialize session actor (heavy: MCP startup, actor spawn)
         let materialization = self
             .materialize_session_actor(
@@ -1128,6 +1167,11 @@ impl SessionMaterializer {
                 &req.mcp_servers,
             )
             .await?;
+
+        // Before the actor can take its first pre-turn snapshot.
+        if let Some(binding) = &workspace {
+            self.link_workspace_store(binding).await;
+        }
 
         // Materialize session actor (heavy: MCP startup, actor spawn)
         let materialization = self
@@ -1591,6 +1635,7 @@ impl SessionMaterializer {
             .complete_fork_isolation(fork_session_id)
             .await
             .map_err(|err| Error::internal_error().data(err.to_string()))?;
+        self.link_workspace_store(binding).await;
 
         // Disclose the fresh working state: files reflect the source's
         // current contents, not the historical filesystem state at the
@@ -2505,6 +2550,8 @@ mod worktree_binding_tests {
         service: Arc<WorkspaceService>,
         repo: tempfile::TempDir,
         storage_root: tempfile::TempDir,
+        /// Where the snapshot stores live, when the fixture has a backend.
+        snapshot_base: tempfile::TempDir,
     }
 
     /// Registry wrapper failing the first N `attach_owner` calls to inject
@@ -2670,19 +2717,25 @@ mod worktree_binding_tests {
     }
 
     async fn worktree_fixture(configure_service: bool) -> WorktreeFixture {
-        worktree_fixture_inner(configure_service, 0).await
+        worktree_fixture_inner(configure_service, 0, false).await
+    }
+
+    /// Fixture whose agent has a git snapshot backend below `snapshot_base`.
+    async fn worktree_fixture_with_snapshots() -> WorktreeFixture {
+        worktree_fixture_inner(true, 0, true).await
     }
 
     /// Fixture whose workspace service fails the first `owner_failures`
     /// owner-binding attempts, injecting a crash/failure after allocation
     /// but before the owner is published.
     async fn worktree_fixture_with_flaky_owner(owner_failures: usize) -> WorktreeFixture {
-        worktree_fixture_inner(true, owner_failures).await
+        worktree_fixture_inner(true, owner_failures, false).await
     }
 
     async fn worktree_fixture_inner(
         configure_service: bool,
         owner_failures: usize,
+        with_snapshots: bool,
     ) -> WorktreeFixture {
         let storage_root = tempfile::TempDir::new().unwrap();
         let storage = Arc::new(
@@ -2731,6 +2784,13 @@ mod worktree_binding_tests {
         if configure_service {
             builder = builder.with_workspace_service(service.clone());
         }
+        let snapshot_base = tempfile::TempDir::new().unwrap();
+        if with_snapshots {
+            builder = builder.with_snapshot_backend(Arc::new(
+                querymt_agent_services::snapshot::GitSnapshotBackend::new()
+                    .with_snapshot_base(snapshot_base.path()),
+            ));
+        }
         let materializer = SessionMaterializer::new(Arc::new(builder.build()));
         WorktreeFixture {
             materializer,
@@ -2738,6 +2798,7 @@ mod worktree_binding_tests {
             service,
             repo,
             storage_root,
+            snapshot_base,
         }
     }
 
@@ -3403,6 +3464,116 @@ mod worktree_binding_tests {
             prepared.runtime.cwd.as_deref(),
             Some(child.effective_cwd.as_path())
         );
+    }
+
+    /// The snapshot store the fixture's backend keeps for `cwd`, found by the
+    /// worktree path it records.
+    fn snapshot_store_of(fx: &WorktreeFixture, cwd: &std::path::Path) -> Option<PathBuf> {
+        std::fs::read_dir(fx.snapshot_base.path())
+            .ok()?
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|store| {
+                std::fs::read_to_string(store.join("WORKTREE_PATH"))
+                    .is_ok_and(|recorded| std::path::Path::new(&recorded) == cwd)
+            })
+    }
+
+    /// Prepare an isolated delegate of an isolated parent, bound through
+    /// `PreallocatedWorkspace::Fresh`, and return it with its workspace record.
+    async fn prepared_delegate(
+        fx: &WorktreeFixture,
+    ) -> (PreparedSession, crate::worktree::WorkspaceRecord) {
+        let parent = fx
+            .materializer
+            .prepare_new_session(
+                NewSessionRequest::new(fx.repo.path().to_path_buf()).meta(isolation_meta()),
+            )
+            .await
+            .unwrap();
+        let parent_record = fx
+            .service
+            .registry()
+            .get_workspace_by_session(&parent.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let child = fx
+            .service
+            .allocate_for_delegation(
+                &parent.session_id,
+                Some(&parent_record),
+                parent.cwd.as_deref().unwrap(),
+                parent.runtime.mutation_gate.get().map(Arc::as_ref),
+                "delegate",
+                Some("batch".into()),
+            )
+            .await
+            .unwrap();
+        let mut meta = serde_json::Map::new();
+        meta.insert("parent_session_id".into(), parent.session_id.clone().into());
+        let prepared = fx
+            .materializer
+            .prepare_new_session_with_workspace(
+                NewSessionRequest::new(child.effective_cwd.clone()).meta(meta),
+                Some(PreallocatedWorkspace::Fresh(child.clone())),
+            )
+            .await
+            .unwrap();
+        (prepared, child.record)
+    }
+
+    fn assert_linked_to_source(store: &std::path::Path, record: &crate::worktree::WorkspaceRecord) {
+        let objects = record.repository.common_dir.join("objects");
+        let alternates = std::fs::read_to_string(store.join("objects/info/alternates"))
+            .expect("the store lists the source objects");
+        assert_eq!(
+            alternates.lines().collect::<Vec<_>>(),
+            [objects.to_string_lossy().into_owned()]
+        );
+        let baseline = record.baseline.as_ref().expect("baseline captured");
+        assert_eq!(
+            std::fs::read_to_string(store.join("qmt-baseline"))
+                .unwrap()
+                .trim(),
+            baseline.baseline_commit
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_delegate_store_links_to_source_objects() {
+        let fx = worktree_fixture_with_snapshots().await;
+        let (prepared, record) = prepared_delegate(&fx).await;
+
+        let store = snapshot_store_of(&fx, prepared.cwd.as_deref().unwrap())
+            .expect("the delegate's snapshot store exists before any snapshot");
+        assert_linked_to_source(&store, &record);
+    }
+
+    #[tokio::test]
+    async fn resumed_delegate_session_links_its_store() {
+        let fx = worktree_fixture_with_snapshots().await;
+        let (prepared, record) = prepared_delegate(&fx).await;
+        let session_id = prepared.session_id.clone();
+        let cwd = prepared.cwd.clone().unwrap();
+        drop(prepared);
+
+        // A store from before linking existed has neither file.
+        let store = snapshot_store_of(&fx, &cwd).expect("store exists");
+        std::fs::remove_file(store.join("objects/info/alternates")).unwrap();
+        std::fs::remove_file(store.join("qmt-baseline")).unwrap();
+
+        let resume = ResumeSessionRequest::new(SessionId::from(session_id), cwd);
+        match fx
+            .materializer
+            .prepare_resume_session(resume, None)
+            .await
+            .unwrap()
+        {
+            PreparedSessionResult::Prepared(_) => {}
+            PreparedSessionResult::AlreadyRegistered(_) => panic!("never registered"),
+        }
+        assert_linked_to_source(&store, &record);
     }
 
     #[tokio::test]
