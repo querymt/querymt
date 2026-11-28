@@ -7,7 +7,7 @@ use std::{rc::Rc, sync::Arc};
 use gpui_kit::component::{Theme, ThemeConfig, ThemeSet, highlighter::HighlightTheme};
 use gpui_kit::{Hsla, Rgba, SharedString};
 
-use super::{Palette, Preset};
+use super::{Palette, Preset, ThemeFonts};
 
 /// The bundled theme files: the vendored kit files (`assets/themes/kit/NOTICE.md`)
 /// and the three converted from Zed (`assets/themes/extra/NOTICE.md`, design D11).
@@ -53,6 +53,8 @@ struct Entry {
     /// The preset the theme's own accent equals (the built-ins' orange).
     own_accent: Option<Preset>,
     syntax: Arc<HighlightTheme>,
+    /// The type the theme file names (`font.*`, `mono_font.*`), if any.
+    fonts: ThemeFonts,
 }
 
 thread_local! {
@@ -146,6 +148,13 @@ impl ThemeId {
     pub fn syntax(self) -> Arc<HighlightTheme> {
         with(|e| e[self.0].syntax.clone())
     }
+
+    /// The families and sizes the theme file names; empty for the built-ins
+    /// and for files that do not set them. [`super::apply`] decides what
+    /// is shown (user setting, then this, then the app default).
+    pub fn fonts(self) -> ThemeFonts {
+        with(|e| e[self.0].fonts.clone())
+    }
 }
 
 /// The syntax colours of the palette's theme.
@@ -153,13 +162,23 @@ pub fn syntax(p: &Palette) -> Arc<HighlightTheme> {
     p.theme.syntax()
 }
 
-/// What the app keeps for itself, whatever a theme file says: its fonts, sizes,
-/// radii and shadow setting. The highlight block moves to the entry.
-pub(super) fn prepare(mut config: ThemeConfig) -> (Rc<ThemeConfig>, Arc<HighlightTheme>) {
-    config.font_size = None;
-    config.font_family = None;
-    config.mono_font_family = None;
-    config.mono_font_size = None;
+/// What the app keeps for itself, whatever a theme file says: its radii and
+/// shadow setting. The highlight block moves to the entry, and so do the
+/// four type settings (`font.*`, `mono_font.*`): they are taken out of the
+/// config so that `apply_config` does not write them, and [`super::apply`]
+/// resolves them against the user's setting instead.
+pub(super) fn prepare(
+    mut config: ThemeConfig,
+) -> (Rc<ThemeConfig>, Arc<HighlightTheme>, ThemeFonts) {
+    let fonts = ThemeFonts {
+        ui_family: config.font_family.take().filter(|f| !f.trim().is_empty()),
+        ui_size: config.font_size.take(),
+        mono_family: config
+            .mono_font_family
+            .take()
+            .filter(|f| !f.trim().is_empty()),
+        mono_size: config.mono_font_size.take(),
+    };
     config.radius = None;
     config.radius_lg = None;
     config.window_radius = None;
@@ -179,7 +198,7 @@ pub(super) fn prepare(mut config: ThemeConfig) -> (Rc<ThemeConfig>, Arc<Highligh
         }
         None => base,
     };
-    (Rc::new(config), syntax)
+    (Rc::new(config), syntax, fonts)
 }
 
 /// Every theme of the bundled files, as the files define them.
@@ -215,6 +234,7 @@ fn builtin(key: &str, label: &str, palette: Palette, syntax: Arc<HighlightTheme>
         palette,
         own_accent: Some(Preset::ORANGE),
         syntax,
+        fonts: ThemeFonts::default(),
     }
 }
 
@@ -238,7 +258,7 @@ fn load() -> Vec<Entry> {
     for dark in [true, false] {
         for config in kit.iter().filter(|c| c.mode.is_dark() == dark) {
             let id = ThemeId(entries.len());
-            let (rc, syntax) = prepare(config.clone());
+            let (rc, syntax, fonts) = prepare(config.clone());
             entries.push(Entry {
                 key: kebab(&config.name).into(),
                 label: config.name.clone(),
@@ -247,6 +267,7 @@ fn load() -> Vec<Entry> {
                 config: Some(rc),
                 own_accent: None,
                 syntax,
+                fonts,
             });
         }
     }

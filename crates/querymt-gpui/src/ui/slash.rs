@@ -19,6 +19,7 @@ use crate::theme::Palette;
 
 /// Rows visible at once; more scroll.
 const MAX_ROWS: usize = 8;
+/// Height of a row at the default 16 px rem; laid out with [`kit::rpx`].
 const ROW_HEIGHT: f32 = 30.;
 
 /// The text typed after the leading `/`, up to the cursor, when the list
@@ -397,7 +398,7 @@ impl SessionPane {
             h_flex()
                 .id(("slash-row", ix))
                 .debug_selector(move || format!("slash-row-{ix}"))
-                .h(px(ROW_HEIGHT))
+                .h(kit::rpx(ROW_HEIGHT))
                 .flex_none()
                 .px_2()
                 .gap_3()
@@ -409,7 +410,7 @@ impl SessionPane {
                 .child(
                     div()
                         .flex_none()
-                        .font_family(kit::MONO)
+                        .font_family(kit::mono_family(cx))
                         .text_sm()
                         .text_color(p.text)
                         .child(format!("/{}", command.name)),
@@ -457,7 +458,7 @@ impl SessionPane {
                 v_flex()
                     .id("slash-rows")
                     .p_1()
-                    .max_h(px(ROW_HEIGHT * MAX_ROWS as f32 + 8.))
+                    .max_h(kit::rpx(ROW_HEIGHT * MAX_ROWS as f32 + 8.))
                     .overflow_y_scroll()
                     .track_scroll(&self.slash_scroll)
                     .children(rows),
@@ -466,7 +467,13 @@ impl SessionPane {
     }
 
     /// One dimmed line above the textarea: `/name` and the command's hint.
-    pub(super) fn render_slash_hint(&self, name: String, hint: String, p: &Palette) -> Div {
+    pub(super) fn render_slash_hint(
+        &self,
+        name: String,
+        hint: String,
+        p: &Palette,
+        cx: &App,
+    ) -> Div {
         h_flex()
             .gap_2()
             .px_1()
@@ -474,7 +481,11 @@ impl SessionPane {
             .text_xs()
             .text_color(p.dim)
             .debug_selector(|| "slash-hint".into())
-            .child(div().font_family(kit::MONO).child(format!("/{name}")))
+            .child(
+                div()
+                    .font_family(kit::mono_family(cx))
+                    .child(format!("/{name}")),
+            )
             .child(div().min_w_0().truncate().child(hint))
     }
 }
@@ -946,6 +957,36 @@ mod ui_tests {
         // At most eight rows tall (plus padding and border); the rest scrolls.
         assert!(list.size.height <= row.size.height * 8.0 + gpui_kit::px(12.));
         assert!(list.size.height >= row.size.height * 7.0);
+    }
+
+    // appearance / Font size: a row is sized to its text, at every size the
+    // setting allows (10 to 32 px), and the list still holds all its rows.
+    #[gpui_kit::test]
+    fn rows_grow_with_the_rem_size(cx: &mut TestAppContext) {
+        let rig = rig(cx, session(two_commands(), false), false);
+        type_text(cx, &rig, "/");
+        for rem in [16., 10., 12., 20., 24., 32.] {
+            // Root sets the window's rem from the theme's base font size.
+            cx.update(|cx| {
+                gpui_kit::component::Theme::update(cx, |t| t.font_size = gpui_kit::px(rem))
+            });
+            render(cx, &rig);
+            let mut vcx = VisualTestContext::from_window(rig.handle, cx);
+            let row = vcx.debug_bounds("slash-row-0").expect("a row");
+            let list = vcx.debug_bounds("slash-list").expect("the list");
+            let last = vcx.debug_bounds("slash-row-1").expect("the last row");
+            // Layout snaps to the device's pixels: within one of them.
+            let want = super::ROW_HEIGHT * rem / 16.;
+            assert!(
+                (f32::from(row.size.height) - want).abs() <= 0.5,
+                "rem {rem}: {:?} for {want}",
+                row.size.height
+            );
+            assert!(
+                last.bottom() <= list.bottom() + gpui_kit::px(0.5),
+                "rem {rem}: the last row is inside the list"
+            );
+        }
     }
 
     #[gpui_kit::test]

@@ -121,6 +121,8 @@ enum PaletteTarget {
     SelectTheme,
     /// A row of the theme list.
     Theme(ThemeId),
+    /// "Text and fonts…": Settings > Appearance, where the Text card is.
+    TextSettings,
 }
 
 /// What the command palette lists (design D12).
@@ -427,7 +429,8 @@ impl QmtApp {
         if let PaletteMode::Themes { restore } =
             std::mem::replace(&mut self.palette_mode, PaletteMode::Commands)
         {
-            theme::apply(restore, cx);
+            let fonts = self.store.read(cx).prefs.fonts();
+            theme::apply_with(restore, &fonts, cx);
             cx.notify();
         }
         was_open
@@ -466,11 +469,13 @@ impl QmtApp {
             return;
         };
         if palette(cx).theme != id {
-            theme::apply(
+            let fonts = self.store.read(cx).prefs.fonts();
+            theme::apply_with(
                 Appearance {
                     theme: id,
                     accent: restore.accent,
                 },
+                &fonts,
                 cx,
             );
             cx.notify();
@@ -558,6 +563,10 @@ impl QmtApp {
             PaletteTarget::ToggleSidebar => self.toggle_sidebar(cx),
             PaletteTarget::RunSetup => return self.open_setup(None, cx),
             PaletteTarget::Page(page) => self.go(page, cx),
+            PaletteTarget::TextSettings => {
+                self.settings_tab = super::settings::SettingsTab::Appearance;
+                self.go(Page::Settings, cx)
+            }
             PaletteTarget::Session(s) => self.open_summary(&s, cx),
             PaletteTarget::SlashCommand { name, input, .. } => {
                 return self.run_slash_command(&name, input, window, cx);
@@ -933,6 +942,24 @@ impl QmtApp {
                 PaletteTarget::SelectTheme,
             )
             .keywords(["colour", "color", "appearance", "dark", "light"]),
+        );
+        actions.push(
+            PaletteEntry::new(
+                "Text and fonts…",
+                IconName::ALargeSmall,
+                PaletteTarget::TextSettings,
+            )
+            .keywords([
+                "font",
+                "fonts",
+                "text size",
+                "font size",
+                "zoom",
+                "typeface",
+                "interface",
+                "code font",
+                "monospace",
+            ]),
         );
         actions.push(
             PaletteEntry::new("Run setup", IconName::Wand, PaletteTarget::RunSetup).keywords([
@@ -1428,6 +1455,25 @@ mod tests {
         assert!(!group_labels(&groups(cx, &rig_away)).contains(&"Slash commands"));
     }
 
+    // appearance / Text: found by what a user would call it, and it opens the
+    // Text card's page.
+    #[gpui_kit::test]
+    fn font_and_zoom_words_find_the_text_settings(cx: &mut TestAppContext) {
+        let rig = rig(cx, Page::Sessions, None, |_| {});
+        for word in ["font", "text size", "zoom", "typeface", "monospace"] {
+            let found = filter_palette(groups(cx, &rig), word);
+            assert!(
+                entry_labels(&found, "Actions").contains(&"Text and fonts…".to_string()),
+                "{word}"
+            );
+        }
+        pick(cx, &rig, PaletteTarget::TextSettings);
+        rig.app.read_with(cx, |app, _| {
+            assert_eq!(app.page_for_test().0, Page::Settings);
+            assert!(app.settings_tab == crate::ui::settings::SettingsTab::Appearance);
+        });
+    }
+
     #[gpui_kit::test]
     fn palette_targets_stay_aligned_without_sessions(cx: &mut TestAppContext) {
         let rig = rig(
@@ -1460,6 +1506,9 @@ mod tests {
                     ) => {}
                     (PaletteTarget::SelectTheme, "Actions") => {
                         assert_eq!(entry.label.as_ref(), "Select theme…");
+                    }
+                    (PaletteTarget::TextSettings, "Actions") => {
+                        assert_eq!(entry.label.as_ref(), "Text and fonts…");
                     }
                     _ => panic!(
                         "{} carries the wrong target in {}",

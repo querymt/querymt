@@ -29,6 +29,7 @@ mod sidebar;
 mod slash;
 mod smooth_scroll;
 mod start;
+mod text_settings;
 mod turn_diff;
 #[cfg(not(target_family = "wasm"))]
 mod updates;
@@ -281,6 +282,8 @@ pub struct QmtApp {
     method_menu: Option<String>,
     /// Appearance whose theme select is open (`true`: dark).
     theme_menu: Option<bool>,
+    /// Appearance > Text: open family menu, its search, the size inputs.
+    text: text_settings::TextUi,
     maintenance_open: bool,
     failed_plugins_open: bool,
     /// General settings: Advanced / Danger zone disclosures and the reset confirmation.
@@ -537,6 +540,7 @@ impl QmtApp {
             provider_open: HashSet::new(),
             method_menu: None,
             theme_menu: None,
+            text: text_settings::TextUi::new(window, cx),
             maintenance_open: false,
             failed_plugins_open: false,
             general_advanced_open: false,
@@ -662,6 +666,8 @@ impl QmtApp {
             WindowAppearance::Dark | WindowAppearance::VibrantDark
         );
         self.apply_theme_for(system_dark, cx);
+        // A theme may bring its own size: the size inputs show what is in force.
+        self.sync_size_inputs(window, cx);
     }
 
     /// [`Self::apply_theme`] with the desktop's appearance given: System mode
@@ -671,7 +677,8 @@ impl QmtApp {
         let prefs = &self.store.read(cx).prefs;
         let dark = prefs.dark.unwrap_or(system_dark);
         let appearance = prefs.appearance(dark);
-        theme::apply(appearance, cx);
+        let fonts = prefs.fonts();
+        theme::apply_with(appearance, &fonts, cx);
         cx.notify();
     }
 
@@ -686,7 +693,10 @@ impl QmtApp {
         if self.preview.take().is_some() || self.close_palette(cx) {
             return true;
         }
-        if self.side.menu.take().is_some() || self.theme_menu.take().is_some() {
+        if self.side.menu.take().is_some()
+            || self.theme_menu.take().is_some()
+            || self.text.menu.take().is_some()
+        {
             return true;
         }
         if self.close_log_view() {
@@ -840,7 +850,7 @@ impl QmtApp {
                     .border_2()
                     .border_color(p.bg)
                     .bg(color)
-                    .text_size(px(10.))
+                    .text_size(kit::rpx(10.))
                     .font_semibold()
                     .text_color(p.on_accent)
                     .child(if count > 99 {
@@ -1354,7 +1364,7 @@ impl Render for QmtApp {
             .rounded_br(radii.bottom_right)
             .bg(p.bg)
             .text_color(p.text)
-            .font_family("IBM Plex Sans");
+            .font_family(kit::sans_family(cx));
         self.on_shortcuts(root, cx)
             // First child: its capture listener must precede every scroll container's.
             .child({

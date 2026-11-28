@@ -95,6 +95,8 @@ pub fn markdown(
         id,
         p,
         SourceShown::default(),
+        1.,
+        px(kit::REM_BASE_PX),
     )
 }
 
@@ -108,6 +110,11 @@ pub fn markdown(
 /// highlighter installed with the theme (`highlight::install`), one `Arc` for
 /// every frame, which is what keeps fences from being re-highlighted.
 pub(crate) fn view_style(p: &Palette) -> TextViewStyle {
+    view_style_scaled(p, 1.)
+}
+
+/// [`view_style`] with code blocks sized by `mono_scale` ([`kit::mono_scale`]).
+pub(crate) fn view_style_scaled(p: &Palette, mono_scale: f32) -> TextViewStyle {
     let radius = px(8.);
     TextViewStyle::default()
         .with_foreground(p.text)
@@ -119,9 +126,10 @@ pub(crate) fn view_style(p: &Palette) -> TextViewStyle {
         .with_code_block(
             StyleRefinement::default()
                 .rounded(radius)
-                .pt(px(42.))
+                // Room for the header row ([`CodeHeader`], rem-sized).
+                .pt(kit::rpx(42.))
                 .pb_3()
-                .text_size(px(13.)),
+                .text_size(kit::mono_px_at(mono_scale, 13.)),
         )
         .with_table(StyleRefinement::default().rounded(radius))
         .with_table_head(StyleRefinement::default().bg(p.card).text_color(p.muted))
@@ -134,12 +142,19 @@ pub(crate) fn view_style(p: &Palette) -> TextViewStyle {
 }
 
 /// Transcript styling and extensions; `id` prefixes the table ids.
-fn styled(view: TextView, id: SharedString, p: &Palette, sources: SourceShown) -> TextView {
+fn styled(
+    view: TextView,
+    id: SharedString,
+    p: &Palette,
+    sources: SourceShown,
+    mono_scale: f32,
+    rem: Pixels,
+) -> TextView {
     let table_prefix = id.clone();
     let mermaid_prefix = id;
     let p = *p;
-    view.style(view_style(&p))
-        .inline_code_style(inline_code_style(&p))
+    view.style(view_style_scaled(&p, mono_scale))
+        .inline_code_style(inline_code_style(&p, mono_scale, rem))
         .code_block_actions(move |block, _, cx| {
             let lang = block.lang();
             let row = header_row("code-header", &p, cx)
@@ -629,9 +644,17 @@ impl KeptMarkdown {
 }
 
 impl RenderOnce for KeptMarkdown {
-    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let state = self.kept.state(&self.id, &self.text, cx);
-        let view = styled(TextView::new(&state), self.id, &self.p, self.sources);
+        let scale = kit::mono_scale(cx);
+        let view = styled(
+            TextView::new(&state),
+            self.id,
+            &self.p,
+            self.sources,
+            scale,
+            window.rem_size(),
+        );
         match self.motion {
             Some(motion) => view.motion(motion),
             None => view,
@@ -666,13 +689,16 @@ impl Element for CodeHeader {
         window: &mut Window,
         _: &mut App,
     ) -> (LayoutId, ()) {
-        let layout = window.request_measured_layout(Style::default(), |known, available, _, _| {
-            let width = known.width.unwrap_or(match available.width {
-                AvailableSpace::Definite(width) => width,
-                _ => px(0.),
+        // As tall as the row painted into it (rem-sized, see `prepaint`).
+        let height = kit::rpx(30.).to_pixels(window.rem_size());
+        let layout =
+            window.request_measured_layout(Style::default(), move |known, available, _, _| {
+                let width = known.width.unwrap_or(match available.width {
+                    AvailableSpace::Definite(width) => width,
+                    _ => px(0.),
+                });
+                size(width, height)
             });
-            size(width, px(30.))
-        });
         (layout, ())
     }
 
@@ -690,7 +716,7 @@ impl Element for CodeHeader {
             bounds.origin - point(px(0.), inset),
             size(
                 AvailableSpace::Definite(bounds.size.width + inset),
-                AvailableSpace::Definite(px(30.)),
+                AvailableSpace::Definite(kit::rpx(30.).to_pixels(window.rem_size())),
             ),
             window,
             cx,
@@ -711,18 +737,31 @@ impl Element for CodeHeader {
     }
 }
 
-/// Desktop `.markdown-body code`: rounded, faint fill, padded.
-fn inline_code_style(p: &Palette) -> StyleRefinement {
+/// The size of inline code in the transcript at the default code size:
+/// the library sets it to 0.875 of the 14 px body text.
+const INLINE_CODE_PX: f32 = 14. * 0.875;
+
+/// Desktop `.markdown-body code`: rounded, faint fill, padded. With the
+/// default sizes (code 13 px, `rem` 16 px) it keeps the library's size (0.875
+/// of the surrounding text), so nothing changes. Otherwise the span gets an
+/// explicit size, the default's 12.25 px times the code size: like the other
+/// code text it follows the Code size setting only, not the interface size.
+fn inline_code_style(p: &Palette, mono_scale: f32, rem: Pixels) -> StyleRefinement {
     let (bg, fg) = if p.dark {
         (rgba(0xffffff13), rgb(0xe5e5e5))
     } else {
         (rgba(0x5e5c641a), rgb(0x3d3846))
     };
-    StyleRefinement::default()
+    let style = StyleRefinement::default()
         .bg(Hsla::from(bg))
         .text_color(Hsla::from(fg))
         .rounded(px(6.))
-        .px(px(5.))
+        .px(px(5.));
+    if mono_scale == 1. && rem == px(kit::REM_BASE_PX) {
+        style
+    } else {
+        style.text_size(kit::mono_px_at(mono_scale, INLINE_CODE_PX))
+    }
 }
 
 /// A markdown table (rendered by a nested view of its own source, without
@@ -782,7 +821,11 @@ impl RenderOnce for TableCard {
 
         let table = TextView::markdown(self.id.clone(), self.source.clone())
             .style(view_style(&p))
-            .inline_code_style(inline_code_style(&p));
+            .inline_code_style(inline_code_style(
+                &p,
+                kit::mono_scale(cx),
+                window.rem_size(),
+            ));
         let (hover, click, value) = (chrome.clone(), chrome, self.source);
         let button = kit::icon_button(
             SharedString::from(format!("{}-copy", self.id)),
@@ -997,13 +1040,13 @@ impl MermaidCard {
 }
 
 /// The Mermaid source as plain monospace lines, as a code block shows it.
-fn source_lines(source: &str, p: &Palette) -> Div {
+fn source_lines(source: &str, p: &Palette, cx: &App) -> Div {
     v_flex()
         .w_full()
         .px_3()
         .py_3()
-        .font_family(kit::MONO)
-        .text_size(px(13.))
+        .font_family(kit::mono_family(cx))
+        .text_size(kit::mono_px(cx, 13.))
         .line_height(relative(1.6))
         .text_color(p.text)
         .children(source.lines().map(|line| {
@@ -1038,7 +1081,7 @@ impl RenderOnce for MermaidCard {
             );
         let body = match (&layout, as_source) {
             (Ok(scene), false) => self.diagram(scene),
-            _ => source_lines(&self.source, &p).into_any_element(),
+            _ => source_lines(&self.source, &p, cx).into_any_element(),
         };
         let note = layout.as_ref().err().map(|why| {
             div()
@@ -1223,6 +1266,36 @@ mod tests {
                 "{key}"
             );
         }
+    }
+
+    // appearance / Code size: code blocks and inline code follow the code
+    // size, in absolute px (not the interface size); at the default they are
+    // exactly what they were.
+    #[test]
+    fn code_text_follows_the_code_size() {
+        use crate::theme::Palette;
+        use gpui_kit::{AbsoluteLength, px};
+        let p = Palette::dark();
+        let block = |scale: f32| {
+            super::view_style_scaled(&p, scale)
+                .code_block()
+                .text
+                .font_size
+        };
+        let at = |v: f32| Some(AbsoluteLength::from(px(v)));
+        assert_eq!(block(1.), at(13.));
+        assert_eq!(block(1.), super::view_style(&p).code_block().text.font_size);
+        assert_eq!(block(16. / 13.), at(16.));
+        assert_eq!(block(8. / 13.), at(8.));
+        // Inline code keeps the library's size (0.875 of the text around it)
+        // at the default sizes, and gets an absolute size of its own off
+        // them: the code size's, whatever the interface size.
+        let inline =
+            |scale: f32, rem: f32| super::inline_code_style(&p, scale, px(rem)).text.font_size;
+        assert_eq!(inline(1., 16.), None);
+        assert_eq!(inline(2., 16.), at(super::INLINE_CODE_PX * 2.));
+        assert_eq!(inline(1., 20.), at(super::INLINE_CODE_PX));
+        assert_eq!(inline(2., 20.), inline(2., 16.));
     }
 
     /// Every colour of a text view comes from the palette it is given, whatever

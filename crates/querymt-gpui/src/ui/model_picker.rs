@@ -583,7 +583,7 @@ impl ModelPicker {
                         div()
                             .text_xs()
                             .text_color(p.dim)
-                            .font_family(kit::MONO)
+                            .font_family(kit::mono_family(cx))
                             .truncate()
                             .child(m.id.clone()),
                     ),

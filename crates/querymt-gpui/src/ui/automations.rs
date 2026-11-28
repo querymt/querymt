@@ -632,7 +632,7 @@ impl QmtApp {
                     .min_w_0()
                     .child(
                         div()
-                            .text_size(px(13.4))
+                            .text_size(kit::rpx(13.4))
                             .font_semibold()
                             .truncate()
                             .child(label.clone()),
@@ -703,7 +703,7 @@ impl QmtApp {
                     .child(text)
                     .child(buttons),
             )
-            .when(expanded, |el| el.child(details(schedule, &row_key, p)))
+            .when(expanded, |el| el.child(details(schedule, &row_key, p, cx)))
             .into_any_element()
     }
 
@@ -773,7 +773,8 @@ fn state_card(
 }
 
 /// Facts of an expanded row, under its title.
-fn details(s: &Schedule, row_key: &str, p: &Palette) -> Div {
+fn details(s: &Schedule, row_key: &str, p: &Palette, cx: &App) -> Div {
+    let mono_family = kit::mono_family(cx);
     let runs = s.max_runs.map_or_else(
         || s.run_count.to_string(),
         |max| format!("{} of {max}", s.run_count),
@@ -795,7 +796,7 @@ fn details(s: &Schedule, row_key: &str, p: &Palette) -> Div {
                 div()
                     .min_w_0()
                     .truncate()
-                    .when(mono, |el| el.font_family(kit::MONO))
+                    .when(mono, |el| el.font_family(mono_family.clone()))
                     .child(value),
             )
     };
@@ -1097,7 +1098,7 @@ fn pill_select<V: PillHost>(
     let trigger = kit::flat_btn(id, s.enabled, true, p)
         .h(px(trigger_h))
         .when(s.quiet, |el| {
-            el.px(px(8.)).text_size(px(11.8)).text_color(p.muted)
+            el.px(px(8.)).text_size(kit::rpx(11.8)).text_color(p.muted)
         })
         .child(kit::icon(
             s.icon,
@@ -1146,7 +1147,7 @@ fn pill_select<V: PillHost>(
                     .gap_2()
                     .rounded(px(6.))
                     .cursor_pointer()
-                    .text_size(px(12.))
+                    .text_size(kit::rpx(12.))
                     .hover(move |st| st.bg(hover))
                     .child(div().flex_1().min_w_0().truncate().child(text))
                     .when(selected, |el| {
@@ -1763,7 +1764,7 @@ impl ScheduleForm {
                 .py(px(4.8))
                 .rounded(px(8.))
                 .bg(fill)
-                .text_size(px(13.))
+                .text_size(kit::rpx(13.))
                 .text_color(p.muted)
                 .child("Every")
                 .child(
@@ -1848,7 +1849,7 @@ impl ScheduleForm {
             .gap(px(6.4))
             .rounded(px(8.))
             .cursor_pointer()
-            .text_size(px(12.5))
+            .text_size(kit::rpx(12.5))
             .font_weight(FontWeight(560.))
             .text_color(if open { p.text } else { p.muted })
             .when(open, |el| el.bg(hover))
@@ -1884,7 +1885,7 @@ impl ScheduleForm {
                                     .flex_1()
                                     .min_w_0()
                                     .gap_1p5()
-                                    .text_size(px(13.))
+                                    .text_size(kit::rpx(13.))
                                     .child(label)
                                     .child(help_icon(id, help, p)),
                             )

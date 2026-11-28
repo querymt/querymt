@@ -3,7 +3,7 @@
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{
-    Disableable as _, Icon, Selectable as _, Sizable as _, StyledExt as _, h_flex, v_flex,
+    Disableable as _, Icon, Selectable as _, Sizable as _, StyledExt as _, Theme, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -11,7 +11,66 @@ use gpui_kit::*;
 use crate::store::ConnState;
 use crate::theme::Palette;
 
-pub const MONO: &str = "IBM Plex Mono";
+/// The rem size the design's pixel values were authored at (the theme's
+/// default `font_size`).
+pub const REM_BASE_PX: f32 = 16.;
+
+/// A design length of `px` pixels at the default 16 px rem, as a rem length,
+/// so it grows and shrinks with the window's rem size (which `Root` keeps at
+/// the theme's `font_size`). At rem 16 it resolves to exactly `px` (dividing
+/// and multiplying by 16 is exact in binary floating point). Use it for text
+/// sizes, text line heights and rows sized to fit text; leave decorative
+/// geometry (radii, padding, gaps) alone.
+pub fn rpx(px: f32) -> Rems {
+    rems(px / REM_BASE_PX)
+}
+
+/// How much the rem size differs from the design's 16 px: the theme's
+/// `font_size` over [`REM_BASE_PX`] (1.0 by default). For estimates made
+/// before a window exists or has been laid out, such as the quick panel's
+/// first height; once drawing, prefer [`rpx`], which follows the window.
+/// Exact at the default, like [`rpx`]. Only the quick panel (native only)
+/// needs it.
+#[cfg(not(target_family = "wasm"))]
+pub fn rem_scale(cx: &App) -> f32 {
+    f32::from(Theme::global(cx).font_size) / REM_BASE_PX
+}
+
+/// The monospace family, from the theme (`Theme::mono_font_family`). The one
+/// place a monospace face is chosen: `.font_family(kit::mono_family(cx))`.
+pub fn mono_family(cx: &App) -> SharedString {
+    Theme::global(cx).mono_font_family.clone()
+}
+
+/// How much the code size differs from the design's 13 px: the theme's
+/// `mono_font_size` over [`crate::theme::DEFAULT_MONO_SIZE`] (1.0 by default,
+/// exact like [`rpx`]). The size of every monospace text site is the
+/// design's size times this: see [`mono_px`].
+pub fn mono_scale(cx: &App) -> f32 {
+    f32::from(Theme::global(cx).mono_font_size) / crate::theme::DEFAULT_MONO_SIZE
+}
+
+/// A monospace text size or line height: the design's `design` pixels at the
+/// 13 px code size, times [`mono_scale`]. Absolute, like an editor's buffer
+/// font size: the code size is the px the user sets, whatever the interface
+/// size (the rem) is, so "Code size 14" is 14 px code. Every site that sets
+/// [`mono_family`] and a size takes the size from here, so the Code size
+/// setting reaches code blocks, diffs, tool output and inline code alike.
+/// Padding and other geometry around code stay rem-based ([`rpx`]).
+pub fn mono_px(cx: &App, design: f32) -> Pixels {
+    mono_px_at(mono_scale(cx), design)
+}
+
+/// [`mono_px`] with the scale given (for code that has no `App` at hand).
+/// Exact at scale 1.
+pub fn mono_px_at(scale: f32, design: f32) -> Pixels {
+    px(design * scale)
+}
+
+/// The proportional UI family, from the theme (`Theme::font_family`).
+pub fn sans_family(cx: &App) -> SharedString {
+    Theme::global(cx).font_family.clone()
+}
 /// The platform's own UI font (GPUI's special family name).
 pub const SYSTEM_UI: &str = ".SystemUIFont";
 
@@ -292,7 +351,7 @@ fn btn_base(id: impl Into<ElementId>, enabled: bool, compact: bool, p: &Palette)
         .border_color(p.border)
         .bg(p.card)
         .text_color(p.text)
-        .text_size(px(if compact { 12. } else { 13.1 }))
+        .text_size(rpx(if compact { 12. } else { 13.1 }))
         .font_weight(FontWeight(550.))
         .map(|el| {
             if enabled {
@@ -566,7 +625,7 @@ pub fn badged_tone(el: impl IntoElement, text: &str, color: Hsla, p: &Palette) -
 /// caller may give it an id and handlers.
 pub fn badge_tag(text: &str, fg: Hsla, bg: Hsla, cut_out: Option<Hsla>, size: BadgeSize) -> Div {
     div()
-        .h(px(size.height))
+        .h(rpx(size.height))
         .px(px(4.))
         .rounded(px(4.))
         .bg(bg)
@@ -579,8 +638,8 @@ pub fn badge_tag(text: &str, fg: Hsla, bg: Hsla, cut_out: Option<Hsla>, size: Ba
                 inset: false,
             }])
         })
-        .text_size(px(size.text))
-        .line_height(px(size.height))
+        .text_size(rpx(size.text))
+        .line_height(rpx(size.height))
         .font_semibold()
         .text_color(fg)
         .text_center()
@@ -593,10 +652,10 @@ pub fn badged(el: impl IntoElement, tag: AnyElement, size: BadgeSize) -> Div {
     let row = h_flex()
         .absolute()
         // CSS positions from inside the pill's 1px border; this wrapper is outside it.
-        .top(px(size.top))
+        .top(rpx(size.top))
         .left(px(6.))
         .right(px(6.))
-        .h(px(size.height))
+        .h(rpx(size.height))
         .justify_end()
         // The tag truncates at half the control's width.
         .child(div().min_w_0().max_w(relative(0.5)).child(tag));

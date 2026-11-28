@@ -97,7 +97,7 @@ pub(super) fn simple_row(
                 .min_w_0()
                 .child(
                     div()
-                        .text_size(px(13.4))
+                        .text_size(kit::rpx(13.4))
                         .font_semibold()
                         .text_color(p.text)
                         .child(title.into()),
@@ -105,7 +105,7 @@ pub(super) fn simple_row(
                 .child(
                     div()
                         .mt(px(3.2))
-                        .text_size(px(12.))
+                        .text_size(kit::rpx(12.))
                         .text_color(p.muted)
                         .child(desc.into()),
                 ),
@@ -144,11 +144,11 @@ fn disclosure(
                 .hover(move |s| s.bg(hover_bg).text_color(hover_fg))
                 .child(
                     v_flex()
-                        .child(div().text_size(px(12.5)).font_semibold().child(title))
+                        .child(div().text_size(kit::rpx(12.5)).font_semibold().child(title))
                         .child(
                             div()
                                 .mt(px(2.4))
-                                .text_size(px(10.9))
+                                .text_size(kit::rpx(10.9))
                                 .text_color(p.dim)
                                 .child(desc),
                         ),
@@ -210,12 +210,17 @@ fn profile_state_panel(
                 .gap(px(2.9))
                 .child(
                     div()
-                        .text_size(px(13.4))
+                        .text_size(kit::rpx(13.4))
                         .font_semibold()
                         .text_color(p.text)
                         .child(title),
                 )
-                .child(div().text_size(px(12.)).text_color(p.muted).child(body)),
+                .child(
+                    div()
+                        .text_size(kit::rpx(12.))
+                        .text_color(p.muted)
+                        .child(body),
+                ),
         )
         .child(action)
         .into_any_element()
@@ -226,7 +231,7 @@ fn section_heading(title: &'static str, desc: &'static str, p: &Palette) -> Div 
     v_flex()
         .child(
             div()
-                .text_size(px(13.4))
+                .text_size(kit::rpx(13.4))
                 .font_semibold()
                 .text_color(p.text)
                 .child(title),
@@ -234,7 +239,7 @@ fn section_heading(title: &'static str, desc: &'static str, p: &Palette) -> Div 
         .child(
             div()
                 .mt(px(3.2))
-                .text_size(px(12.))
+                .text_size(kit::rpx(12.))
                 .text_color(p.muted)
                 .child(desc),
         )
@@ -360,7 +365,7 @@ fn theme_preview(
 /// Key combination and what it does, for the Keybindings tab.
 type Binding = (Vec<&'static str>, &'static str);
 
-fn keycap(k: &str, p: &Palette) -> Div {
+fn keycap(k: &str, p: &Palette, cx: &App) -> Div {
     div()
         .px_1p5()
         .py(px(1.))
@@ -371,7 +376,7 @@ fn keycap(k: &str, p: &Palette) -> Div {
         // visible on the `card` rows the keycaps sit on.
         .bg(p.chip)
         .text_color(p.muted)
-        .font_family(kit::MONO)
+        .font_family(kit::mono_family(cx))
         .text_xs()
         .child(k.to_string())
 }
@@ -810,7 +815,7 @@ impl QmtApp {
                         .child(
                             div()
                                 .text_center()
-                                .text_size(px(12.5))
+                                .text_size(kit::rpx(12.5))
                                 .font_semibold()
                                 .text_color(if selected { p.text } else { p.muted })
                                 .child(label),
@@ -966,7 +971,7 @@ impl QmtApp {
                         .flex_none()
                         .rounded(px(6.))
                         .cursor_pointer()
-                        .text_size(px(12.))
+                        .text_size(kit::rpx(12.))
                         .hover(move |s| s.bg(hover))
                         .child(h_flex().flex_none().gap(px(2.)).children(swatch.map(|c| {
                             div()
@@ -1044,6 +1049,7 @@ impl QmtApp {
 
     fn settings_appearance(&self, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let prefs = self.store.read(cx).prefs.clone();
+        let text_card = self.text_card(p, cx);
         let motion_card = settings_card(p).child(simple_row(
                 "Fade in streamed text",
                 "Replies and reasoning fade in word by word as they arrive. Off when the system reduces motion.",
@@ -1157,6 +1163,7 @@ impl QmtApp {
         v_flex()
             .gap(px(12.8))
             .child(self.appearance_controls(p, cx))
+            .child(text_card)
             .child(motion_card)
             .child(scroll)
     }
@@ -1232,7 +1239,7 @@ impl QmtApp {
                 .children(keys.iter().enumerate().flat_map(|(ix, k)| {
                     let plus = (ix > 0).then(|| div().child("+").into_any_element());
                     plus.into_iter()
-                        .chain(std::iter::once(keycap(k, p).into_any_element()))
+                        .chain(std::iter::once(keycap(k, p, cx).into_any_element()))
                 }))
         };
 
@@ -1265,7 +1272,7 @@ impl QmtApp {
                     .child(
                         div()
                             .px_1()
-                            .text_size(px(13.4))
+                            .text_size(kit::rpx(13.4))
                             .font_semibold()
                             .text_color(p.text)
                             .child(title),
@@ -1377,16 +1384,16 @@ impl QmtApp {
                 .child(
                     div()
                         .truncate()
-                        .text_size(px(11.5))
+                        .text_size(kit::rpx(11.5))
                         .text_color(p.muted)
                         .child(label),
                 )
                 .child(
                     div()
                         .mt(px(3.8))
-                        .font_family(kit::MONO)
-                        .text_size(px(15.2))
-                        .line_height(px(19.))
+                        .font_family(kit::mono_family(cx))
+                        .text_size(kit::rpx(15.2))
+                        .line_height(kit::rpx(19.))
                         .text_color(color)
                         .child(value.to_string()),
                 )
@@ -1499,7 +1506,7 @@ impl QmtApp {
                     .p_3()
                     .rounded(px(8.))
                     .bg(subtle_surface)
-                    .child(div().text_size(px(11.8)).text_color(p.muted).child(if flow.needs_code {
+                    .child(div().text_size(kit::rpx(11.8)).text_color(p.muted).child(if flow.needs_code {
                         "A browser window opened. After approving, paste the callback URL or code here."
                     } else {
                         "A browser window opened. Approve the device there, then press Done."
@@ -1535,8 +1542,8 @@ impl QmtApp {
                         .flex_1()
                         .min_w_0()
                         .overflow_hidden()
-                        .child(div().text_size(px(11.8)).font_semibold().text_color(p.text).child(title))
-                        .child(sub.mt(px(2.5)).text_size(px(11.2)).text_color(p.muted))
+                        .child(div().text_size(kit::rpx(11.8)).font_semibold().text_color(p.text).child(title))
+                        .child(sub.mt(px(2.5)).text_size(kit::rpx(11.2)).text_color(p.muted))
                 };
 
                 // Authentication method: a pill select.
@@ -1584,7 +1591,7 @@ impl QmtApp {
                                 .gap_2()
                                 .rounded(px(6.))
                                 .cursor_pointer()
-                                .text_size(px(12.))
+                                .text_size(kit::rpx(12.))
                                 .hover(move |s| s.bg(hover))
                                 .child(div().flex_1().child(*text))
                                 .when(selected, |el| el.child(kit::icon(IconName::Check, 13., p.accent)))
@@ -1719,15 +1726,15 @@ impl QmtApp {
                             ))
                             .child(div().relative().flex_none().child(trigger).children(menu)),
                     )
-                    .child(detail_row(false).child(label("Provider ID", div().font_family(kit::MONO).truncate().child(pr.provider.clone()))))
+                    .child(detail_row(false).child(label("Provider ID", div().font_family(kit::mono_family(cx)).truncate().child(pr.provider.clone()))))
                     .when_some(pr.env_var_name.clone(), |el, env| {
                         el.child(
                             detail_row(false)
-                                .child(label("Environment variable", div().font_family(kit::MONO).truncate().child(env)))
+                                .child(label("Environment variable", div().font_family(kit::mono_family(cx)).truncate().child(env)))
                                 .child(
                                     div()
                                         .flex_none()
-                                        .text_size(px(11.2))
+                                        .text_size(kit::rpx(11.2))
                                         .text_color(if pr.has_env_api_key { p.success } else { p.dim })
                                         .child(if pr.has_env_api_key { "Available" } else { "Not set" }),
                                 ),
@@ -1794,7 +1801,7 @@ impl QmtApp {
                                     .child(
                                         div()
                                             .truncate()
-                                            .text_size(px(13.4))
+                                            .text_size(kit::rpx(13.4))
                                             .font_semibold()
                                             .text_color(p.text)
                                             .child(pr.display_name.clone()),
@@ -1803,7 +1810,7 @@ impl QmtApp {
                                         div()
                                             .mt(px(3.2))
                                             .truncate()
-                                            .text_size(px(12.))
+                                            .text_size(kit::rpx(12.))
                                             .text_color(p.muted)
                                             .child(provider_summary(pr)),
                                     ),
@@ -1901,7 +1908,7 @@ impl QmtApp {
                         .border_1()
                         .border_color(subtle_border)
                         .bg(subtle_surface)
-                        .text_size(px(12.))
+                        .text_size(kit::rpx(12.))
                         .child(
                             h_flex()
                                 .justify_between()
@@ -1949,7 +1956,7 @@ impl QmtApp {
                                     .justify_between()
                                     .gap_4()
                                     .cursor_pointer()
-                                    .text_size(px(11.8))
+                                    .text_size(kit::rpx(11.8))
                                     .font_semibold()
                                     .text_color(p.danger)
                                     .child(format!(
@@ -1980,7 +1987,7 @@ impl QmtApp {
                                         h_flex()
                                             .items_start()
                                             .gap(px(11.2))
-                                            .text_size(px(11.5))
+                                            .text_size(kit::rpx(11.5))
                                             .child(
                                                 div()
                                                     .min_w(px(112.))
@@ -2019,7 +2026,7 @@ impl QmtApp {
                                 .py_2()
                                 .rounded(px(8.))
                                 .bg(color.opacity(0.1))
-                                .text_size(px(12.))
+                                .text_size(kit::rpx(12.))
                                 .text_color(color)
                                 .child(msg),
                         )
@@ -2163,7 +2170,7 @@ impl QmtApp {
                     let detail_row = |label: &'static str, value: String| {
                         h_flex()
                             .gap(px(11.2))
-                            .text_size(px(11.2))
+                            .text_size(kit::rpx(11.2))
                             .text_color(p.muted)
                             .child(
                                 div()
@@ -2178,7 +2185,7 @@ impl QmtApp {
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
-                                    .font_family(kit::MONO)
+                                    .font_family(kit::mono_family(cx))
                                     .child(value),
                             )
                     };
@@ -2199,7 +2206,7 @@ impl QmtApp {
                     });
                     let feedback = feedback.map(|(message, error)| {
                         div()
-                            .text_size(px(11.5))
+                            .text_size(kit::rpx(11.5))
                             .text_color(if error { p.danger } else { p.success })
                             .child(message)
                     });
@@ -2252,7 +2259,7 @@ impl QmtApp {
                                         .child(
                                             div()
                                                 .truncate()
-                                                .text_size(px(13.4))
+                                                .text_size(kit::rpx(13.4))
                                                 .font_semibold()
                                                 .text_color(p.text)
                                                 .child(t.name.clone()),
@@ -2261,7 +2268,7 @@ impl QmtApp {
                                             div()
                                                 .mt(px(3.2))
                                                 .truncate()
-                                                .text_size(px(12.))
+                                                .text_size(kit::rpx(12.))
                                                 .text_color(p.muted)
                                                 .child(t.description.clone()),
                                         ),
@@ -2306,7 +2313,7 @@ impl QmtApp {
                 .child(
                     div()
                         .max_w(px(672.))
-                        .text_size(px(12.))
+                        .text_size(kit::rpx(12.))
                         .text_color(p.muted)
                         .child(
                             "Profiles are stored as TOML configuration files in ~/.qmt/profiles. \

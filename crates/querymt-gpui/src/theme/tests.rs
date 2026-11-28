@@ -774,8 +774,10 @@ fn kit_holds_the_entrys_highlight_theme(cx: &mut TestAppContext) {
     }
 }
 
+/// The theme's radii and shadow are the app's; its type is resolved by
+/// `apply_with` (user setting, theme file, app default).
 #[gpui_kit::test]
-fn theme_fonts_are_ignored(cx: &mut TestAppContext) {
+fn theme_radii_and_shadow_are_ignored_and_type_is_resolved(cx: &mut TestAppContext) {
     let defaults = Theme::default();
     start(cx, Appearance::builtin(true));
     for id in bundled() {
@@ -791,16 +793,18 @@ fn theme_fonts_are_ignored(cx: &mut TestAppContext) {
         cx.update(|cx| {
             let t = Theme::global(cx);
             let what = id.label();
-            assert_eq!(t.font_family, "IBM Plex Sans", "{what}");
-            assert_eq!(t.mono_font_family, "IBM Plex Mono", "{what}");
             assert_eq!(t.radius, px(8.), "{what}");
             assert_eq!(t.radius_lg, px(12.), "{what}");
-            assert_eq!(t.font_size, defaults.font_size, "{what}");
-            assert_eq!(t.mono_font_size, defaults.mono_font_size, "{what}");
             assert!(t.shadow, "{what}");
+            // The bundled files set no type: the app defaults apply.
+            assert_eq!(t.font_family, "IBM Plex Sans", "{what}");
+            assert_eq!(t.mono_font_family, "IBM Plex Mono", "{what}");
+            assert_eq!(t.font_size, defaults.font_size, "{what}");
+            assert_eq!(t.mono_font_size, px(13.), "{what}");
         });
     }
-    // The load step clears them from any config, whatever it sets.
+    // The load step takes the type out of any config, whatever it sets, and
+    // records it; radii and shadow are cleared.
     let config: ThemeConfig = serde_json::from_value(serde_json::json!({
         "name": "Loud", "mode": "dark",
         "font.size": 31, "font.family": "Comic Sans", "mono_font.family": "Courier",
@@ -808,9 +812,19 @@ fn theme_fonts_are_ignored(cx: &mut TestAppContext) {
         "shadow": false,
     }))
     .expect("config");
-    let (config, _) = prepare(config);
+    let (config, _, fonts) = prepare(config);
+    assert_eq!(
+        fonts,
+        ThemeFonts {
+            ui_family: Some("Comic Sans".into()),
+            ui_size: Some(31.),
+            mono_family: Some("Courier".into()),
+            mono_size: Some(29.),
+        }
+    );
     let mut kit = Theme::default();
     kit.apply_config(&config);
+    // `apply_config` does not write them: `apply_with` decides.
     assert_eq!(kit.font_size, defaults.font_size);
     assert_eq!(kit.font_family, defaults.font_family);
     assert_eq!(kit.mono_font_family, defaults.mono_font_family);
@@ -847,4 +861,288 @@ fn built_in_after_bundled_leaves_nothing_behind(
     assert_ne!(kit_json(light), kit_json(fresh_light));
     show(light, "qmt-light");
     assert_eq!(kit_json(light), kit_json(fresh_light));
+}
+
+// ---- typography: user setting > theme file > app default
+
+fn has(names: &'static [&'static str]) -> impl FnMut(&str) -> bool {
+    move |f| names.contains(&f)
+}
+
+fn user(
+    ui_family: Option<&str>,
+    ui_size: Option<f32>,
+    mono_family: Option<&str>,
+    mono_size: Option<f32>,
+) -> FontPrefs {
+    FontPrefs {
+        ui_family: ui_family.map(str::to_owned),
+        ui_size,
+        mono_family: mono_family.map(str::to_owned),
+        mono_size,
+    }
+}
+
+fn themed(
+    ui_family: Option<&str>,
+    ui_size: Option<f32>,
+    mono_family: Option<&str>,
+    mono_size: Option<f32>,
+) -> ThemeFonts {
+    ThemeFonts {
+        ui_family: ui_family.map(Into::into),
+        ui_size,
+        mono_family: mono_family.map(Into::into),
+        mono_size,
+    }
+}
+
+const INSTALLED: &[&str] = &["User Sans", "Theme Sans", "User Mono", "Theme Mono"];
+
+#[test]
+fn nothing_set_is_the_app_default() {
+    let t = resolve_typography(&FontPrefs::default(), &ThemeFonts::default(), &mut has(&[]));
+    assert_eq!(t, Typography::default());
+    assert_eq!(t.ui_family, "IBM Plex Sans");
+    assert_eq!(t.ui_size, 16.);
+    assert_eq!(t.mono_family, "IBM Plex Mono");
+    assert_eq!(t.mono_size, 13.);
+}
+
+#[test]
+fn a_theme_value_beats_the_default_and_a_user_value_beats_both() {
+    let theme = themed(Some("Theme Sans"), Some(15.), Some("Theme Mono"), Some(12.));
+    // Theme over default, per field.
+    let t = resolve_typography(&FontPrefs::default(), &theme, &mut has(INSTALLED));
+    assert_eq!(
+        (&*t.ui_family, t.ui_size, &*t.mono_family, t.mono_size),
+        ("Theme Sans", 15., "Theme Mono", 12.)
+    );
+    // User over theme, each field on its own.
+    type Shown<'a> = (&'a str, f32, &'a str, f32);
+    let fields: [(FontPrefs, Shown); 4] = [
+        (
+            user(Some("User Sans"), None, None, None),
+            ("User Sans", 15., "Theme Mono", 12.),
+        ),
+        (
+            user(None, Some(20.), None, None),
+            ("Theme Sans", 20., "Theme Mono", 12.),
+        ),
+        (
+            user(None, None, Some("User Mono"), None),
+            ("Theme Sans", 15., "User Mono", 12.),
+        ),
+        (
+            user(None, None, None, Some(14.)),
+            ("Theme Sans", 15., "Theme Mono", 14.),
+        ),
+    ];
+    for (prefs, (uf, us, mf, ms)) in fields {
+        let t = resolve_typography(&prefs, &theme, &mut has(INSTALLED));
+        assert_eq!(
+            (&*t.ui_family, t.ui_size, &*t.mono_family, t.mono_size),
+            (uf, us, mf, ms),
+            "{prefs:?}"
+        );
+    }
+    // A theme that names only some fields leaves the others to the default.
+    let some = themed(None, Some(18.), Some("Theme Mono"), None);
+    let t = resolve_typography(&FontPrefs::default(), &some, &mut has(INSTALLED));
+    assert_eq!(
+        (&*t.ui_family, t.ui_size, &*t.mono_family, t.mono_size),
+        ("IBM Plex Sans", 18., "Theme Mono", 13.)
+    );
+}
+
+#[test]
+fn a_family_that_is_not_installed_falls_back_one_level_at_a_time() {
+    let theme = themed(Some("Theme Sans"), None, Some("Theme Mono"), None);
+    // The user's is missing: the theme's.
+    let t = resolve_typography(
+        &user(Some("Gone Sans"), None, Some("Gone Mono"), None),
+        &theme,
+        &mut has(INSTALLED),
+    );
+    assert_eq!(
+        (&*t.ui_family, &*t.mono_family),
+        ("Theme Sans", "Theme Mono")
+    );
+    // Both missing: the app default.
+    let theme = themed(Some("Gone Too"), None, Some("Gone Too"), None);
+    let t = resolve_typography(
+        &user(Some("Gone Sans"), None, Some("Gone Mono"), None),
+        &theme,
+        &mut has(INSTALLED),
+    );
+    assert_eq!(t.ui_family, "IBM Plex Sans");
+    assert_eq!(t.mono_family, "IBM Plex Mono");
+    // Blank names are not names.
+    let t = resolve_typography(
+        &user(Some("  "), None, None, None),
+        &ThemeFonts::default(),
+        &mut has(&[]),
+    );
+    assert_eq!(t.ui_family, "IBM Plex Sans");
+}
+
+#[test]
+fn the_bundled_families_need_no_lookup() {
+    let t = resolve_typography(
+        &user(Some("IBM Plex Mono"), None, Some("IBM Plex Sans"), None),
+        &ThemeFonts::default(),
+        &mut |_| panic!("a bundled family must not be looked up"),
+    );
+    assert_eq!(t.ui_family, "IBM Plex Mono");
+    assert_eq!(t.mono_family, "IBM Plex Sans");
+}
+
+#[test]
+fn sizes_are_clamped_and_non_finite_is_ignored() {
+    let none = ThemeFonts::default();
+    let size = |ui, mono| {
+        let t = resolve_typography(&user(None, ui, None, mono), &none, &mut has(&[]));
+        (t.ui_size, t.mono_size)
+    };
+    assert_eq!(size(Some(4.), Some(2.)), (10., 8.));
+    assert_eq!(size(Some(99.), Some(99.)), (32., 32.));
+    assert_eq!(size(Some(10.), Some(8.)), (10., 8.));
+    assert_eq!(size(Some(32.), Some(32.)), (32., 32.));
+    assert_eq!(size(Some(17.5), Some(13.5)), (17.5, 13.5));
+    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        assert_eq!(size(Some(bad), Some(bad)), (16., 13.), "{bad}");
+    }
+    // A non-finite user size falls through to the theme's, which is clamped
+    // too.
+    let theme = themed(None, Some(f32::NAN), None, Some(64.));
+    let t = resolve_typography(
+        &user(None, Some(f32::NAN), None, f32::NAN.into()),
+        &theme,
+        &mut has(&[]),
+    );
+    assert_eq!((t.ui_size, t.mono_size), (16., 32.));
+    assert_eq!(clamp_size(f32::NAN, UI_SIZE_RANGE), None);
+    assert_eq!(clamp_size(1e9, MONO_SIZE_RANGE), Some(32.));
+}
+
+#[gpui_kit::test]
+fn apply_writes_the_resolved_type_to_the_kit_theme(cx: &mut TestAppContext) {
+    start(cx, Appearance::builtin(true));
+    cx.update(|cx| FontCatalog::seed(cx, INSTALLED, &["User Mono", "Theme Mono"]));
+    let appearance = Appearance::builtin(true);
+    // Theme only.
+    cx.update(|cx| {
+        apply_resolved(
+            appearance,
+            &FontPrefs::default(),
+            &themed(Some("Theme Sans"), Some(15.), Some("Theme Mono"), Some(12.)),
+            cx,
+        );
+        let t = Theme::global(cx);
+        assert_eq!(t.font_family, "Theme Sans");
+        assert_eq!(t.font_size, px(15.));
+        assert_eq!(t.mono_font_family, "Theme Mono");
+        assert_eq!(t.mono_font_size, px(12.));
+        assert_eq!(typography(cx).ui_size, 15.);
+    });
+    // The user's settings over it.
+    cx.update(|cx| {
+        apply_resolved(
+            appearance,
+            &user(Some("User Sans"), Some(22.), Some("User Mono"), Some(100.)),
+            &themed(Some("Theme Sans"), Some(15.), Some("Theme Mono"), Some(12.)),
+            cx,
+        );
+        let t = Theme::global(cx);
+        assert_eq!(t.font_family, "User Sans");
+        assert_eq!(t.font_size, px(22.));
+        assert_eq!(t.mono_font_family, "User Mono");
+        assert_eq!(t.mono_font_size, px(32.));
+    });
+    // A theme naming a family the machine lacks does not reach the kit.
+    cx.update(|cx| {
+        apply_resolved(
+            appearance,
+            &FontPrefs::default(),
+            &themed(Some("Missing Sans"), None, Some("Missing Mono"), None),
+            cx,
+        );
+        let t = Theme::global(cx);
+        assert_eq!(t.font_family, "IBM Plex Sans");
+        assert_eq!(t.mono_font_family, "IBM Plex Mono");
+    });
+    // Back to nothing set: everything is the default again.
+    cx.update(|cx| {
+        apply(appearance, cx);
+        assert_eq!(typography(cx), Typography::default());
+    });
+}
+
+#[gpui_kit::test]
+fn a_missing_family_does_not_panic_when_text_is_laid_out(cx: &mut TestAppContext) {
+    use gpui_kit::{AvailableSpace, point, size};
+    start(cx, Appearance::builtin(true));
+    cx.update(|cx| {
+        apply_resolved(
+            Appearance::builtin(true),
+            &user(Some("Not A Real Family"), None, Some("Nor This One"), None),
+            &themed(Some("Nor Theme"), None, Some("Nor Mono"), None),
+            cx,
+        );
+    });
+    let vcx = cx.add_empty_window();
+    vcx.draw(
+        point(px(0.), px(0.)),
+        size(
+            AvailableSpace::Definite(px(300.)),
+            AvailableSpace::Definite(px(100.)),
+        ),
+        |_, cx| {
+            use gpui_kit::{IntoElement as _, ParentElement as _, Styled as _, div};
+            div()
+                .font_family(Theme::global(cx).font_family.clone())
+                .child(
+                    div()
+                        .font_family(Theme::global(cx).mono_font_family.clone())
+                        .child("code"),
+                )
+                .child("text")
+                .into_any_element()
+        },
+    );
+}
+
+#[test]
+fn bundled_themes_name_no_fonts_and_the_built_ins_neither() {
+    for id in bundled() {
+        assert!(id.fonts().is_empty(), "{}", id.label());
+    }
+    assert!(ThemeId::QMT_DARK.fonts().is_empty());
+    assert!(ThemeId::QMT_LIGHT.fonts().is_empty());
+}
+
+#[test]
+fn the_family_list_is_sorted_without_private_names_and_keeps_the_bundled() {
+    let installed = Installed::new(
+        ["zeta", ".SystemUIFont", "Alpha", "alpha", "Beta", "  "]
+            .into_iter()
+            .map(String::from),
+    );
+    let names: Vec<&str> = installed.families().iter().map(|f| &**f).collect();
+    assert_eq!(
+        names,
+        [
+            "Alpha",
+            "alpha",
+            "Beta",
+            "IBM Plex Mono",
+            "IBM Plex Sans",
+            "zeta"
+        ]
+    );
+    assert!(installed.contains("zeta"));
+    assert!(!installed.contains(".SystemUIFont"));
+    // Monospace is unknown until the pass has run, except the bundled one.
+    assert!(!installed.mono_ready());
+    assert_eq!(installed.mono_families(), ["IBM Plex Mono"]);
 }

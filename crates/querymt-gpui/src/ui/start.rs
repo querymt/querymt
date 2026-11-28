@@ -431,8 +431,8 @@ pub(super) fn toolbar_button(id: &'static str, p: &Palette) -> Stateful<Div> {
         .bg(p.card)
         .hover(move |s| s.bg(hover))
         .cursor_pointer()
-        .text_size(px(12.))
-        .line_height(px(19.2))
+        .text_size(kit::rpx(12.))
+        .line_height(kit::rpx(19.2))
         .font_weight(FontWeight(550.))
 }
 
@@ -451,7 +451,7 @@ pub(super) fn model_toolbar_button(
         .gap_0()
         .pl(px(4.8))
         .pr(px(9.6))
-        .line_height(px(16.))
+        .line_height(kit::rpx(16.))
         .font_medium()
         .child(
             h_flex()

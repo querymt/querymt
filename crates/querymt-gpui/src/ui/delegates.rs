@@ -562,7 +562,7 @@ impl QmtApp {
                                         .child(
                                             div()
                                                 .text_xs()
-                                                .font_family(kit::MONO)
+                                                .font_family(kit::mono_family(cx))
                                                 .text_color(p.dim)
                                                 .child(a.agent_id.clone()),
                                         ),
@@ -669,7 +669,7 @@ impl QmtApp {
                         kit::flat_btn(kit::keyed("delegate-orphan", o.agent_id.clone()), enabled, true, p)
                             .justify_start()
                             .child(kit::icon(IconName::TriangleAlert, 13., p.warn))
-                            .child(div().font_family(kit::MONO).child(o.agent_id.clone()))
+                            .child(div().font_family(kit::mono_family(cx)).child(o.agent_id.clone()))
                             .child(div().flex_1().min_w_0().truncate().text_color(p.muted).child(
                                 route_summary(
                                     o.route.as_ref(),

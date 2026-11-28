@@ -3,7 +3,7 @@ id: gpui-ui
 title: UI shell, pages and the session pane
 description: How the main window is put together (QmtApp, pages, sidebar, modals), how one SessionPane renders a session in both the main window and the quick panel (density, RenderCtx, row cache), and the shared pieces (model picker, keys, palette, fuzzy search).
 tags: ui, gpui, find, search in session, cmd-f, mermaid, diagrams, markdown, shell, pages, sidebar, session pane, transcript, rows, density, compact, render, model picker, keybindings, actions, theme, palette, search
-knowledge_paths: ["crates/querymt-gpui/src/ui/**", "crates/querymt-gpui/src/search.rs"]
+knowledge_paths: ["crates/querymt-gpui/src/ui/**", "crates/querymt-gpui/src/theme/**", "crates/querymt-gpui/src/search.rs"]
 knowledge_sources: ["crates/querymt-gpui/src/ui/mod.rs", "crates/querymt-gpui/src/ui/session_pane.rs", "crates/querymt-gpui/src/ui/model_picker.rs", "crates/querymt-gpui/src/ui/keys.rs#bind_keys"]
 ---
 
@@ -201,6 +201,31 @@ The bar and its state live on `SessionPane` (`find: Option<FindBar>`, in `find.r
   `UndoWorkspace`, `OpenModelPicker`, `OpenSidebarSession { index }`, …) bound with no key
   context so they reach `QmtApp`'s root even with nothing focused; Cmd on macOS, Ctrl
   elsewhere. Text inputs keep their own deeper bindings.
+- **Theme** (`src/theme/mod.rs`): QueryMT design tokens applied to the gpui-component theme,
+  plus a `Palette` global for app colours the component theme has no slot for. The
+  transcript reads the palette once per frame and passes it down, so the quick panel can
+  substitute its HUD palette.
+- **Typography** (`src/theme/fonts.rs`, `src/ui/text_settings.rs`): four fields, each the
+  user's setting (`Prefs::ui_font_family/ui_font_size/mono_font_family/mono_font_size`),
+  else the theme file's (`font.*`, `mono_font.*`, kept on the catalogue entry as
+  `ThemeId::fonts()`), else the default (IBM Plex Sans 16, IBM Plex Mono 13).
+  `theme::apply_with(appearance, &FontPrefs, cx)` resolves them and writes the kit theme;
+  `theme::apply` is the same with no user choices. Sizes are clamped (interface 10-32,
+  code 8-32; non-finite ignored). GPUI panics when it lays out text in a family that is not
+  installed, so a non-bundled family is checked against `FontCatalog` (installed families,
+  listed once with `all_font_names`, monospace ones found in the background by comparing
+  the advance of `i` and `W`) and skipped, with a `warn!`, on a miss. The interface size is
+  the window rem (`Root` sets it from `Theme::font_size`); code text is sized with
+  `kit::mono_px(cx, px)`, the design px times `kit::mono_scale` (code size / 13) in
+  absolute pixels: code blocks, diffs, tool output, their scroll blocks and inline code
+  follow the code size only, not the interface size (like an editor's buffer font size;
+  "Code size 14" is 14 px code at any interface size). Padding around code stays
+  rem-based (`kit::rpx`). Inline code keeps the library's relative size only at the
+  default sizes (rem 16, code 13). `RenderCtx` carries the scale and the rem and hashes
+  both. Compact density keeps the
+  system font (`kit::SYSTEM_UI`). The Text card is Settings > Appearance; on wasm only the
+  bundled families are offered. Mono text that only names the family and inherits its size
+  (ids, labels) follows the interface size, not the code size.
 - **Search** (`src/search.rs`): one frizbee-based fuzzy matcher for every search box. Every
   query word must match within one field (its characters in order, gaps allowed);
   different words may match different fields, and a match in a secondary field
@@ -212,6 +237,8 @@ The bar and its state live on `SessionPane` (`find: Option<FindBar>`, in `find.r
 | File | Purpose |
 |------|---------|
 | `../src/ui/mod.rs` | `QmtApp` root view, `Page`, modals, `open_main_window`. |
+| `../src/ui/text_settings.rs` | Settings > Appearance > Text: font pickers, size inputs, presets. |
+| `../src/theme/fonts.rs` | Font precedence, size clamps, installed / monospace family catalogue. |
 | `../src/ui/session_pane.rs` | `SessionPane`: one session in a surface, at a density. |
 | `../src/ui/session_view.rs` | Session page, transcript row renderers, composer, `Density`. |
 | `../src/ui/sidebar.rs` | Session tabs in the sidebar: order, drag, context menu, attention dots. |

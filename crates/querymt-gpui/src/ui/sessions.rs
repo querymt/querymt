@@ -1354,7 +1354,7 @@ impl QmtApp {
                         .truncate()
                         .text_xs()
                         .text_color(p.dim)
-                        .font_family(kit::MONO)
+                        .font_family(kit::mono_family(cx))
                         .child(key.clone()),
                 )
                 .child({
@@ -1618,7 +1618,7 @@ impl QmtApp {
                 el.child(workspace_name(s.group_cwd())).child("·")
             })
             .when(rc.show_agent, |el| el.child(info.name.clone()).child("·"))
-            .child(div().font_family(kit::MONO).child(s.short_id()))
+            .child(div().font_family(kit::mono_family(cx)).child(s.short_id()))
             .when(s.messages > 0, |el| {
                 el.child("·").child(format!("{} msgs", s.messages))
             })

@@ -659,34 +659,40 @@ fn show_view(
 #[test]
 fn fitted_height_grows_in_steps_and_stops_at_the_cap() {
     // Overflow is added and rounded up to a step.
-    assert_eq!(fitted_height(260., 13., 0., 1000., true), 276.);
-    assert_eq!(fitted_height(260., 0., 0., 1000., true), 260.);
+    assert_eq!(fitted_height(260., 13., 0., 1000., true, 1.), 276.);
+    assert_eq!(fitted_height(260., 0., 0., 1000., true, 1.), 260.);
     // min(760, 70 % of the display).
-    assert_eq!(fitted_height(260., 5000., 0., 1000., true), 700.);
-    assert_eq!(fitted_height(260., 5000., 0., 2000., true), 760.);
+    assert_eq!(fitted_height(260., 5000., 0., 1000., true, 1.), 700.);
+    assert_eq!(fitted_height(260., 5000., 0., 2000., true, 1.), 760.);
     // A small display still gets the compact height.
-    assert_eq!(fitted_height(260., 5000., 0., 300., true), MIN_HEIGHT);
+    assert_eq!(fitted_height(260., 5000., 0., 300., true, 1.), MIN_HEIGHT);
 }
 
 #[test]
 fn fitted_height_never_shrinks_with_a_session_but_follows_an_empty_chat() {
-    assert_eq!(fitted_height(500., 0., 0., 1000., true), 500.);
-    assert_eq!(fitted_height(500., 0., 400., 1000., true), 500.);
+    assert_eq!(fitted_height(500., 0., 0., 1000., true, 1.), 500.);
+    assert_eq!(fitted_height(500., 0., 400., 1000., true, 1.), 500.);
     // An empty chat returns to its bar once nothing needs the room.
-    assert_eq!(fitted_height(500., 0., 0., 1000., false), BAR_HEIGHT);
-    assert_eq!(fitted_height(260., 0., 480., 1000., false), 480.);
+    assert_eq!(fitted_height(500., 0., 0., 1000., false, 1.), BAR_HEIGHT);
+    assert_eq!(fitted_height(260., 0., 480., 1000., false, 1.), 480.);
 }
 
 #[test]
 fn a_conversation_shown_in_the_bar_gets_room_for_a_turn() {
     // From the bar's height: at least the conversation's minimum.
-    assert_eq!(fitted_height(BAR_HEIGHT, 0., 0., 1000., true), MIN_HEIGHT);
-    assert_eq!(fitted_height(BAR_HEIGHT, 100., 0., 1000., true), MIN_HEIGHT);
+    assert_eq!(
+        fitted_height(BAR_HEIGHT, 0., 0., 1000., true, 1.),
+        MIN_HEIGHT
+    );
+    assert_eq!(
+        fitted_height(BAR_HEIGHT, 100., 0., 1000., true, 1.),
+        MIN_HEIGHT
+    );
     // More than that when the transcript needs it.
-    assert_eq!(fitted_height(BAR_HEIGHT, 300., 0., 1000., true), 364.);
+    assert_eq!(fitted_height(BAR_HEIGHT, 300., 0., 1000., true, 1.), 364.);
     // The bar grows with what it shows (more lines, an error), exactly: it
     // sits on the bottom edge, so spare height would be a gap above it.
-    assert_eq!(fitted_height(BAR_HEIGHT, 0., 91., 1000., false), 91.);
+    assert_eq!(fitted_height(BAR_HEIGHT, 0., 91., 1000., false, 1.), 91.);
 }
 
 // quick-panel / Opens with motion
@@ -3427,7 +3433,7 @@ fn on_a_small_display_the_grid_stops_at_the_limit_and_scrolls(cx: &mut TestAppCo
         // Never past what the display leaves the panel, and short of the
         // 746 px eight cards want.
         assert!(height <= display * 0.9 + 0.5, "{height} on {display}");
-        assert!(height < picker_height(PickerLayout::Grid, 8) || !scrolls);
+        assert!(height < picker_height(PickerLayout::Grid, 8, 1.) || !scrolls);
         let search = bounds_of(cx, window, "quick-picker-search").expect("the search row");
         let toggle = bounds_of(cx, window, "quick-picker-layout").expect("the toggle");
         let cards = bounds_of(cx, window, "quick-picker-cards").expect("the cards");
@@ -3523,15 +3529,24 @@ fn closing_the_list_restores_the_scroll_position(cx: &mut TestAppContext) {
     assert_eq!(after, before);
 }
 
+/// Show the interface at `rem` px the way the setting does: the theme's
+/// `font_size`, which `Root` turns into the window's rem size each frame.
 fn set_rem(cx: &mut TestAppContext, window: AnyWindowHandle, rem: f32) {
-    cx.update_window(window, |_, window, _| window.set_rem_size(rem))
+    cx.update(|cx| {
+        gpui_kit::component::Theme::update(cx, |t| t.font_size = gpui_kit::px(rem));
+    });
+    settle(cx, window);
+    let shown = cx
+        .update_window(window, |_, window, _| f32::from(window.rem_size()))
         .unwrap();
+    assert_eq!(shown, rem, "the window follows the theme's size");
 }
 
 // quick-panel / Every listed session is visible
 #[gpui_kit::test]
 fn the_last_listed_session_is_inside_the_window(cx: &mut TestAppContext) {
-    for rem in [16., 20.] {
+    // The default and zoomed sizes, and both ends of the setting's range.
+    for rem in [10., 12., 16., 20., 24., 32.] {
         let rig = rig(cx);
         list_sessions(&rig, cx, 8);
         let (window, panel) = rig.open_panel(cx);

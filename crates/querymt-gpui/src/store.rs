@@ -1402,6 +1402,23 @@ fn lenient_string<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::E
     })
 }
 
+/// An optional string preference: anything but a non-blank string reads as
+/// unset (the theme's or the app's value).
+fn lenient_opt_string<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::String(s) if !s.trim().is_empty() => Some(s),
+        _ => None,
+    })
+}
+
+/// An optional size preference: anything but a finite number reads as unset.
+fn lenient_opt_size<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f32>, D::Error> {
+    Ok(serde_json::Value::deserialize(d)?
+        .as_f64()
+        .map(|v| v as f32)
+        .filter(|v| v.is_finite()))
+}
+
 /// The version of the appearance preferences (theme keys, accent meaning).
 ///
 /// Version 0 is a file saved before themes existed, which stored `orange`
@@ -1466,6 +1483,19 @@ pub struct Prefs {
     /// Theme key of the light appearance (as `theme_dark`).
     #[serde(default, deserialize_with = "lenient_string")]
     pub theme_light: String,
+    /// Interface font family; `None`: the theme's, else IBM Plex Sans.
+    #[serde(default, deserialize_with = "lenient_opt_string")]
+    pub ui_font_family: Option<String>,
+    /// Interface size in px (the window's rem size); `None`: the theme's,
+    /// else 16.
+    #[serde(default, deserialize_with = "lenient_opt_size")]
+    pub ui_font_size: Option<f32>,
+    /// Code font family; `None`: the theme's, else IBM Plex Mono.
+    #[serde(default, deserialize_with = "lenient_opt_string")]
+    pub mono_font_family: Option<String>,
+    /// Code size in px; `None`: the theme's, else 13.
+    #[serde(default, deserialize_with = "lenient_opt_size")]
+    pub mono_font_size: Option<f32>,
     /// Which version of the appearance preferences saved this file.
     #[serde(
         default = "AppearanceVersion::legacy",
@@ -1605,6 +1635,16 @@ impl Prefs {
     /// The saved accent: a preset, or the shown theme's own.
     pub fn accent_choice(&self) -> crate::theme::Accent {
         crate::theme::Accent::parse(&self.accent)
+    }
+
+    /// The user's font choices, for [`crate::theme::apply_with`].
+    pub fn fonts(&self) -> crate::theme::FontPrefs {
+        crate::theme::FontPrefs {
+            ui_family: self.ui_font_family.clone(),
+            ui_size: self.ui_font_size,
+            mono_family: self.mono_font_family.clone(),
+            mono_size: self.mono_font_size,
+        }
     }
 
     /// What to show in the `dark` or light appearance.
@@ -5569,6 +5609,53 @@ mod seed_tests {
         let (_, prefs, _) = startup_state(Some(saved), Vec::new());
         assert_eq!(prefs.accent, "blue", "a non-orange accent is kept");
         assert_eq!(prefs.accent_choice().id(), "blue");
+    }
+
+    #[test]
+    fn font_preferences_default_to_none_and_roundtrip() {
+        let saved = load(r#"{"configs":[],"prefs":{"dark":true}}"#);
+        assert_eq!(saved.prefs.fonts(), crate::theme::FontPrefs::default());
+        let prefs = Prefs {
+            ui_font_family: Some("Inter".into()),
+            ui_font_size: Some(17.5),
+            mono_font_family: Some("JetBrains Mono".into()),
+            mono_font_size: Some(14.),
+            ..Prefs::default()
+        };
+        let back = reload(&prefs);
+        assert_eq!(back.ui_font_family.as_deref(), Some("Inter"));
+        assert_eq!(back.ui_font_size, Some(17.5));
+        assert_eq!(back.mono_font_family.as_deref(), Some("JetBrains Mono"));
+        assert_eq!(back.mono_font_size, Some(14.));
+        assert_eq!(back.fonts(), prefs.fonts());
+        // Unset stays unset (`None` is written as null).
+        assert_eq!(
+            reload(&Prefs::default()).fonts(),
+            crate::theme::FontPrefs::default()
+        );
+    }
+
+    #[test]
+    fn malformed_font_preferences_read_as_unset_and_keep_the_rest() {
+        let saved = load(
+            r#"{"configs":[],"prefs":{"cwd":"/w","accent":"blue",
+                "ui_font_family":42,"ui_font_size":"big",
+                "mono_font_family":["x"],"mono_font_size":{"a":1}}}"#,
+        );
+        assert_eq!(saved.prefs.fonts(), crate::theme::FontPrefs::default());
+        assert_eq!(saved.prefs.cwd, "/w");
+        assert_eq!(saved.prefs.accent, "blue");
+        // Blank names and null are unset too; numbers of any form read.
+        let saved = load(
+            r#"{"configs":[],"prefs":{"ui_font_family":"  ","ui_font_size":null,
+                "mono_font_family":null,"mono_font_size":13}}"#,
+        );
+        assert_eq!(saved.prefs.ui_font_family, None);
+        assert_eq!(saved.prefs.ui_font_size, None);
+        assert_eq!(saved.prefs.mono_font_family, None);
+        assert_eq!(saved.prefs.mono_font_size, Some(13.));
+        // Reset app data clears the choices.
+        assert_eq!(Prefs::default().fonts(), crate::theme::FontPrefs::default());
     }
 
     #[test]

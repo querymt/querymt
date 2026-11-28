@@ -546,7 +546,7 @@ impl Render for WorkspaceField {
                         .gap_2()
                         .rounded(px(6.))
                         .cursor_pointer()
-                        .text_size(px(12.))
+                        .text_size(kit::rpx(12.))
                         .hover(move |s| s.bg(hover))
                         .when(cursor == Some(ix), |el| el.bg(hover))
                         .child(kit::icon(
@@ -572,7 +572,7 @@ impl Render for WorkspaceField {
                                 .flex_1()
                                 .min_w_0()
                                 .truncate()
-                                .text_size(px(11.2))
+                                .text_size(kit::rpx(11.2))
                                 .text_color(dim)
                                 .child(parent_dir(&item.path)),
                         )
@@ -580,7 +580,7 @@ impl Render for WorkspaceField {
                             el.child(
                                 div()
                                     .flex_none()
-                                    .text_size(px(11.))
+                                    .text_size(kit::rpx(11.))
                                     .text_color(dim)
                                     .child("Workspace"),
                             )

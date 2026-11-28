@@ -32,10 +32,11 @@ use crate::theme::Palette;
 
 /// Layouts kept, least recently used first out (shaped like `code.rs`).
 const CACHE_LIMIT: usize = 128;
-/// Size of text with no size of its own in a diagram.
-const FONT_SIZE: f64 = 14.0;
-/// Family of interface text; diagrams are drawn in it.
-const SANS: &str = "IBM Plex Sans";
+/// Size of text with no size of its own in a diagram, at the default 16 px
+/// rem. [`font_size`] scales it with the window's rem size.
+const BASE_FONT_SIZE: f64 = 14.0;
+/// The rem size [`BASE_FONT_SIZE`] was chosen at.
+const BASE_REM: f64 = 16.0;
 
 /// Why a closed `mermaid` fence is shown as code instead of a diagram.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,19 +81,29 @@ thread_local! {
     static CACHE: RefCell<Cache> = RefCell::new(Cache::default());
 }
 
-/// The families diagrams are measured and drawn in.
+/// The families diagrams are measured and drawn in: the theme's interface
+/// and monospace families.
 pub(crate) fn fonts(cx: &App) -> Fonts {
     Fonts {
-        sans: SANS.into(),
+        sans: Theme::global(cx).font_family.clone(),
         mono: Theme::global(cx).mono_font_family.clone(),
     }
 }
 
-fn key(source: &str, fonts: &Fonts) -> u64 {
+/// Size of diagram text with no size of its own: [`BASE_FONT_SIZE`] scaled by
+/// the window's rem size (the theme's font size), so diagrams follow the
+/// interface's text size. Exactly the base at the default rem.
+fn font_size(window: &Window) -> f64 {
+    BASE_FONT_SIZE * f64::from(f32::from(window.rem_size())) / BASE_REM
+}
+
+/// Cache key: a layout depends on the source, the families text is measured
+/// in and the base size.
+fn key(source: &str, fonts: &Fonts, font_size: f64) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     source.hash(&mut h);
     fonts.hash(&mut h);
-    FONT_SIZE.to_bits().hash(&mut h);
+    font_size.to_bits().hash(&mut h);
     h.finish()
 }
 
@@ -100,7 +111,8 @@ fn key(source: &str, fonts: &Fonts) -> u64 {
 /// parsed and laid out now (measuring text needs the window).
 pub(crate) fn scene(source: &str, window: &Window, cx: &App) -> Layout {
     let fonts = fonts(cx);
-    let key = key(source, &fonts);
+    let font_size = font_size(window);
+    let key = key(source, &fonts, font_size);
     let hit = CACHE.with(|c| {
         let mut c = c.borrow_mut();
         let found = c.entries.get(&key).cloned();
@@ -113,7 +125,7 @@ pub(crate) fn scene(source: &str, window: &Window, cx: &App) -> Layout {
     if let Some(layout) = hit {
         return layout;
     }
-    let layout = compute(source, paint::TextMeasurer::new(window, fonts));
+    let layout = compute(source, paint::TextMeasurer::new(window, fonts), font_size);
     CACHE.with(|c| {
         let mut c = c.borrow_mut();
         #[cfg(test)]
@@ -131,10 +143,10 @@ pub(crate) fn scene(source: &str, window: &Window, cx: &App) -> Layout {
 }
 
 /// Parse and lay out, mapping limu's errors to [`Unavailable`].
-fn compute(source: &str, measurer: paint::TextMeasurer) -> Layout {
+fn compute(source: &str, measurer: paint::TextMeasurer, font_size: f64) -> Layout {
     let options = limu::layout::Options {
         measurer: &measurer,
-        font_size: FONT_SIZE,
+        font_size,
         ..limu::layout::Options::default()
     };
     limu::parse(source, &limu::ParseOptions::default())
@@ -714,6 +726,41 @@ mod tests {
 
     pub(super) const FLOW: &str = "flowchart LR; a --> b";
 
+    // appearance / Font family and size: a cached layout is only reused for
+    // the families and size it was measured with.
+    #[test]
+    fn the_cache_key_includes_the_families_and_the_size() {
+        let fonts = |sans: &str, mono: &str| Fonts {
+            sans: sans.to_string().into(),
+            mono: mono.to_string().into(),
+        };
+        let base = key(FLOW, &fonts("Sans", "Mono"), BASE_FONT_SIZE);
+        assert_eq!(base, key(FLOW, &fonts("Sans", "Mono"), BASE_FONT_SIZE));
+        assert_ne!(base, key(FLOW, &fonts("Other", "Mono"), BASE_FONT_SIZE));
+        assert_ne!(base, key(FLOW, &fonts("Sans", "Other"), BASE_FONT_SIZE));
+        assert_ne!(
+            base,
+            key(FLOW, &fonts("Sans", "Mono"), BASE_FONT_SIZE * 1.25)
+        );
+    }
+
+    // appearance / Font size: the diagram's text is the base size at the
+    // default rem and scales with it.
+    #[gpui_kit::test]
+    fn the_font_size_follows_the_rem_size(cx: &mut TestAppContext) {
+        let vcx = cx.add_empty_window();
+        let sizes: Vec<f64> = [16., 20.]
+            .map(|rem| {
+                vcx.update(|window, _| {
+                    window.set_rem_size(px(rem));
+                    font_size(window)
+                })
+            })
+            .into();
+        assert_eq!(sizes[0], BASE_FONT_SIZE);
+        assert_eq!(sizes[1], BASE_FONT_SIZE * 1.25);
+    }
+
     /// A column `width` wide holding one diagram of `source`.
     pub(super) struct Fixture {
         pub(super) source: SharedString,
@@ -1062,7 +1109,7 @@ mod tests {
             .update_window(handle, |_, window, cx| {
                 let measurer = paint::TextMeasurer::new(window, fonts(cx));
                 let start = std::time::Instant::now();
-                let layout = compute(&src, measurer);
+                let layout = compute(&src, measurer, super::BASE_FONT_SIZE);
                 (layout, start.elapsed())
             })
             .unwrap();

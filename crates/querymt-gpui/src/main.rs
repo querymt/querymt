@@ -177,7 +177,8 @@ pub fn run(app: Application, panel_only: bool) {
             )
         });
         let appearance = store.read(cx).prefs.appearance(dark);
-        theme::apply(appearance, cx);
+        let fonts = store.read(cx).prefs.fonts();
+        theme::apply_with(appearance, &fonts, cx);
 
         cx.on_action(|_: &Quit, cx| cx.quit());
         #[cfg(not(target_family = "wasm"))]

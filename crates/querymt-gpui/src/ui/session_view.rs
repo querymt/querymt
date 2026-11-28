@@ -48,7 +48,10 @@ const OUTPUT_LINES: usize = 80;
 /// Floating composer: height of the fade above it, and its background-colored halo.
 const COMPOSER_FADE_H: f32 = 28.;
 /// Height of the slot the activity bar, waiting bubble and scroll pill float
-/// in above the composer (their pill height).
+/// in above the composer (their pill height). Like [`TOOL_LINE_H`] and the
+/// block heights below, it is in design pixels at the default 16 px rem and
+/// laid out with [`kit::rpx`], so it follows the window's rem size with the
+/// text inside it.
 const DOCK_ROW_H: f32 = 32.;
 const COMPOSER_HALO_BLUR: f32 = 10.;
 const COMPOSER_HALO_SPREAD: f32 = 2.;
@@ -103,7 +106,12 @@ fn copied_badge(p: &Palette) -> Div {
 
 /// Tooltip of a click-to-copy target: the value muted (monospace for IDs)
 /// above the hint; just "Copied" while the copy feedback shows (`value: None`).
-fn copy_tooltip(value: Option<String>, hint: &'static str, dim: Hsla, mono: bool) -> Tooltip {
+fn copy_tooltip(
+    value: Option<String>,
+    hint: &'static str,
+    dim: Hsla,
+    mono: Option<SharedString>,
+) -> Tooltip {
     Tooltip::element(move |_, _| match &value {
         Some(v) => v_flex()
             .max_w(px(kit::TOOLTIP_MAX_W))
@@ -111,7 +119,7 @@ fn copy_tooltip(value: Option<String>, hint: &'static str, dim: Hsla, mono: bool
             .child(
                 div()
                     .text_color(dim)
-                    .when(mono, |el| el.font_family(kit::MONO).text_xs())
+                    .when_some(mono.clone(), |el, family| el.font_family(family).text_xs())
                     .child(v.clone()),
             )
             .child(div().child(hint))
@@ -124,7 +132,9 @@ fn copy_tooltip(value: Option<String>, hint: &'static str, dim: Hsla, mono: bool
 pub(super) const CHAT_MAX: f32 = 832.;
 /// Transcript column of a compact pane (the quick panel is 680 px wide).
 const COMPACT_CHAT_MAX: f32 = 640.;
-/// Size of the conversation's text in the HUD.
+/// Size of the conversation's text in the HUD. Deliberately a fixed physical
+/// size, not rem-scaled: the HUD is a system-font overlay whose size is not
+/// part of the app's font-size appearance (undecided; see `Density::Compact`).
 const COMPACT_PROSE_PX: f32 = 14.5;
 
 /// How much a session pane shows. The row renderers are the same in both;
@@ -467,9 +477,24 @@ struct RenderCtx {
     tool_content: bool,
     /// Developer mode: message metadata, `exit 0` of shell calls.
     developer: bool,
+    /// The window's rem size: text sizes and the line heights paired with
+    /// them scale with it, so a change re-measures every row.
+    rem: Pixels,
+    /// Theme monospace family ([`kit::mono_family`]), resolved once per frame.
+    mono: SharedString,
+    /// The code size over the design's 13 px ([`kit::mono_scale`]): every
+    /// monospace text size and its line height scale with it (absolute, not
+    /// with the rem), so a change re-measures every row. Size monospace text
+    /// with [`Self::mono_px`].
+    mono_scale: f32,
 }
 
 impl RenderCtx {
+    /// [`kit::mono_px`] at this frame's code size.
+    fn mono_px(&self, design: f32) -> Pixels {
+        kit::mono_px_at(self.mono_scale, design)
+    }
+
     /// Item `ix` belongs to the turn still running.
     fn live_turn(&self, ix: usize) -> bool {
         self.running && ix >= self.last_turn_start
@@ -559,6 +584,11 @@ impl RenderCtx {
         (std::sync::Arc::as_ptr(&self.syntax) as usize).hash(h);
         self.tool_content.hash(h);
         self.developer.hash(h);
+        // Rem and the monospace family change text metrics, hence wrapping
+        // and row heights, without changing any item.
+        f32::from(self.rem).to_bits().hash(h);
+        self.mono.hash(h);
+        self.mono_scale.to_bits().hash(h);
     }
 
     /// Signature of one transcript row: it changes exactly when the row's
@@ -1424,7 +1454,7 @@ fn clipped_with_more(
     )
 }
 
-fn code_block(text: String, p: &Palette) -> Div {
+fn code_block(text: String, p: &Palette, mono: &SharedString, scale: f32) -> Div {
     div()
         .w_full()
         .px_3()
@@ -1433,8 +1463,8 @@ fn code_block(text: String, p: &Palette) -> Div {
         .bg(p.bg)
         .border_1()
         .border_color(p.border)
-        .font_family(kit::MONO)
-        .text_xs()
+        .font_family(mono.clone())
+        .text_size(kit::mono_px_at(scale, 12.))
         .text_color(p.muted)
         .child(text)
 }
@@ -1467,8 +1497,13 @@ fn detail_section(
                 ),
         )
         .child(
-            code_block(clipped(&text, rc.density.output_lines()), p)
-                .when(danger, |el| el.text_color(p.danger)),
+            code_block(
+                clipped(&text, rc.density.output_lines()),
+                p,
+                &rc.mono,
+                rc.mono_scale,
+            )
+            .when(danger, |el| el.text_color(p.danger)),
         )
 }
 
@@ -1675,7 +1710,7 @@ fn render_diff_file(
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .font_family(kit::MONO)
+                            .font_family(rc.mono.clone())
                             .child(path.to_string()),
                     )
                     .child(
@@ -1701,9 +1736,9 @@ fn render_diff_file(
             ScrollbarAxis::Vertical,
             v_flex()
                 .w_full()
-                .line_height(px(TOOL_LINE_H))
-                .font_family(kit::MONO)
-                .text_xs()
+                .line_height(rc.mono_px(TOOL_LINE_H))
+                .font_family(rc.mono.clone())
+                .text_size(rc.mono_px(12.))
                 .children(body),
             rc,
         ))
@@ -1722,27 +1757,33 @@ fn attaches_to_header(call: &ToolCall) -> bool {
 }
 
 /// Frame of a borderless output block inside an attached tool card.
-fn flat_frame(p: &Palette) -> Div {
+fn flat_frame(p: &Palette, mono: &SharedString, scale: f32) -> Div {
     div()
         .w_full()
         .px_3()
         .py_2()
         .bg(p.bg)
-        .font_family(kit::MONO)
-        .text_xs()
-        .line_height(px(TOOL_LINE_H))
+        .font_family(mono.clone())
+        .text_size(kit::mono_px_at(scale, 12.))
+        .line_height(kit::mono_px_at(scale, TOOL_LINE_H))
         .text_color(p.muted)
 }
 
 /// Borderless output block inside an attached tool card.
-fn flat_block(text: String, p: &Palette) -> Div {
-    flat_frame(p).child(text)
+fn flat_block(text: String, p: &Palette, mono: &SharedString, scale: f32) -> Div {
+    flat_frame(p, mono, scale).child(text)
 }
 
 /// First line of an attached card (the shell command, the fetched URL):
 /// a dim prefix, the full value, and the desktop's thin rule
 /// (`.session-tool-terminal-command-line::after`) under it.
-fn card_heading(prefix: &'static str, value: impl IntoElement, p: &Palette) -> Div {
+fn card_heading(
+    prefix: &'static str,
+    value: impl IntoElement,
+    p: &Palette,
+    mono: &SharedString,
+    scale: f32,
+) -> Div {
     v_flex()
         .w_full()
         .child(
@@ -1752,8 +1793,8 @@ fn card_heading(prefix: &'static str, value: impl IntoElement, p: &Palette) -> D
                 .px_3()
                 .pt_2()
                 .bg(p.bg)
-                .font_family(kit::MONO)
-                .text_xs()
+                .font_family(mono.clone())
+                .text_size(kit::mono_px_at(scale, 12.))
                 .child(div().flex_none().text_color(p.dim).child(prefix))
                 .child(
                     div()
@@ -1795,7 +1836,9 @@ fn scroll_area(
     let area = div()
         .id(SharedString::from(key.clone()))
         .w_full()
-        .max_h(px(max_h))
+        // The blocks hold code and are so many code lines tall: they follow
+        // the code size, like the lines in them.
+        .max_h(rc.mono_px(max_h))
         .track_scroll(&handle)
         .map(|el| match axis {
             ScrollbarAxis::Vertical => el.overflow_y_scroll(),
@@ -1910,7 +1953,7 @@ fn render_skill_content(call: &ToolCall, skill: &SkillContent<'_>, rc: &RenderCt
                     .child(div().text_color(p.dim).child("Location"))
                     .child(
                         div()
-                            .font_family(kit::MONO)
+                            .font_family(rc.mono.clone())
                             .text_color(p.muted)
                             .child(skill.base_path.to_string()),
                     ),
@@ -1924,7 +1967,7 @@ fn render_skill_content(call: &ToolCall, skill: &SkillContent<'_>, rc: &RenderCt
                     .child(div().text_color(p.dim).child("Sample files"))
                     .child(
                         div()
-                            .font_family(kit::MONO)
+                            .font_family(rc.mono.clone())
                             .text_color(p.muted)
                             .child(files.to_string()),
                     ),
@@ -2056,8 +2099,8 @@ fn delegate_pill(call: &ToolCall, target: String, rc: &RenderCtx) -> AnyElement 
         .py(px(1.))
         .rounded_full()
         .bg(p.chip)
-        .font_family(kit::MONO)
-        .text_xs()
+        .font_family(rc.mono.clone())
+        .text_size(rc.mono_px(12.))
         .text_color(p.muted)
         .child(kit::icon(IconName::ArrowUpRight, 12., p.muted))
         .child(target.clone());
@@ -2120,7 +2163,7 @@ fn attached_content(call: &ToolCall, rc: &RenderCtx) -> Div {
                 let (text, more) =
                     clipped_with_more(&call.id, output, rc.density.output_lines(), rc);
                 el.child(
-                    flat_block(text, p)
+                    flat_block(text, p, &rc.mono, rc.mono_scale)
                         .border_t_1()
                         .border_color(p.border)
                         .text_color(p.danger),
@@ -2132,7 +2175,9 @@ fn attached_content(call: &ToolCall, rc: &RenderCtx) -> Div {
         // The header shows the command truncated; the full one heads the output.
         let cmd = call.command().unwrap_or_default();
         return body
-            .when(!cmd.is_empty(), |el| el.child(card_heading("$", cmd, p)))
+            .when(!cmd.is_empty(), |el| {
+                el.child(card_heading("$", cmd, p, &rc.mono, rc.mono_scale))
+            })
             .child(if output.trim().is_empty() {
                 flat_note(
                     if call.running() {
@@ -2146,7 +2191,8 @@ fn attached_content(call: &ToolCall, rc: &RenderCtx) -> Div {
             } else {
                 let (text, more) =
                     clipped_with_more(&call.id, output, rc.density.output_lines(), rc);
-                let block = flat_block(text, p).when(call.failed(), |el| el.text_color(p.danger));
+                let block = flat_block(text, p, &rc.mono, rc.mono_scale)
+                    .when(call.failed(), |el| el.text_color(p.danger));
                 v_flex()
                     .w_full()
                     .child(scroll_area(
@@ -2176,7 +2222,7 @@ fn attached_content(call: &ToolCall, rc: &RenderCtx) -> Div {
             .into_any_element()
         } else {
             let (text, more) = clipped_with_more(id, output, rc.density.read_lines(), rc);
-            let block = flat_frame(p)
+            let block = flat_frame(p, &rc.mono, rc.mono_scale)
                 .when(call.failed(), |el| el.text_color(p.danger))
                 .child(linked_text(
                     SharedString::from(format!("fetch-out-{id}")),
@@ -2209,7 +2255,7 @@ fn attached_content(call: &ToolCall, rc: &RenderCtx) -> Div {
     if call.failed() {
         let (text, more) = clipped_with_more(&call.id, output, rc.density.output_lines(), rc);
         return body
-            .child(flat_block(text, p).text_color(p.danger))
+            .child(flat_block(text, p, &rc.mono, rc.mono_scale).text_color(p.danger))
             .children(more);
     }
     let path = call.summary();
@@ -2221,6 +2267,8 @@ fn attached_content(call: &ToolCall, rc: &RenderCtx) -> Div {
         true,
         &rc.syntax,
         p,
+        &rc.mono,
+        rc.mono_scale,
     );
     body.child(scroll_area(
         format!("read-scroll-{}", call.id),
@@ -2300,8 +2348,8 @@ fn render_expansion(item_key: &str, expansion: &str, rc: &RenderCtx) -> AnyEleme
         .bg(p.card)
         .border_1()
         .border_color(p.border)
-        .font_family(kit::MONO)
-        .text_xs()
+        .font_family(rc.mono.clone())
+        .text_size(rc.mono_px(12.))
         .text_color(p.muted)
         .child(expansion.to_owned())
         .into_any_element()
@@ -2452,7 +2500,7 @@ fn render_tool(call: &ToolCall, rc: &RenderCtx) -> AnyElement {
                         .id(SharedString::from(format!("fetch-link-{}", call.id)))
                         .min_w_0()
                         .truncate()
-                        .font_family(kit::MONO)
+                        .font_family(rc.mono.clone())
                         .text_color(p.dim)
                         .cursor_pointer()
                         .hover(|s| s.underline())
@@ -2468,7 +2516,7 @@ fn render_tool(call: &ToolCall, rc: &RenderCtx) -> AnyElement {
                 .flex_1()
                 .min_w_0()
                 .truncate()
-                .font_family(kit::MONO)
+                .font_family(rc.mono.clone())
                 .text_color(p.dim)
                 .child(compact(&tool_preview(call, &rc.cwd)))
                 .into_any_element(),
@@ -2477,7 +2525,7 @@ fn render_tool(call: &ToolCall, rc: &RenderCtx) -> AnyElement {
             el.child(
                 h_flex()
                     .gap_1()
-                    .font_family(kit::MONO)
+                    .font_family(rc.mono.clone())
                     .when(adds > 0, |el| {
                         el.child(div().text_color(p.success).child(format!("+{adds}")))
                     })
@@ -3172,9 +3220,9 @@ fn turn_actions(
                     .py(px(4.5))
                     .rounded_full()
                     .bg(p.chip)
-                    .font_family(kit::MONO)
-                    .text_size(px(10.9))
-                    .line_height(px(10.9))
+                    .font_family(rc.mono.clone())
+                    .text_size(rc.mono_px(10.9))
+                    .line_height(rc.mono_px(10.9))
                     .font_semibold()
                     .text_color(p.dim)
                     .child(kit::icon(IconName::Diff, 13., p.dim))
@@ -3365,7 +3413,7 @@ fn render_item(ix: usize, item: &Item, rc: &RenderCtx) -> AnyElement {
                                                             "user-command-name".into()
                                                         })
                                                         .flex_none()
-                                                        .font_family(kit::MONO)
+                                                        .font_family(rc.mono.clone())
                                                         .child(format!("/{}", command.name)),
                                                 )
                                                 .when(!text.is_empty(), |el| {
@@ -3751,7 +3799,7 @@ fn render_compaction(item: &Item, c: &Compaction, rc: &RenderCtx) -> AnyElement 
                             .id(SharedString::from(format!("creq-{}", item.key)))
                             .debug_selector(|| "compaction-command".into())
                             .flex_none()
-                            .font_family(kit::MONO)
+                            .font_family(rc.mono.clone())
                             .text_color(p.muted)
                             .child("/compact"),
                     )
@@ -4012,18 +4060,23 @@ fn usage_ring(
                             div()
                                 .font_medium()
                                 .text_color(p.text)
-                                .when(exact, |el| el.text_size(px(11.)))
-                                .when(!exact, |el| el.text_size(px(16.)))
+                                .when(exact, |el| el.text_size(kit::rpx(11.)))
+                                .when(!exact, |el| el.text_size(kit::rpx(16.)))
                                 .child(value),
                         )
-                        .child(div().text_size(px(11.)).text_color(p.muted).child(label)),
+                        .child(
+                            div()
+                                .text_size(kit::rpx(11.))
+                                .text_color(p.muted)
+                                .child(label),
+                        ),
                 ),
         )
         .child(
             div()
-                .h(px(16.))
-                .text_size(px(11.))
-                .font_family(kit::MONO)
+                .h(kit::rpx(16.))
+                .text_size(kit::rpx(11.))
+                .font_family(kit::mono_family(cx))
                 .text_color(p.dim)
                 .truncate()
                 .child(caption),
@@ -4633,7 +4686,7 @@ impl SessionPane {
                 .child(div().truncate().child(workspace_name(&view.cwd)))
                 .when(done, |el| el.child(copied_badge(p)))
                 .tooltip(move |window, cx| {
-                    copy_tooltip(tip.clone(), "Click to copy path", dim, false).build(window, cx)
+                    copy_tooltip(tip.clone(), "Click to copy path", dim, None).build(window, cx)
                 })
                 .on_mouse_down(MouseButton::Left, kit::claim_press)
                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -4659,7 +4712,8 @@ impl SessionPane {
                     )
                 })
                 .tooltip(move |window, cx| {
-                    copy_tooltip(tip.clone(), "Click to copy session ID", dim, true)
+                    let mono = Some(kit::mono_family(cx));
+                    copy_tooltip(tip.clone(), "Click to copy session ID", dim, mono)
                         .build(window, cx)
                 })
                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -4741,7 +4795,8 @@ impl SessionPane {
         // Usage widget, ported from the desktop app's `SessionUsageBar`: context
         // meter, latest-request / session-total token rings, cost, active time.
         let details_panel = (self.details_open && self.density.has_panels()).then(|| {
-            let mono = |el: Div| el.font_family(kit::MONO);
+            let mono_font = kit::mono_family(cx);
+            let mono = move |el: Div| el.font_family(mono_font.clone());
             let section_rule = || kit::divider(p).bg(p.border.opacity(0.6));
 
             // ---- worktree (desktop details list: branch, checkout, baseline, state)
@@ -4976,7 +5031,7 @@ impl SessionPane {
                 .child(
                     h_flex()
                         .justify_between()
-                        .child(div().text_size(px(11.)).font_semibold().text_color(p.dim).child("SESSION"))
+                        .child(div().text_size(kit::rpx(11.)).font_semibold().text_color(p.dim).child("SESSION"))
                         .child(h_flex().gap_1p5().text_xs().font_medium().text_color(p.text).child(kit::dot(status_color)).child(status_label)),
                 )
                 .when_some(worktree, |el, w| el.child(w).child(section_rule()))
@@ -5207,7 +5262,7 @@ impl SessionPane {
                 ))
                 .child(
                     div()
-                        .font_family(kit::MONO)
+                        .font_family(kit::mono_family(cx))
                         .child(format!("{done}/{total}")),
                 )
                 .when(!open, |el| {
@@ -5256,7 +5311,7 @@ impl SessionPane {
                             .pb_1()
                             .child(
                                 div()
-                                    .text_size(px(11.))
+                                    .text_size(kit::rpx(11.))
                                     .font_semibold()
                                     .text_color(p.dim)
                                     .child("PLAN"),
@@ -5264,7 +5319,7 @@ impl SessionPane {
                             .child(
                                 div()
                                     .text_xs()
-                                    .font_family(kit::MONO)
+                                    .font_family(kit::mono_family(cx))
                                     .text_color(p.muted)
                                     .child(format!("{done}/{total}")),
                             ),
@@ -5459,7 +5514,7 @@ impl SessionPane {
             .map(|list| self.render_slash_list(&list, p, cx));
         let slash_hint = self
             .slash_hint(cx)
-            .map(|(name, hint)| self.render_slash_hint(name, hint, p));
+            .map(|(name, hint)| self.render_slash_hint(name, hint, p, cx));
         let running = view.running();
         let loading = view.loading;
         let has_text = !self.prompt.read(cx).value().trim().is_empty();
@@ -5840,6 +5895,9 @@ impl SessionPane {
             md: self.transcript.md.clone(),
             tool_content: open.supports_tool_content(),
             developer: store.prefs.developer_mode,
+            rem: window.rem_size(),
+            mono: kit::mono_family(cx),
+            mono_scale: kit::mono_scale(cx),
         });
         self.transcript.sync(&key, &view.items, &rc);
         if !self.transcript.scroll_hooked {
@@ -5904,8 +5962,8 @@ impl SessionPane {
                     .bg(p.card)
                     .border_1()
                     .border_color(p.border)
-                    .font_family(kit::MONO)
-                    .text_xs()
+                    .font_family(kit::mono_family(cx))
+                    .text_size(kit::mono_px(cx, 12.))
                     .text_color(p.muted)
                     .whitespace_normal()
                     .children(
@@ -6149,7 +6207,7 @@ impl SessionPane {
                 act_full.clone().or_else(|| act_preview.clone())
             };
             let can_cancel = running && !waiting;
-            let (dim, mono) = (p.dim, kit::MONO);
+            let (dim, mono) = (p.dim, kit::mono_family(cx));
             halo_pill(h_flex().id("activity-bar"))
                 .min_w_0()
                 .max_w_full()
@@ -6163,7 +6221,7 @@ impl SessionPane {
                 .child(
                     h_flex()
                         .min_w_0()
-                        .text_size(px(12.5))
+                        .text_size(kit::rpx(12.5))
                         .font_semibold()
                         .text_color(p.text)
                         .child(div().flex_none().child(if waiting {
@@ -6186,7 +6244,7 @@ impl SessionPane {
                     el.child(
                         div()
                             .flex_none()
-                            .text_size(px(11.2))
+                            .text_size(kit::rpx(11.2))
                             .text_color(p.dim)
                             .child("Respond below to continue."),
                     )
@@ -6194,12 +6252,13 @@ impl SessionPane {
                 .when(can_cancel || tip_cmd.is_some(), |el| {
                     el.tooltip(move |window, cx| {
                         let cmd = tip_cmd.clone();
+                        let mono = mono.clone();
                         Tooltip::element(move |_, _| {
                             v_flex()
                                 .max_w(px(512.))
                                 .gap_1()
                                 .when_some(cmd.clone(), |el, c| {
-                                    el.child(div().font_family(mono).text_xs().child(c))
+                                    el.child(div().font_family(mono.clone()).text_xs().child(c))
                                 })
                                 .when(can_cancel, |el| {
                                     el.child(div().text_color(dim).child("Double Esc to cancel"))
@@ -6236,7 +6295,7 @@ impl SessionPane {
                 ))
                 .child(
                     div()
-                        .text_size(px(12.5))
+                        .text_size(kit::rpx(12.5))
                         .font_semibold()
                         .text_color(p.text)
                         .child(count.to_string()),
@@ -6272,7 +6331,7 @@ impl SessionPane {
                             .flex_none()
                             .gap_1()
                             .h(px(20.))
-                            .text_size(px(10.2))
+                            .text_size(kit::rpx(10.2))
                             .font_semibold()
                             .text_color(p.warn)
                             .child(kit::icon(
@@ -6290,8 +6349,8 @@ impl SessionPane {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .text_size(px(11.8))
-                            .line_height(px(20.))
+                            .text_size(kit::rpx(11.8))
+                            .line_height(kit::rpx(20.))
                             .text_color(p.text)
                             .child(if input.text.is_empty() {
                                 format!("{} attachment(s)", input.attachments)
@@ -6368,24 +6427,29 @@ impl SessionPane {
         // (40px at the pill, 29px at the bar). The slot keeps the last message
         // clear of the dock row; the waiting panel grows upward over the
         // transcript like a popover.
-        let dock = div().relative().flex_none().h(px(DOCK_ROW_H)).child(
-            v_flex()
-                .absolute()
-                .left_0()
-                .right_0()
-                .bottom_0()
-                .gap_2()
-                .children(waiting_panel)
-                .child(
-                    h_flex()
-                        .px_1()
-                        .gap(px(6.4))
-                        .min_w_0()
-                        .children(waiting_bubble)
-                        .children(activity_bar)
-                        .children(scroll_pill),
-                ),
-        );
+        let dock = div()
+            .relative()
+            .flex_none()
+            .h(kit::rpx(DOCK_ROW_H))
+            .debug_selector(|| "dock-row".into())
+            .child(
+                v_flex()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .gap_2()
+                    .children(waiting_panel)
+                    .child(
+                        h_flex()
+                            .px_1()
+                            .gap(px(6.4))
+                            .min_w_0()
+                            .children(waiting_bubble)
+                            .children(activity_bar)
+                            .children(scroll_pill),
+                    ),
+            );
 
         // ---- requests + composer
         let mcp_notice = self.mcp_notice(&p, cx);
@@ -7064,6 +7128,146 @@ mod compact_tests {
         (handle, pane)
     }
 
+    fn set_rem(cx: &mut gpui_kit::TestAppContext, handle: gpui_kit::AnyWindowHandle, rem: f32) {
+        use gpui_kit::test::TestWindowExt as _;
+        // The zoom control: Root sets every window's rem from the theme's
+        // base font size each frame.
+        cx.update(|cx| gpui_kit::component::Theme::update(cx, |t| t.font_size = gpui_kit::px(rem)));
+        cx.update_window(handle, |_, window, cx| {
+            window.refresh();
+            window.render_frame(cx);
+        })
+        .unwrap();
+    }
+
+    // appearance / Font size: text-paired heights follow the rem size
+    #[gpui_kit::test]
+    fn the_dock_row_grows_with_the_rem_size(cx: &mut gpui_kit::TestAppContext) {
+        let (handle, _pane) = pane(cx, 1, Density::Comfortable);
+        // The default, and the interface size's range with sizes between.
+        for rem in [16., 10., 12., 20., 24., 32.] {
+            set_rem(cx, handle, rem);
+            let mut vcx = gpui_kit::VisualTestContext::from_window(handle, cx);
+            let dock = vcx.debug_bounds("dock-row").expect("the dock row");
+            assert_eq!(
+                f32::from(dock.size.height),
+                super::DOCK_ROW_H * rem / 16.,
+                "rem {rem}"
+            );
+        }
+    }
+
+    // appearance / Font size: tool output lines keep the code size's line
+    // box whatever the interface size; only the padding follows the rem
+    #[gpui_kit::test]
+    fn tool_output_padding_follows_the_rem_size(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::{AvailableSpace, InteractiveElement as _, point, px, size};
+        let p = crate::theme::Palette::dark();
+        let mono: gpui_kit::SharedString = "IBM Plex Mono".into();
+        let vcx = cx.add_empty_window();
+        let mut heights = Vec::new();
+        for rem in [16., 12., 20., 24.] {
+            vcx.update(|window, _| window.set_rem_size(px(rem)));
+            vcx.draw(
+                point(px(0.), px(0.)),
+                size(
+                    AvailableSpace::Definite(px(400.)),
+                    AvailableSpace::Definite(px(600.)),
+                ),
+                |_, _| {
+                    super::flat_block("a\nb\nc".into(), &p, &mono, 1.)
+                        .debug_selector(|| "tool-lines".into())
+                },
+            );
+            let block = vcx.debug_bounds("tool-lines").expect("the block");
+            heights.push(f32::from(block.size.height));
+        }
+        // Three lines of TOOL_LINE_H (the code size's, absolute) and the
+        // block's py_2 (rem-based padding, 1 rem in all).
+        assert_eq!(heights[0], 3. * super::TOOL_LINE_H + 16.);
+        for (rem, h) in [16., 12., 20., 24.].into_iter().zip(&heights) {
+            assert_eq!(*h, 3. * super::TOOL_LINE_H + rem, "rem {rem}");
+        }
+    }
+
+    // appearance / Code size: code text and its line box follow the code
+    // size, absolute (not the rem size); the default is exactly the old
+    // layout.
+    #[gpui_kit::test]
+    fn tool_output_lines_grow_with_the_code_size(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::{AvailableSpace, InteractiveElement as _, point, px, size};
+        let p = crate::theme::Palette::dark();
+        let mono: gpui_kit::SharedString = "IBM Plex Mono".into();
+        let vcx = cx.add_empty_window();
+        let mut at = |rem: f32, scale: f32| {
+            vcx.update(|window, _| window.set_rem_size(px(rem)));
+            vcx.draw(
+                point(px(0.), px(0.)),
+                size(
+                    AvailableSpace::Definite(px(400.)),
+                    AvailableSpace::Definite(px(600.)),
+                ),
+                |_, _| {
+                    super::flat_block("a\nb\nc".into(), &p, &mono, scale)
+                        .debug_selector(|| "tool-lines".into())
+                },
+            );
+            f32::from(
+                vcx.debug_bounds("tool-lines")
+                    .expect("the block")
+                    .size
+                    .height,
+            )
+        };
+        // Padding is the interface's (rem); the three lines are the code's.
+        // Layout snaps to the device's pixels: within one of them.
+        let near = |got: f32, want: f32, what: &str| {
+            assert!((got - want).abs() <= 1., "{what}: {got} for {want}");
+        };
+        let default = at(16., 1.);
+        assert_eq!(default, 3. * super::TOOL_LINE_H + 16.);
+        near(
+            at(16., 20. / 13.),
+            3. * super::TOOL_LINE_H * 20. / 13. + 16.,
+            "20 px",
+        );
+        near(
+            at(16., 8. / 13.),
+            3. * super::TOOL_LINE_H * 8. / 13. + 16.,
+            "8 px",
+        );
+        // The code size is absolute: a larger interface only grows the
+        // padding ("Code size 14" at interface 20 is still 14 px code).
+        near(
+            at(24., 2.),
+            3. * super::TOOL_LINE_H * 2. + 16. * 24. / 16.,
+            "rem 24, scale 2",
+        );
+        near(
+            at(20., 14. / 13.),
+            3. * super::TOOL_LINE_H * 14. / 13. + 20.,
+            "rem 20, 14 px",
+        );
+    }
+
+    // appearance / Code size: rows depend on the code size, so it is in the
+    // key that decides when they are measured again.
+    #[gpui_kit::test]
+    fn the_code_size_is_part_of_the_row_key(cx: &mut gpui_kit::TestAppContext) {
+        use std::hash::{DefaultHasher, Hasher as _};
+        let (_, mut rc) = agent_reply(cx, Density::Comfortable);
+        let mut key = |scale: f32| {
+            rc.mono_scale = scale;
+            let mut h = DefaultHasher::new();
+            rc.hash_globals(&mut h);
+            h.finish()
+        };
+        let default = key(1.);
+        assert_eq!(default, key(1.));
+        assert_ne!(default, key(14. / 13.));
+        assert_ne!(key(14. / 13.), key(16. / 13.));
+    }
+
     fn expand(
         cx: &mut gpui_kit::TestAppContext,
         handle: gpui_kit::AnyWindowHandle,
@@ -7286,6 +7490,9 @@ mod compact_tests {
             md: Default::default(),
             tool_content: false,
             developer: false,
+            rem: gpui_kit::px(16.),
+            mono: super::kit::mono_family(cx),
+            mono_scale: super::kit::mono_scale(cx),
         });
         (item, rc)
     }
@@ -7376,7 +7583,7 @@ mod compact_tests {
         p.bg = gpui_kit::red();
         p.muted = gpui_kit::green();
         p.border = gpui_kit::blue();
-        let mut block = super::code_block("let x = 1;".into(), &p);
+        let mut block = super::code_block("let x = 1;".into(), &p, &"IBM Plex Mono".into(), 1.);
         let style = block.style();
         assert_eq!(style.background, Some(p.bg.into()));
         assert_eq!(style.border_color, Some(p.border));

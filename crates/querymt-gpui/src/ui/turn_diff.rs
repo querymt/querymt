@@ -354,7 +354,7 @@ impl SessionPane {
                     .flex_1()
                     .min_w_0()
                     .gap_2()
-                    .text_size(px(12.5))
+                    .text_size(kit::rpx(12.5))
                     .child(div().font_medium().text_color(p.text).child(match count {
                         0 => "Turn changes".to_string(),
                         1 => "1 file".to_string(),
@@ -364,8 +364,8 @@ impl SessionPane {
                         el.child(
                             h_flex()
                                 .gap_1p5()
-                                .font_family(kit::MONO)
-                                .text_size(px(11.))
+                                .font_family(kit::mono_family(cx))
+                                .text_size(kit::mono_px(cx, 11.))
                                 .font_semibold()
                                 .child(div().text_color(p.success).child(format!("+{added}")))
                                 .child(div().text_color(p.danger).child(format!("-{removed}"))),
@@ -478,8 +478,8 @@ impl SessionPane {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .font_family(kit::MONO)
-                    .text_size(px(11.5))
+                    .font_family(kit::mono_family(cx))
+                    .text_size(kit::mono_px(cx, 11.5))
                     .text_color(p.text)
                     .child(file.path.clone()),
             )
@@ -487,8 +487,8 @@ impl SessionPane {
                 h_flex()
                     .flex_none()
                     .gap_1p5()
-                    .font_family(kit::MONO)
-                    .text_size(px(11.))
+                    .font_family(kit::mono_family(cx))
+                    .text_size(kit::mono_px(cx, 11.))
                     .font_semibold()
                     .child(
                         div()
@@ -555,8 +555,8 @@ impl SessionPane {
                                     .bg(p.chip.opacity(0.5))
                                     .border_b_1()
                                     .border_color(p.border.opacity(0.6))
-                                    .font_family(kit::MONO)
-                                    .text_size(px(10.6))
+                                    .font_family(kit::mono_family(cx))
+                                    .text_size(kit::mono_px(cx, 10.6))
                                     .font_medium()
                                     .text_color(p.dim)
                                     .child(kit::icon(IconName::GitCommitHorizontal, 13., p.muted))
@@ -566,9 +566,9 @@ impl SessionPane {
                         .child(
                             v_flex()
                                 .w_full()
-                                .line_height(px(TOOL_LINE_H))
-                                .font_family(kit::MONO)
-                                .text_xs()
+                                .line_height(kit::mono_px(cx, TOOL_LINE_H))
+                                .font_family(kit::mono_family(cx))
+                                .text_size(kit::mono_px(cx, 12.))
                                 .children(rows),
                         )
                         .when(hidden > 0, |el| {

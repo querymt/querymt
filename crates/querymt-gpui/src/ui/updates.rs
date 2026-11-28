@@ -196,7 +196,7 @@ impl QmtApp {
             .debug_selector(|| "update-release-link".into())
             .flex_none()
             .cursor_pointer()
-            .text_size(px(12.))
+            .text_size(kit::rpx(12.))
             .text_color(p.accent)
             .underline()
             .child("Release page")

@@ -277,7 +277,7 @@ impl QmtApp {
                     .px(px(9.))
                     .py(px(5.))
                     .rounded(px(8.))
-                    .text_size(px(12.5))
+                    .text_size(kit::rpx(12.5))
                     .text_color(if current {
                         p.text
                     } else if done {
@@ -296,7 +296,7 @@ impl QmtApp {
                             .w(px(16.))
                             .flex()
                             .justify_center()
-                            .text_size(px(11.5))
+                            .text_size(kit::rpx(11.5))
                             .child(if done {
                                 kit::icon(IconName::Check, 13., p.accent).into_any_element()
                             } else {
@@ -387,7 +387,7 @@ impl QmtApp {
                                 .id("setup-skip-all")
                                 .px_1p5()
                                 .cursor_pointer()
-                                .text_size(px(12.5))
+                                .text_size(kit::rpx(12.5))
                                 .text_color(quiet)
                                 .hover(move |s| s.text_color(text))
                                 .child("Skip setup")
@@ -490,8 +490,8 @@ impl QmtApp {
                 v_flex()
                     .items_center()
                     .gap_0p5()
-                    .font_family(kit::MONO)
-                    .text_size(px(11.8))
+                    .font_family(kit::mono_family(cx))
+                    .text_size(kit::rpx(11.8))
                     .children(log),
             );
 

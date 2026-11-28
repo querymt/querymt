@@ -4,12 +4,19 @@
 
 mod accent;
 mod catalogue;
+mod fonts;
 
 use gpui_kit::component::{Theme, ThemeMode, ThemeRegistry};
 use gpui_kit::{App, Global, Hsla, px, rgb, rgba};
 
 pub use accent::{Accent, Appearance, Preset};
 pub use catalogue::{ThemeId, syntax};
+#[cfg(test)]
+pub use fonts::resolve as resolve_typography;
+pub use fonts::{
+    DEFAULT_MONO_FAMILY, DEFAULT_MONO_SIZE, DEFAULT_UI_FAMILY, FontCatalog, FontPrefs, Installed,
+    MONO_SIZE_RANGE, ThemeFonts, Typography, UI_SIZE_RANGE, clamp_size,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Palette {
@@ -122,10 +129,49 @@ pub fn palette(cx: &App) -> &Palette {
     cx.global::<Palette>()
 }
 
-/// Show `appearance`: set the palette, install the theme's kit config, then
-/// write the app's own tokens over it (design D7).
+/// The type the theme `id` shows when the user has chosen nothing: its own
+/// settings over the app defaults. What "Theme default" means in settings.
+pub fn theme_typography(id: ThemeId, cx: &mut App) -> Typography {
+    fonts::resolve_installed(&FontPrefs::default(), &id.fonts(), false, cx)
+}
+
+/// The type in force: the kit theme's fonts, as [`apply_with`] set them.
+pub fn typography(cx: &App) -> Typography {
+    let t = Theme::global(cx);
+    Typography {
+        ui_family: t.font_family.clone(),
+        ui_size: f32::from(t.font_size),
+        mono_family: t.mono_font_family.clone(),
+        mono_size: f32::from(t.mono_font_size),
+    }
+}
+
+/// [`apply_with`] with no user font choices: the theme's own type over the
+/// app defaults. The app itself always has choices to pass (the tests and the
+/// film scenes do not).
+#[cfg(test)]
 pub fn apply(appearance: Appearance, cx: &mut App) {
+    apply_with(appearance, &FontPrefs::default(), cx);
+}
+
+/// Show `appearance`: set the palette, install the theme's kit config, then
+/// write the app's own tokens over it (design D7). Each of the four type
+/// fields is the user's setting in `fonts`, else the theme's, else the app
+/// default; families that are not installed are skipped (see [`fonts`]).
+pub fn apply_with(appearance: Appearance, fonts: &FontPrefs, cx: &mut App) {
+    apply_resolved(appearance, fonts, &appearance.theme.fonts(), cx);
+}
+
+/// [`apply_with`] with the theme's type given (tests name fonts no bundled
+/// theme file sets).
+fn apply_resolved(
+    appearance: Appearance,
+    fonts: &FontPrefs,
+    theme_fonts: &ThemeFonts,
+    cx: &mut App,
+) {
     let id = appearance.theme;
+    let typography = fonts::resolve_installed(fonts, theme_fonts, true, cx);
     let dark = appearance.dark();
     let p = appearance.palette();
     cx.set_global(p);
@@ -152,8 +198,10 @@ pub fn apply(appearance: Appearance, cx: &mut App) {
     Theme::update(cx, |t| t.apply_config(&config));
     let syntax = id.syntax();
     Theme::update(cx, |t| {
-        t.font_family = "IBM Plex Sans".into();
-        t.mono_font_family = "IBM Plex Mono".into();
+        t.font_family = typography.ui_family.clone();
+        t.font_size = px(typography.ui_size);
+        t.mono_font_family = typography.mono_family.clone();
+        t.mono_font_size = px(typography.mono_size);
         t.radius = px(8.);
         t.radius_lg = px(12.);
         t.window_radius = if cfg!(target_os = "linux") {

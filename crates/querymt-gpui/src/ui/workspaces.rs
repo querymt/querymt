@@ -478,7 +478,7 @@ impl QmtApp {
                                     .min_w_0()
                                     .child(
                                         div()
-                                            .text_size(px(13.4))
+                                            .text_size(kit::rpx(13.4))
                                             .font_semibold()
                                             .truncate()
                                             .child(workspace_name(&row.path)),
@@ -490,7 +490,7 @@ impl QmtApp {
                                     .id(kit::keyed("workspace-path", key.clone()))
                                     .mt(px(2.))
                                     .text_xs()
-                                    .font_family(kit::MONO)
+                                    .font_family(kit::mono_family(cx))
                                     .text_color(p.muted)
                                     .truncate()
                                     .child(row.path.clone())
