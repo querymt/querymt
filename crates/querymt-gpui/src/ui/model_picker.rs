@@ -1442,8 +1442,8 @@ mod tests {
 
     #[gpui_kit::test]
     fn a_nameless_node_shows_its_short_peer_id(cx: &mut TestAppContext) {
-        let peer = "12D3KooWLCvKmZTEXHWcXgXF89NHvQcB2fezfSX9BpKp3jXLW";
-        let named = "12D3KooWDfXhAAAAAAAAAAAAAAAAAAAAAAAAAAAAA4uPwJieh";
+        let peer = "12D3KooWAbCdEfGhIjKlMnOpQrStUvWxYz1234";
+        let named = "12D3KooWZyXwVuTsRqPoNmLkJiHgFeDcBa9876";
         let rig = rig(cx, 0, Page::Start, |store| {
             crate::store::launch::add_models_for_test(
                 store,
@@ -1454,15 +1454,18 @@ mod tests {
                       "provider": "codex", "node_id": named },
                 ]),
             );
-            crate::store::launch::set_mesh_nodes_for_test(store, &[(named, "klbr")]);
+            crate::store::launch::set_mesh_nodes_for_test(store, &[(named, "peer-beta")]);
         });
         let heads = headings(cx, &rig);
         assert!(
-            heads.contains(&"codex · 12D3KooWLCvK...pKp3jXLW".to_string()),
+            heads.contains(&"codex · 12D3KooWAbCd\u{2026}WxYz1234".to_string()),
             "{heads:?}"
         );
         // The mesh's own name wins over the id.
-        assert!(heads.contains(&"codex · klbr".to_string()), "{heads:?}");
+        assert!(
+            heads.contains(&"codex · peer-beta".to_string()),
+            "{heads:?}"
+        );
         // The full id still finds it.
         search(cx, &rig, peer);
         assert_eq!(listed(cx, &rig), ["codex/gpt-6.2-sol"]);
