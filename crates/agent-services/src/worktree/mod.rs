@@ -23,6 +23,7 @@
 pub mod allocate;
 pub mod apply;
 pub mod capture;
+mod capture_scan;
 pub use querymt_agent_core::worktree::domain;
 pub mod error;
 pub mod finalize;
@@ -51,7 +52,8 @@ pub mod test_support;
 
 pub use allocate::{BaselineSource, RecoveredWorkspace, WorkspaceAllocator, checkout_path_for};
 pub use capture::{
-    CaptureRetryPolicy, CapturedState, capture_working_state, capture_working_state_validated,
+    CaptureRetryPolicy, CaptureStats, CapturedState, capture_working_state,
+    capture_working_state_validated,
 };
 pub use domain::{
     Baseline, BaselineMode, ChangeKind, ChangedPath, DelegationIsolation, ExecutionMode,
