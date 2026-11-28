@@ -111,6 +111,17 @@ fn parse_zone_tab(tab: &str) -> Vec<String> {
         .collect()
 }
 
+/// A mesh peer id shortened for display: `12D3KooWPtRj...unWZUT62`.
+pub fn short_peer(id: &str) -> String {
+    let chars: Vec<char> = id.chars().collect();
+    if chars.len() <= 24 {
+        return id.to_string();
+    }
+    let head: String = chars[..12].iter().collect();
+    let tail: String = chars[chars.len() - 8..].iter().collect();
+    format!("{head}...{tail}")
+}
+
 pub fn workspace_name(cwd: &str) -> String {
     cwd.trim_end_matches(['/', '\\'])
         .rsplit(['/', '\\'])

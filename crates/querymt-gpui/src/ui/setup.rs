@@ -680,15 +680,23 @@ impl QmtApp {
                 self.model_picker
                     .update(cx, |picker, cx| picker.search(&agent, p, cx)),
             )
-            .child(
-                v_flex()
+            .child({
+                let list = v_flex()
                     .id("setup-model-list")
-                    .h(px(MODEL_LIST_H))
+                    .flex_1()
+                    .min_h_0()
                     .overflow_y_scroll()
                     .track_scroll(&self.model_picker.read(cx).scroll_handle())
                     .children(rows)
-                    .map(|el| self.smooth_scroll.region("setup-model-list", el)),
-            )
+                    .map(|el| self.smooth_scroll.region("setup-model-list", el));
+                // On the setup card's fill.
+                let surface = p.surface;
+                v_flex()
+                    .h(px(MODEL_LIST_H))
+                    .child(self.model_picker.update(cx, |picker, cx| {
+                        picker.pinned_list(list, surface, px(0.), cx)
+                    }))
+            })
     }
 
     fn setup_done(&self, readiness: &Readiness, p: &Palette) -> Div {

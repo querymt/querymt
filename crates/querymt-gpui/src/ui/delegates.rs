@@ -13,7 +13,7 @@ use super::kit::ButtonExt as _;
 use super::{QmtApp, kit};
 use crate::session::open::SessionKey;
 use crate::store::delegates::{Assignment, DelegateState, Orphan, REASONING, Route, RouteChange};
-use crate::store::find_model;
+use crate::store::{Model, find_model};
 use crate::theme::{Palette, palette};
 
 /// Height of the delegate's model list.
@@ -403,7 +403,15 @@ impl QmtApp {
         cx: &mut Context<Self>,
     ) -> Div {
         let store = self.store.read(cx);
-        let models = store.models(owner).to_vec();
+        // Nodes by name, else by short peer id.
+        let models: Vec<Model> = store
+            .models(owner)
+            .iter()
+            .map(|m| Model {
+                node: store.model_node_name(owner, m),
+                ..m.clone()
+            })
+            .collect();
         let busy = state.pending.is_some() || state.loading;
         let mut out = v_flex().gap_3();
         if state.conflict {
@@ -531,9 +539,12 @@ impl QmtApp {
                         .and_then(|r| models.iter().find(|m| m.key() == r.key()));
                     let unavailable = a.route.is_some() && model.is_none();
                     // The peer's name from the catalog, else the route's node id.
-                    let peer = model
-                        .and_then(|m| m.node.clone())
-                        .or_else(|| a.route.as_ref().and_then(|r| r.node_id.clone()));
+                    let peer = model.and_then(|m| m.node.clone()).or_else(|| {
+                        a.route
+                            .as_ref()
+                            .and_then(|r| r.node_id.as_deref())
+                            .map(crate::util::short_peer)
+                    });
                     kit::card_row(ix == 0, p)
                         .id(kit::keyed("delegate-row", a.agent_id.clone()))
                         .when(enabled, |el| {
@@ -795,16 +806,21 @@ impl QmtApp {
                 )
             }))
             .child(search)
-            .child(
-                v_flex()
+            .child({
+                let list = v_flex()
                     .id("delegate-model-list")
-                    .h(px(LIST_H))
+                    .flex_1()
+                    .min_h_0()
                     .overflow_y_scroll()
                     .track_scroll(&self.model_picker.read(cx).scroll_handle())
                     .when(busy, |el| el.opacity(0.6))
                     .children(rows)
-                    .map(|el| self.smooth_scroll.region("delegate-model-list", el)),
-            )
+                    .map(|el| self.smooth_scroll.region("delegate-model-list", el));
+                let surface = p.surface;
+                v_flex().h(px(LIST_H)).child(self.model_picker.update(cx, |picker, cx| {
+                    picker.pinned_list(list, surface, px(0.), cx)
+                }))
+            })
             .children(reasoning)
     }
 }

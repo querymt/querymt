@@ -15,7 +15,7 @@ use gpui_kit::component::{StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use super::kit::{self, ButtonExt as _};
@@ -26,6 +26,12 @@ use crate::theme::{Palette, palette};
 
 /// Rows shown per provider group before "N more" (searching shows everything).
 const GROUP_ROW_LIMIT: usize = 40;
+
+/// Label of the recently used models' group.
+const RECENT: &str = "Recent";
+
+/// Height of the fades at the list's scrolled edges.
+const EDGE_FADE_H: f32 = 14.;
 
 /// What a pick applies to.
 #[derive(Clone)]
@@ -113,8 +119,23 @@ pub(crate) struct ModelPicker {
     /// [`SHEET_MODEL_ROWS`] models (headings count as children, not models).
     /// `None`: fewer models than that, so the whole list is wanted.
     sheet_cap: Rc<Cell<Option<usize>>>,
+    /// The group headings of the last [`Self::rows`], for the sticky copy.
+    headings: RefCell<Vec<Heading>>,
+    /// Scroll offset of the last render, to re-render the sticky heading.
+    seen_offset: Rc<Cell<f32>>,
     smooth_scroll: SmoothScroll,
     _subs: Vec<Subscription>,
+}
+
+/// A group heading among the list's rows.
+#[derive(Clone)]
+struct Heading {
+    /// Index among the list's children.
+    row: usize,
+    label: String,
+    /// Provider whose icon it shows; `None`: the Recent group.
+    provider: Option<String>,
+    count: usize,
 }
 
 /// One provider group as the list shows it.
@@ -168,6 +189,8 @@ impl ModelPicker {
             palette: None,
             scroll: ScrollHandle::new(),
             sheet_cap: Rc::new(Cell::new(None)),
+            headings: RefCell::default(),
+            seen_offset: Rc::default(),
             smooth_scroll,
             _subs: subs,
         }
@@ -273,7 +296,7 @@ impl ModelPicker {
         self.sections(cx)
             .into_iter()
             .map(|(label, mut models)| {
-                let shown = if searching || label == "Recent" {
+                let shown = if searching || label == RECENT {
                     models.len()
                 } else {
                     models.len().min(GROUP_ROW_LIMIT)
@@ -366,22 +389,28 @@ impl ModelPicker {
             return vec![];
         };
         let store = self.store.read(cx);
+        // Rows and headings name a node by its name, else its short peer id.
+        let named = |m: &Model| Model {
+            node: store.model_node_name(&agent, m),
+            ..m.clone()
+        };
         let mut sections: Vec<(String, Vec<Model>)> = Vec::new();
         let mut taken = std::collections::HashSet::new();
         if query.is_empty() {
-            let recent: Vec<Model> = self
-                .recent
-                .clone()
-                .unwrap_or_else(|| store.recent_models(&agent).into_iter().cloned().collect());
+            let recent: Vec<Model> = match &self.recent {
+                Some(recent) => recent.iter().map(named).collect(),
+                None => store.recent_models(&agent).into_iter().map(named).collect(),
+            };
             if !recent.is_empty() {
                 taken.extend(recent.iter().map(Model::key));
-                sections.push(("Recent".into(), recent));
+                sections.push((RECENT.into(), recent));
             }
         }
-        let models: Vec<&Model> = store
+        let models: Vec<Model> = store
             .models(&agent)
             .iter()
             .filter(|m| !taken.contains(&m.key()))
+            .map(named)
             .collect();
         // The model's own names lead; its id (which repeats the provider as
         // a prefix), provider and node only describe where it is served.
@@ -392,11 +421,12 @@ impl ModelPicker {
             |m| {
                 let mut fields = vec![m.id.clone(), m.provider.clone()];
                 fields.extend(m.node.clone());
+                fields.extend(m.node_id.clone());
                 fields
             },
         );
         for (ix, _) in ranked {
-            let m = models[ix];
+            let m = &models[ix];
             let label = match &m.node {
                 Some(node) => format!("{} · {node}", m.provider),
                 None => m.provider.clone(),
@@ -443,6 +473,7 @@ impl ModelPicker {
         let total = pickable.len();
 
         let mut rows: Vec<AnyElement> = Vec::new();
+        let mut headings = Vec::new();
         let mut models_listed = 0;
         let mut sheet_cap = None;
         for Group {
@@ -451,30 +482,14 @@ impl ModelPicker {
             hidden,
         } in groups
         {
-            let recent = label == "Recent";
-            let group_icon: AnyElement = if recent {
-                kit::icon(IconName::Clock, 12., p.dim).into_any_element()
-            } else {
-                kit::provider_icon(&models[0].provider, 12., p.dim)
+            let heading = Heading {
+                row: rows.len(),
+                label: label.clone(),
+                provider: (label != RECENT).then(|| models[0].provider.clone()),
+                count: models.len() + hidden,
             };
-            rows.push(
-                h_flex()
-                    .gap_1p5()
-                    .px_2()
-                    .pt_3()
-                    .pb_1()
-                    .text_xs()
-                    .font_semibold()
-                    .text_color(p.dim)
-                    .child(group_icon)
-                    .child(label.clone())
-                    .child(
-                        div()
-                            .text_color(p.border_strong)
-                            .child((models.len() + hidden).to_string()),
-                    )
-                    .into_any_element(),
-            );
+            rows.push(Self::heading(&heading, &p).into_any_element());
+            headings.push(heading);
             for m in &models {
                 rows.push(self.model_row(
                     m,
@@ -502,6 +517,7 @@ impl ModelPicker {
             }
         }
         self.sheet_cap.set(sheet_cap);
+        *self.headings.borrow_mut() = headings;
         if total == 0 {
             rows.push(
                 div()
@@ -646,6 +662,132 @@ impl ModelPicker {
             )
             .on_click(cx.listener(move |this, _, _, cx| this.pick(id.clone(), cx)))
             .into_any_element()
+    }
+
+    /// A group's heading: icon, label and model count.
+    fn heading(h: &Heading, p: &Palette) -> Div {
+        let icon: AnyElement = match &h.provider {
+            Some(provider) => kit::provider_icon(provider, 12., p.dim),
+            None => kit::icon(IconName::Clock, 12., p.dim).into_any_element(),
+        };
+        h_flex()
+            .gap_1p5()
+            .px_2()
+            .pt_3()
+            .pb_1()
+            .text_xs()
+            .font_semibold()
+            .text_color(p.dim)
+            .child(icon)
+            .child(h.label.clone())
+            .child(div().text_color(p.border_strong).child(h.count.to_string()))
+    }
+
+    /// The heading of the group under the list's top edge once its own has
+    /// scrolled off, and how far the next heading pushes it up. Read from
+    /// the last layout of the rows (bounds are unscrolled).
+    fn sticky_heading(&self) -> Option<(Heading, f32)> {
+        let scrolled = -f32::from(self.scroll.offset().y);
+        if scrolled <= 0. {
+            return None;
+        }
+        let origin = f32::from(self.scroll.bounds().top());
+        let headings = self.headings.borrow();
+        let top = |h: &Heading| {
+            self.scroll
+                .bounds_for_item(h.row)
+                .map(|b| (f32::from(b.top()) - origin, f32::from(b.size.height)))
+        };
+        let at = headings
+            .iter()
+            .rposition(|h| top(h).is_some_and(|(t, _)| t < scrolled))?;
+        let (_, height) = top(&headings[at])?;
+        let push = headings
+            .get(at + 1)
+            .and_then(top)
+            .map_or(0., |(next, _)| (next - scrolled - height).min(0.));
+        Some((headings[at].clone(), push))
+    }
+
+    /// `list` (the rows' scrolling box, tracking [`Self::scroll_handle`],
+    /// with `inset` horizontal padding) on a `surface` of that colour: the
+    /// heading of the group in view stays pinned at the top, and the rows
+    /// fade out at the scrolled edges instead of being cut off. The frame
+    /// fills its parent's height.
+    pub(crate) fn pinned_list(
+        &self,
+        list: impl IntoElement,
+        surface: Hsla,
+        inset: Pixels,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let p = self.colours(cx);
+        let handle = &self.scroll;
+        let scrolled = -f32::from(handle.offset().y);
+        let below = f32::from(handle.max_offset().y) - scrolled > 0.5;
+        let sticky = self.sticky_heading();
+        // The offset moves without a render (wheel, smooth scroll):
+        // re-render once it changed so the heading and fades follow.
+        let watch = {
+            let (seen, handle, weak) = (
+                self.seen_offset.clone(),
+                self.scroll.clone(),
+                cx.entity().downgrade(),
+            );
+            canvas(
+                move |_, window, _| {
+                    let y = f32::from(handle.offset().y);
+                    if (seen.get() - y).abs() > 0.5 {
+                        seen.set(y);
+                        window.on_next_frame(move |_, cx| {
+                            let _ = weak.update(cx, |_, cx| cx.notify());
+                        });
+                    }
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_0()
+        };
+        // Plain divs have no hitbox: the wheel over them reaches the list.
+        let fade = |top: bool| {
+            div()
+                .absolute()
+                .left_0()
+                .right_0()
+                .h(px(EDGE_FADE_H))
+                .bg(linear_gradient(
+                    if top { 180. } else { 0. },
+                    linear_color_stop(surface, 0.),
+                    linear_color_stop(surface.opacity(0.), 1.),
+                ))
+        };
+        let top_fade = (scrolled > 0.).then(|| fade(true).top_0());
+        let pinned = sticky.map(|(heading, push)| {
+            div()
+                .absolute()
+                .top(px(push))
+                .left_0()
+                .right_0()
+                .debug_selector(|| "model-sticky-heading".into())
+                // The list's own horizontal padding.
+                .px(inset)
+                .bg(surface)
+                .child(Self::heading(&heading, &p))
+                // The fade hangs under the pinned heading.
+                .child(fade(true).top_full().h(px(EDGE_FADE_H)))
+        });
+        v_flex()
+            .id("model-list-frame")
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .overflow_hidden()
+            .child(list)
+            .children(if pinned.is_some() { None } else { top_fade })
+            .children(pinned)
+            .children(below.then(|| fade(false).bottom_0()))
+            .child(watch)
     }
 
     /// Search field with the refresh button, above the model rows.
@@ -895,7 +1037,18 @@ impl ModelPicker {
                         .px_2()
                         .pb(px(LIST_PAD_BOTTOM))
                         .children(rows)
-                        .map(|el| smooth_scroll.region("model-list", el)),
+                        .map(|el| smooth_scroll.region("model-list", el))
+                        // On the card's own opaque fill, the heading in view
+                        // stays pinned and the edges fade. A sheet lies on
+                        // its host's surface, which may be see-through.
+                        .map(|list| {
+                            if is_card && p.popover.a >= 1. {
+                                self.pinned_list(list, p.popover, px(8.), cx)
+                                    .into_any_element()
+                            } else {
+                                list.into_any_element()
+                            }
+                        }),
                 )
                 .children(footer)
                 .when(is_card, |el| {
@@ -1285,6 +1438,69 @@ mod tests {
         }
         assert_eq!(seen.len(), total);
         assert!(!seen.contains("bulk/m44"));
+    }
+
+    #[gpui_kit::test]
+    fn a_nameless_node_shows_its_short_peer_id(cx: &mut TestAppContext) {
+        let peer = "12D3KooWLCvKmZTEXHWcXgXF89NHvQcB2fezfSX9BpKp3jXLW";
+        let named = "12D3KooWDfXhAAAAAAAAAAAAAAAAAAAAAAAAAAAAA4uPwJieh";
+        let rig = rig(cx, 0, Page::Start, |store| {
+            crate::store::launch::add_models_for_test(
+                store,
+                json!([
+                    { "id": "codex/gpt-6.2-sol", "label": "gpt-6.2-sol",
+                      "provider": "codex", "node_id": peer },
+                    { "id": "codex/gpt-6.2-luna", "label": "gpt-6.2-luna",
+                      "provider": "codex", "node_id": named },
+                ]),
+            );
+            crate::store::launch::set_mesh_nodes_for_test(store, &[(named, "klbr")]);
+        });
+        let heads = headings(cx, &rig);
+        assert!(
+            heads.contains(&"codex · 12D3KooWLCvK...pKp3jXLW".to_string()),
+            "{heads:?}"
+        );
+        // The mesh's own name wins over the id.
+        assert!(heads.contains(&"codex · klbr".to_string()), "{heads:?}");
+        // The full id still finds it.
+        search(cx, &rig, peer);
+        assert_eq!(listed(cx, &rig), ["codex/gpt-6.2-sol"]);
+    }
+
+    #[gpui_kit::test]
+    fn the_heading_in_view_stays_pinned(cx: &mut TestAppContext) {
+        let rig = rig(cx, 30, Page::Start, |_| {});
+        let picker = picker(cx, &rig);
+        let draw = |cx: &mut TestAppContext| {
+            cx.update_window(rig.handle, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+        };
+        // At the top nothing is pinned.
+        draw(cx);
+        assert!(picker.read_with(cx, |p, _| p.sticky_heading()).is_none());
+        // Into the long `bulk` group: its heading is pinned at the top.
+        let (row, label) = picker.read_with(cx, |p, _| {
+            let h = p.headings.borrow();
+            let bulk = h.iter().find(|h| h.label == "bulk").unwrap();
+            (bulk.row, bulk.label.clone())
+        });
+        let scroll = picker.read_with(cx, |p, _| p.scroll.clone());
+        let origin = scroll.bounds().top();
+        let top = scroll.bounds_for_item(row + 3).unwrap().top() - origin;
+        scroll.set_offset(gpui_kit::point(gpui_kit::px(0.), -top));
+        draw(cx);
+        draw(cx);
+        let (heading, push) = picker
+            .read_with(cx, |p, _| p.sticky_heading())
+            .expect("pinned heading");
+        assert_eq!(heading.label, label);
+        assert_eq!(push, 0.);
+        assert!(
+            VisualTestContext::from_window(rig.handle, cx)
+                .debug_bounds("model-sticky-heading")
+                .is_some()
+        );
     }
 
     #[gpui_kit::test]
